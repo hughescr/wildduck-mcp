@@ -67,7 +67,7 @@ git push origin main develop --follow-tags
 
 Pushes to `main` and `develop`, and pull requests targeting either, run the checks and build. A separate main-only job deploys the verified artifact with short-lived AWS OIDC credentials. `develop` and pull requests cannot assume the production deployment role. The local and CI artifact is `dist/function.zip`; it contains bundled JavaScript and its source map, with no runtime package installation.
 
-**No AWS resources have been created for this scaffold.** Automatic deployment remains visibly disabled until its one-time prerequisites are configured. The main workflow reports the bootstrap requirement instead of claiming a live deployment. Once `DEPLOY_ENABLED=true`, every successful main push deploys automatically; missing required settings fail the deployment checks.
+**The AWS bootstrap infrastructure and GitHub deployment settings are configured.** Every successful main push deploys automatically through the main-only OIDC role. When deployed, the application remains a scaffold: health is available, while readiness and MCP reject access until OAuth and mailbox tools are implemented. The steps below document the one-time setup for recreating this deployment; a fresh clone does not require repeating them.
 
 With administrator credentials for the intended account, bootstrap in `us-west-2`:
 
@@ -91,7 +91,7 @@ This expects the account's existing GitHub OIDC stack export `GitHubOIDCProvider
 | `AWS_DEPLOYMENT_BUCKET_NAME` | `ArtifactBucketName` |
 | `AWS_EXECUTION_ROLE_ARN` | `ExecutionRoleArn` |
 
-Set the repository **secret** `SERVERLESS_ACCESS_KEY` using the normal GitHub secret UI or stdin; never put the value in a command argument or commit. Then set repository variable `DEPLOY_ENABLED=true` and push a release to main, or dispatch the workflow on main. The scaffold will expose only health and fail-closed readiness/MCP endpoints until the OAuth implementation lands. The workflow performs live HTTP checks after deployment; it does not equate successful CloudFormation creation with a working application.
+Set the repository **secret** `SERVERLESS_ACCESS_KEY` using the normal GitHub secret UI or stdin; never put the value in a command argument or commit. For a newly bootstrapped deployment, set repository variable `DEPLOY_ENABLED=true` last, then push a release to main or dispatch the workflow on main. The scaffold will expose only health and fail-closed readiness/MCP endpoints until the OAuth implementation lands. The workflow performs live HTTP checks after deployment; it does not equate successful CloudFormation creation with a working application.
 
 For a deliberate local deployment after bootstrap, export the bucket name, execution-role ARN, and Serverless access key using the normal credential-injection tooling, then:
 
