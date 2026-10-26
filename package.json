@@ -1,0 +1,11 @@
+{
+  "name": "wildduck-mcp",
+  "version": "0.1.0",
+  "description": "A lightweight remote MCP service for Wildduck mail accounts",
+  "type": "module",
+  "private": true,
+  "license": "UNLICENSED",
+  "author": "Craig Hughes",
+  "repository": { "type": "git", "url": "https://github.com/hughescr/wildduck-mcp.git" },
+  "engines": { "node": ">=26 <27", "bun": ">=1.4.4" }
+}
