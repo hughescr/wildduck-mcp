@@ -78,7 +78,15 @@ export async function postBrowser(context: Context, runtime: AuthRuntime) {
             const accountId = flow.credentials.profile.id;
             const previous = await runtime.store.get('connection', accountId);
             if (previous && (previous.kind !== 'connection' || previous.accountId !== accountId)) { throw new OAuthError('invalid_request'); }
-            const stored = previous?.kind === 'connection' ? runtime.crypto.open<UpstreamCredentials>('upstream-credentials', connectionAAD(previous), previous.credentials) : undefined;
+            let stored: UpstreamCredentials | undefined;
+            if (previous?.kind === 'connection') {
+                // This read only detects duplicate delivery. A retired key or damaged
+                // old ciphertext must not prevent newly completed authentication from
+                // replacing the credential through engine validation and generation CAS.
+                try { stored = runtime.crypto.open<UpstreamCredentials>('upstream-credentials', connectionAAD(previous), previous.credentials); }
+                catch { stored = undefined; }
+            }
+
             const identical = stored !== undefined && equal(stored.accessToken, flow.credentials.accessToken) && stored.issuedAt === flow.credentials.issuedAt && stored.profile.id === flow.credentials.profile.id && stored.profile.name === flow.credentials.profile.name && stored.profile.email === flow.credentials.profile.email;
             if (identical && previous && (previous.expiresAt <= now() || previous.status !== 'active')) { throw new OAuthError('invalid_grant'); }
             // Duplicate delivery of this consent must not rotate the canonical credential

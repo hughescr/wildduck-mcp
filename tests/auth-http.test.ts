@@ -1,7 +1,7 @@
 import { expect, test } from 'bun:test';
 import { handle, type LambdaContext } from '@hono/aws-lambda';
 import { createApp } from '../src/app';
-import { AuthCrypto, digest } from '../src/auth/crypto';
+import { AuthCrypto, connectionAAD, digest } from '../src/auth/crypto';
 import { AuthEngine } from '../src/auth/engine';
 import { MemoryStore } from '../src/auth/memory-store';
 import { ClientRegistry } from '../src/auth/clients';
@@ -131,4 +131,31 @@ test.each(['expired', 'revoked', 'reconnect_required'])('identical consent canno
     const previous = await env.runtime.store.get('connection', credentials.profile.id); if (previous?.kind !== 'connection') { throw new Error(); }
     await env.runtime.store.transact({ conditions: [{ kind: 'connection', id: previous.id, revision: previous.revision }], puts: [{ ...previous, revision: previous.revision + 1, ...(state === 'expired' ? { expiresAt: Math.floor(Date.now() / 1000) - 1 } : { status: state as 'revoked' | 'reconnect_required' }) }], operationId: `test-${state}` });
     expect((await post(env.app, '/auth/consent', approve.fields, approve.cookie)).status).toBe(400);
+});
+test.each(['retired-key', 'damaged-ciphertext'])('fresh password/TOTP authentication replaces %s canonical credentials', async failure => {
+    const env = setup(true);
+    const previous = await env.runtime.engine.connectOrReconnect({ accountId: credentials.profile.id, credentials, expiresAt: Math.floor(Date.now() / 1000) + 3600 });
+    if (failure === 'damaged-ciphertext') {
+        expect(await env.runtime.store.transact({ conditions: [{ kind: 'connection', id: previous.id, revision: previous.revision }], puts: [{ ...previous, revision: previous.revision + 1, credentials: { ...previous.credentials, tag: 'invalid' } }], operationId: 'damage-old-ciphertext' })).toBe(true);
+    }
+    const v2 = new AuthCrypto({ activeKeyId: 'v2', keys: { v2: new Uint8Array(32).fill(9), ...(failure === 'damaged-ciphertext' ? { v1: new Uint8Array(32).fill(3) } : {}) } });
+    const fresh = { ...credentials, accessToken: 'c'.repeat(40), issuedAt: credentials.issuedAt + 1 };
+    let validated = 0; let completedTotp = 0;
+    env.runtime.crypto = v2;
+    env.runtime.clients = new ClientRegistry({ crypto: v2 });
+    env.runtime.engine = new AuthEngine(env.runtime.store, v2, { validate: async connection => {
+        try {
+            const candidate = v2.open<UpstreamCredentials>('upstream-credentials', connectionAAD(connection), connection.credentials);
+            if (!completedTotp || candidate.accessToken !== fresh.accessToken || candidate.profile.id !== fresh.profile.id) { return 'temporary'; }
+            validated++; return 'valid';
+        } catch { return 'temporary'; }
+    } }, { issuer, refreshRetrySeconds: 10 });
+    env.runtime.wildduck.completeTotp = async (pending, code) => { expect(pending.accountId).toBe(fresh.profile.id); expect(code).toBe('123456'); completedTotp++; return fresh; };
+    const registration = env.runtime.clients.register({ client_name: 'After rotation', redirect_uris: ['http://127.0.0.1/callback'], application_type: 'native', token_endpoint_auth_method: 'none', grant_types: ['authorization_code', 'refresh_token'] });
+    env.registration = registration; env.params.set('client_id', registration.client_id);
+    expect((await post(env.app, '/auth/consent', new URLSearchParams({ ...Object.fromEntries(env.params), decision: 'allow', csrf: 'invented' })) ).status).toBe(400);
+    const { tokens } = await connect(env); expect(tokens.access_token).toBeString(); expect(completedTotp).toBe(1); expect(validated).toBeGreaterThanOrEqual(3);
+    const current = await env.runtime.store.get('connection', fresh.profile.id); if (current?.kind !== 'connection') { throw new Error('missing canonical connection'); }
+    expect(current.id).toBe(previous.id); expect(current.credentialGeneration).toBe(previous.credentialGeneration + 1); expect(current.credentials.keyId).toBe('v2');
+    expect(v2.open<UpstreamCredentials>('upstream-credentials', connectionAAD(current), current.credentials)).toEqual(fresh);
 });
