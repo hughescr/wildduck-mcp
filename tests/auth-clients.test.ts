@@ -153,8 +153,30 @@ test('DCR and CIMD require the complete v1 code plus refresh flow and default om
         const cimd = new ClientRegistry({ crypto, fetchMetadata: async () => json(document(id, extra)) });
         expect((await cimd.resolve(id)).grantTypes).toEqual(['authorization_code', 'refresh_token']);
     }
-    for (const grants of [null, [], 'authorization_code', ['authorization_code'], ['refresh_token'], ['authorization_code', 'authorization_code'], ['authorization_code', 'refresh_token', 'refresh_token'], ['authorization_code', 'refresh_token', 'client_credentials'], ['authorization_code', null]]) {
+    for (const grants of [null, [], 'authorization_code', ['authorization_code'], ['refresh_token'], ['authorization_code', 'authorization_code'], ['authorization_code', 'refresh_token', 'refresh_token'], ['authorization_code', null]]) {
         expect(() => registry.register({ ...publicMetadata, grant_types: grants })).toThrow('invalid_client_metadata');
         await expect(new ClientRegistry({ crypto, fetchMetadata: async () => json(document(id, { grant_types: grants })) }).resolve(id)).rejects.toThrow('invalid_client_metadata');
+    }
+});
+
+// Public snapshot fetched from this client_id on 2026-10-26; contains no user data or credentials.
+const claudeMetadata = {"client_id":"https://claude.ai/oauth/mcp-oauth-client-metadata","client_name":"Claude","client_uri":"https://claude.ai","redirect_uris":["https://claude.ai/api/mcp/auth_callback"],"grant_types":["authorization_code","refresh_token","urn:ietf:params:oauth:grant-type:jwt-bearer"],"response_types":["code"],"token_endpoint_auth_method":"none"};
+
+test('public Claude CIMD and unrelated extension capabilities select only the supported grant pair', async () => {
+    for (const metadata of [claudeMetadata, { ...claudeMetadata, grant_types: ['urn:example:custom-grant', 'refresh_token', 'authorization_code', 'client_credentials'] }]) {
+        const registry = new ClientRegistry({ crypto, fetchMetadata: async () => json(metadata) });
+        const client = await registry.resolve(metadata.client_id);
+        expect(client.name).toBe('Claude'); expect(client.authMethod).toBe('none');
+        expect(client.redirectUris).toEqual(claudeMetadata.redirect_uris);
+        expect(client.grantTypes).toEqual(['authorization_code', 'refresh_token']);
+        expect(() => registry.register(metadata)).toThrow('invalid_client_metadata');
+    }
+});
+
+test('CIMD validates every grant capability before discarding unsupported grants', async () => {
+    const pair = ['authorization_code', 'refresh_token'];
+    for (const grant_types of [[...pair, null], [...pair, 1], [...pair, {}], [...pair, ''], [...pair, 'bad grant'], [...pair, 'bad\n'], [...pair, 'bad\u007f'], [...pair, 'x'.repeat(257)], [...pair, 'urn:example:grant', 'urn:example:grant'], [...pair, 'authorization_code'], [...pair, ...Array.from({ length: 15 }, (_, index) => 'urn:example:grant:' + index)], ['authorization_code', 'urn:example:grant'], ['refresh_token', 'urn:example:grant']]) {
+        const registry = new ClientRegistry({ crypto, fetchMetadata: async () => json({ ...claudeMetadata, grant_types }) });
+        await expect(registry.resolve(claudeMetadata.client_id)).rejects.toThrow('invalid_client_metadata');
     }
 });

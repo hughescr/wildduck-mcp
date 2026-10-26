@@ -159,3 +159,27 @@ test.each(['retired-key', 'damaged-ciphertext'])('fresh password/TOTP authentica
     expect(current.id).toBe(previous.id); expect(current.credentialGeneration).toBe(previous.credentialGeneration + 1); expect(current.credentials.keyId).toBe('v2');
     expect(v2.open<UpstreamCredentials>('upstream-credentials', connectionAAD(current), current.credentials)).toEqual(fresh);
 });
+
+test('published Claude CIMD reaches login while extra JWT grant capabilities remain unsupported', async () => {
+    const env = setup();
+    // Exact public document snapshot, 2026-10-26; this test never calls account or upstream APIs.
+    const metadata = {"client_id":"https://claude.ai/oauth/mcp-oauth-client-metadata","client_name":"Claude","client_uri":"https://claude.ai","redirect_uris":["https://claude.ai/api/mcp/auth_callback"],"grant_types":["authorization_code","refresh_token","urn:ietf:params:oauth:grant-type:jwt-bearer"],"response_types":["code"],"token_endpoint_auth_method":"none"};
+    let fetches = 0;
+    env.runtime.clients = new ClientRegistry({ crypto: env.runtime.crypto, fetchMetadata: async input => { expect(String(input)).toBe(metadata.client_id); fetches++; return new Response(JSON.stringify(metadata), { headers: { 'content-type': 'application/json' } }); } });
+    const params = new URLSearchParams(env.params); params.set('client_id', metadata.client_id); params.set('redirect_uri', metadata.redirect_uris[0] ?? '');
+    const start = await env.app.request('/authorize?' + params);
+    expect(start.status).toBe(200); const html = await start.text();
+    expect(html).toContain('Connect your mail account'); expect(html).toContain('continue to Claude');
+    expect(start.headers.get('set-cookie')).toContain('__Host-wildduck-flow=');
+    expect(env.loginCalls()).toBe(0); expect(fetches).toBe(1);
+    const fields = new URLSearchParams({ client_id: metadata.client_id, resource: issuer + '/mcp', grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer', assertion: 'eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJmaXh0dXJlIiwic3ViIjoiZml4dHVyZSJ9.c2lnbmF0dXJl' });
+    const unsupported = await post(env.app, '/token', fields);
+    expect(unsupported.status).toBe(400); expect(await unsupported.json()).toEqual({ error: 'unsupported_grant_type' });
+    fields.set('client_assertion_type', 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer'); fields.set('client_assertion', fields.get('assertion') ?? '');
+    const wrongMethod = await post(env.app, '/token', fields);
+    expect(wrongMethod.status).toBe(401); expect(await wrongMethod.json()).toEqual({ error: 'invalid_client' });
+    const discovery = await (await env.app.request('/.well-known/oauth-authorization-server')).json();
+    expect(discovery.grant_types_supported).toEqual(['authorization_code', 'refresh_token']);
+    expect(discovery.token_endpoint_auth_methods_supported).not.toContain('private_key_jwt');
+    expect(env.loginCalls()).toBe(0);
+});

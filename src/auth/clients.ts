@@ -58,9 +58,10 @@ function normalize(raw: unknown, cimd = false): Metadata {
         authMethod = 'none';
     }
     if (!['none', 'client_secret_basic', 'client_secret_post'].includes(authMethod as string) || (cimd && authMethod !== 'none')) { throw new ClientError('invalid_client_metadata'); }
-    // V1 always issues refresh tokens: metadata must describe that complete supported flow.
+    // V1 requires code plus refresh. CIMD describes client capabilities across servers,
+    // so validate the whole list and select only our supported pair; DCR keeps its exact-pair policy.
     const grants = data.grant_types === undefined ? ['authorization_code', 'refresh_token'] : data.grant_types;
-    if (!Array.isArray(grants) || grants.length !== 2 || !grants.includes('authorization_code') || !grants.includes('refresh_token')) { throw new ClientError('invalid_client_metadata'); }
+    if (!Array.isArray(grants) || !grants.length || grants.length > 16 || grants.some(value => typeof value !== 'string' || !value.length || value.length > 256 || !/^[!-~]+$/u.test(value)) || new Set(grants).size !== grants.length || !grants.includes('authorization_code') || !grants.includes('refresh_token') || (!cimd && grants.length !== 2)) { throw new ClientError('invalid_client_metadata'); }
     const responses = data.response_types ?? ['code'];
     if (!Array.isArray(responses) || responses.length !== 1 || responses[0] !== 'code') { throw new ClientError('invalid_client_metadata'); }
     const result: Metadata = { name: name.trim(), redirectUris: [...new Set(redirects)], applicationType, authMethod: authMethod as ClientAuthMethod, grantTypes: ['authorization_code', 'refresh_token'] };
