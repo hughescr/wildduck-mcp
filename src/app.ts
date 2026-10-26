@@ -3,48 +3,80 @@ import { bodyLimit } from 'hono/body-limit';
 import { secureHeaders } from 'hono/secure-headers';
 import { version } from '../package.json';
 import { handleMcp } from './mcp';
-
-export interface VerifiedConnection {
-    readonly connectionId: string;
-    readonly accountId: string;
-}
-
-export type AuthenticationResult =
-    | { readonly status: 'unavailable' }
-    | { readonly status: 'invalid' }
-    | { readonly status: 'verified'; readonly connection: VerifiedConnection };
-
-/** Integration seam; production has no verifier until the OAuth implementation lands. */
-export interface Authenticator {
-    verify(request: Request): Promise<AuthenticationResult>;
-}
-
-const unavailableAuthenticator: Authenticator = { verify: async () => ({ status: 'unavailable' }) };
-
-export function createApp(authenticator: Authenticator = unavailableAuthenticator) {
+import { loadConfig, type Config } from './config';
+import { createRuntimeProvider, type RuntimeProvider } from './auth/runtime';
+import { authenticate, authorization, boundedText, challenge, form, metadata, required, scopes, unique, SCOPES } from './auth/http';
+import { beginBrowser, postBrowser } from './auth/browser';
+import { OAuthError, type UpstreamCredentials } from './auth/contracts';
+import { ClientError } from './auth/clients';
+import { connectionAAD } from './auth/crypto';
+export interface AppOptions { config?: Config; runtime?: RuntimeProvider }
+export function createApp(options: AppOptions = {}) {
+    const config = options.config ?? loadConfig(); const runtime = options.runtime ?? createRuntimeProvider(config);
     const app = new Hono();
     app.use('*', secureHeaders());
+    app.use('*', async (context, next) => { context.header('Cache-Control', 'no-store'); await next(); });
+    app.use('/mcp', bodyLimit({ maxSize: 1024 * 1024, onError: context => context.json({ error: 'payload_too_large' }, 413) }));
     app.use('*', async (context, next) => {
-        context.header('Cache-Control', 'no-store');
+        if (context.req.method === 'OPTIONS') { context.header('Access-Control-Allow-Origin', '*'); context.header('Access-Control-Allow-Headers', 'Authorization, Content-Type, MCP-Protocol-Version'); context.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS'); return context.body(null, 204); }
+        if (['/register', '/token', '/revoke', '/mcp'].includes(context.req.path) || context.req.path.startsWith('/.well-known/')) { context.header('Access-Control-Allow-Origin', '*'); context.header('Access-Control-Expose-Headers', 'WWW-Authenticate'); }
         await next();
     });
-    app.use('/mcp', bodyLimit({ maxSize: 1024 * 1024, onError: (context) => context.json({ error: 'payload_too_large' }, 413) }));
-    app.get('/healthz', (context) => context.json({ service: 'wildduck-mcp', version, status: 'scaffold' }));
-    app.get('/readyz', (context) => context.json({ ready: false, reason: 'oauth_not_implemented' }, 503));
-    app.all('/mcp', async (context) => {
-        // A supplied bearer/header is never itself proof of authentication.
-        const result = await authenticator.verify(context.req.raw);
-        if (result.status === 'unavailable') {
-            return context.json({ error: 'service_not_ready', message: 'OAuth and mailbox access are not implemented.' }, 503);
-        }
-        if (result.status === 'invalid') {
-            context.header('WWW-Authenticate', 'Bearer realm="wildduck-mcp", error="invalid_token"');
-            return context.json({ error: 'invalid_token' }, 401);
-        }
-        // Never retain connection identity or backend credentials in shared globals.
-        return handleMcp(context.req.raw);
+    app.get('/healthz', context => context.json({ service: 'wildduck-mcp', version, status: 'oauth' }));
+    app.get('/readyz', async context => { const ready = Boolean(await runtime()); return context.json({ ready }, ready ? 200 : 503); });
+    app.get('/.well-known/oauth-authorization-server', context => config.publicBaseUrl ? context.json(metadata(config.publicBaseUrl)) : context.json({ error: 'service_not_ready' }, 503));
+    for (const path of ['/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/mcp']) {
+        app.get(path, context => config.publicBaseUrl ? context.json({ resource: `${config.publicBaseUrl}/mcp`, authorization_servers: [config.publicBaseUrl], bearer_methods_supported: ['header'], scopes_supported: SCOPES }) : context.json({ error: 'service_not_ready' }, 503));
+    }
+    app.get('/authorize', async context => { const auth = await runtime(); if (!auth) { return context.json({ error: 'service_not_ready' }, 503); } return beginBrowser(context, auth); });
+    app.post('/auth/:step', async context => { if (new URL(context.req.url).search) { throw new OAuthError('invalid_request'); } const auth = await runtime(); if (!auth) { return context.json({ error: 'service_not_ready' }, 503); } return postBrowser(context, auth); });
+    app.post('/register', async context => {
+        const auth = await runtime(); if (!auth) { return context.json({ error: 'service_not_ready' }, 503); }
+        if (!/^application\/json(?:\s*;|$)/i.test(context.req.header('content-type') ?? '')) { throw new OAuthError('invalid_request'); }
+        let raw: unknown; try { raw = JSON.parse(await boundedText(context.req.raw)); } catch { throw new OAuthError('invalid_request'); }
+        return context.json(auth.clients.register(raw), 201);
     });
-    app.notFound((context) => context.json({ error: 'not_found' }, 404));
-    app.onError((_error, context) => context.json({ error: 'internal_error' }, 500));
+    app.post('/token', async context => {
+        const auth = await runtime(); if (!auth) { return context.json({ error: 'service_not_ready' }, 503); }
+        unique(new URL(context.req.url).searchParams);
+        if (new URL(context.req.url).search) { throw new OAuthError('invalid_request'); }
+        const fields = await form(context.req.raw); const client = await authenticate(auth, context.req.raw, fields);
+        const resource = required(fields, 'resource');
+        if (fields.grant_type === 'authorization_code') {
+            const request = await authorization(auth, { client_id: client.clientId, redirect_uri: required(fields, 'redirect_uri'), resource, response_type: 'code', code_challenge_method: 'S256', code_challenge: 'x'.repeat(43) });
+            return context.json(await auth.engine.exchange({ client: request.client, code: required(fields, 'code'), verifier: required(fields, 'code_verifier'), redirectUri: request.redirectUri, resource }));
+        }
+        if (fields.grant_type === 'refresh_token') { return context.json(await auth.engine.refresh({ client, refreshToken: required(fields, 'refresh_token'), resource, ...(fields.scope === undefined ? {} : { scopes: scopes(fields.scope) }) })); }
+        return context.json({ error: 'unsupported_grant_type' }, 400);
+    });
+    app.post('/revoke', async context => { if (new URL(context.req.url).search) { throw new OAuthError('invalid_request'); } const auth = await runtime(); if (!auth) { return context.json({ error: 'service_not_ready' }, 503); } const fields = await form(context.req.raw); const client = await authenticate(auth, context.req.raw, fields); await auth.engine.revoke(required(fields, 'token'), client); return context.body(null, 200); });
+    app.all('/mcp', async context => {
+        if (!config.publicBaseUrl) { return context.json({ error: 'service_not_ready' }, 503); }
+        const header = context.req.header('authorization');
+        const unauthorized = () => { const value = challenge(config.publicBaseUrl ?? ''); context.header('WWW-Authenticate', value); return context.json({ error: 'invalid_token', _meta: { 'mcp/www_authenticate': [value] } }, 401); };
+        if (!header || !/^Bearer [A-Za-z0-9._~-]+$/i.test(header)) { return unauthorized(); }
+        const auth = await runtime(); if (!auth) { return context.json({ error: 'service_not_ready' }, 503); }
+        try {
+            const token = header.slice(7); const identity = await auth.engine.verifyAccess(token);
+            const [grant, record] = await Promise.all([auth.store.get('grant', identity.grantId), auth.store.get('connection', identity.connectionId)]);
+            if (grant?.kind !== 'grant' || record?.kind !== 'connection') { return unauthorized(); }
+            const credentials = auth.crypto.open<UpstreamCredentials>('upstream-credentials', connectionAAD(record), record.credentials);
+            if (identity.connectionStatus === 'active') {
+                const state = await auth.wildduck.validateCredentials(credentials);
+                if (state === 'temporary') { return context.json({ error: 'temporarily_unavailable' }, 503); }
+                if (state === 'expired') { return unauthorized(); }
+            }
+            return handleMcp(context.req.raw, { token, clientId: grant.clientId, scopes: identity.scopes, resource: new URL(auth.engine.resource), extra: { ...identity } }, identity, credentials.profile);
+        } catch (error) { if (error instanceof OAuthError && error.error !== 'temporarily_unavailable') { return unauthorized(); } throw error; }
+    });
+    app.notFound(context => context.json({ error: 'not_found' }, 404));
+    app.onError((error, context) => {
+        if (error instanceof OAuthError || error instanceof ClientError) {
+            const temporary = error.error === 'temporarily_unavailable';
+            if (error.error === 'invalid_client') { context.header('WWW-Authenticate', 'Basic realm="oauth"'); }
+            return context.json({ error: error.error, ...(error.error === 'invalid_grant' ? { error_description: 'Reconnect your mail account and authorize this client again.' } : {}) }, temporary ? 503 : error.error === 'invalid_client' ? 401 : 400);
+        }
+        return context.json({ error: 'temporarily_unavailable' }, 503);
+    });
     return app;
 }

@@ -44,12 +44,16 @@ jobs:
           ROLE: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           BUCKET: ${{ vars.AWS_DEPLOYMENT_BUCKET_NAME }}
           EXECUTION_ROLE: ${{ vars.AWS_EXECUTION_ROLE_ARN }}
+          PUBLIC_BASE_URL: ${{ vars.PUBLIC_BASE_URL }}
+          AUTH_KEYRING_PARAMETER: ${{ vars.AUTH_KEYRING_PARAMETER }}
           ACCESS_KEY: ${{ secrets.SERVERLESS_ACCESS_KEY }}
         run: |
           test -n "$ROLE"
           test -n "$BUCKET"
           test -n "$EXECUTION_ROLE"
           test -n "$ACCESS_KEY"
+          test -n "$PUBLIC_BASE_URL"
+          test "$AUTH_KEYRING_PARAMETER" = /wildduck-mcp/prod/auth-keyring
 
   deploy:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
@@ -85,8 +89,10 @@ jobs:
         env:
           AWS_DEPLOYMENT_BUCKET_NAME: ${{ vars.AWS_DEPLOYMENT_BUCKET_NAME }}
           AWS_EXECUTION_ROLE_ARN: ${{ vars.AWS_EXECUTION_ROLE_ARN }}
+          PUBLIC_BASE_URL: ${{ vars.PUBLIC_BASE_URL }}
+          AUTH_KEYRING_PARAMETER: ${{ vars.AUTH_KEYRING_PARAMETER }}
           SERVERLESS_ACCESS_KEY: ${{ secrets.SERVERLESS_ACCESS_KEY }}
-      - name: Verify live scaffold
+      - name: Verify live OAuth readiness
         run: node scripts/verify-deployment.mjs
         env:
           STACK_NAME: wildduck-mcp-prod

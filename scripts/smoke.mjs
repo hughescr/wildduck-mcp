@@ -11,5 +11,5 @@ const health = await handler(event('/healthz'), {});
 assert.equal(health.statusCode, 200);
 assert.equal(JSON.parse(health.body).service, 'wildduck-mcp');
 const mail = await handler(event('/mcp', { authorization: 'Bearer fabricated', 'x-access-token': 'fabricated' }), {});
-assert.equal(mail.statusCode, 503, 'Unimplemented authentication must fail closed');
+assert.equal(mail.statusCode, 503, 'Unconfigured authentication must fail closed');
 assert.equal((await handler(event('/readyz'), {})).statusCode, 503);

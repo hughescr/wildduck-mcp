@@ -1,115 +1,59 @@
 # wildduck-mcp
 
-A small remote MCP service for Wildduck mail accounts. TypeScript and Bun tooling build a self-contained JavaScript artifact that runs on Node.js 26 in an ordinary, on-demand AWS Lambda with a Function URL.
+A small remote MCP connection service for Wildduck, built with Hono, the official MCP SDK and an ordinary buffered AWS Lambda Function URL. This phase implements OAuth and account connection. The only tools are `get_profile`, `whoami`, `get_connection_status` and `get_service_info`; mail reading, modification, drafting and sending are not implemented.
 
-**This is a scaffold, not a working email connector yet.** `/healthz` reports the build version. `/readyz` and `/mcp` return `503` because production OAuth and mailbox tools are not implemented. Supplied bearer tokens or Wildduck API headers do not bypass this boundary. OAuth discovery is deliberately absent until a complete authorization flow exists. The official MCP SDK transport has a service-information tool exercised through an injected verifier in tests; the production handler never installs that test verifier.
+## Account connection
 
-## Local development
+Clients discover OAuth using the `/mcp` bearer challenge and the authorization-server and protected-resource metadata endpoints. Authorization uses an exact client/redirect/resource binding, S256 PKCE, password login, any required TOTP challenge, and explicit account/permissions consent. A native client's HTTP loopback redirect may vary its port only. The callback includes `iss` and the original `state`. There is no OpenID Connect, `openid` scope, ID token, password grant or client-credentials grant.
 
-Install Node.js 26, Bun 1.4.4 or newer, `zip`, and git-flow. The deployment uses the Node 26 preview runtime, an accepted tradeoff for this noncritical service; AWS preview availability must be verified in the deployment Region.
+Passkey-only accounts fail closed with a webmail instruction. Existing webmail passkeys belong to their existing relying-party origins and cannot be used by the Lambda origin. Accounts requiring a password change or MFA enrollment must complete it in webmail. Passwords and TOTP codes exist only in the current request and are never retained. Pending MFA and newly authenticated credentials are encrypted in a short-lived Secure/HttpOnly/SameSite=Lax browser cookie with a fixed ten-minute deadline. Every browser POST requires an origin check, synchronizer CSRF token and the bound OAuth request digest. Public request fields appear in forms; credentials do not. No third-party assets or scripts are loaded.
+
+The registered client name is presentation metadata, not proof of ownership. Consent also displays the redirect hostname and, for a client metadata document, its hostname. `mail:send` requires a separate explicit checkbox. Scopes are `profile`, `mail:read`, `mail:modify`, `mail:draft`, `mail:send`; default scope is `profile mail:read`. These permissions reserve future tool capabilities and do not make mail tools available today. Refresh tokens are issued with connection consent without an OIDC `offline_access` scope.
+
+Dynamic client registration at `/register` supports public (`none`) and confidential (`client_secret_basic` or `client_secret_post`) clients. Registrations are stateless authenticated IDs; anonymous registration does not write DynamoDB. HTTPS client metadata document IDs are fetched with the maintained `@better-auth/cimd` transport, public-IP DNS pinning and TLS identity checks, no redirects, a five-KiB cap and bounded deadlines/cache. Supported public metadata documents explicitly negotiate `none`; unsupported private-key methods cannot silently downgrade. Duplicate form/query fields and mixed credential methods are rejected.
+
+Access tokens last five minutes. Grants and connections have a maximum lifetime of 180 days. Refresh tokens rotate atomically; an identical retry within ten seconds returns the same encrypted response. After that fixed grace window an authenticated old-token replay revokes that client's grant. Revocation at `/revoke` invalidates its access and refresh tokens. A backend outage returns `503 temporarily_unavailable` and preserves grants; a definitively expired backend session requires human reconnection. Upstream sessions may expire after 14 inactive days or 180 total days, so the OAuth lifetime is an upper bound rather than a guarantee. There is no background keepalive or password reauthentication. Reauthorize through the client's normal connection UI with the same account to replace that account's canonical backend connection; other client grants use the same account connection, but clients may require explicit reconnection after `invalid_grant`.
+
+The backend adapter always uses the connected user's explicit `X-Access-Token` for session checks and user operations. Only the two login/MFA bootstrap paths omit it, using the separately approved backend proxy fallback. Browser cancellation attempts upstream logout; upstream revocation is best effort. This repository changes no backend code or configuration.
+
+## Local validation
+
+Use Node.js 26, Bun 1.4.4 or newer, `zip`, and git-flow:
 
 ```sh
 bun install --frozen-lockfile --ignore-scripts
-bun check
-bun run lint
-bun test
-bun run build
-bun run smoke
+bun run validate
 bun run dev
 ```
 
-The local server binds only to `127.0.0.1:3000`. `PORT` optionally changes the port. No credentials are required for scaffold checks. `bun run validate` runs typechecking, lint, tests, bundling, and the Node 26 Lambda-event smoke test using the same commands CI uses.
+The local server binds `127.0.0.1:3000`; `PORT` changes the port. With auth configuration absent, `/healthz` reports the package version, `/readyz` and `/mcp` return 503, and no AWS request is made. Configuration is not a credential bypass. `bun run validate` runs Bun's TypeScript checker, Oxlint, tests, bundling and a real Node 26 Lambda-event smoke test. HTTP tests inject a typed test runtime with the real engine/crypto/store contracts and exercise password/TOTP consent, CSRF, redirects, code exchange, refresh and request-scoped MCP identity; production never installs a test verifier.
 
-`bun check` is Bun's built-in TypeScript checker; there is no same-name package script and no separate TypeScript compiler dependency. Oxlint approximates supported correctness, TypeScript, import, Node, and Unicorn rules from `@hughescr/eslint-config-default`. Custom ESLint plugins, typed ESLint rules, and stylistic coverage are intentionally not reproduced.
+## Runtime and storage
 
-## Architecture and boundaries
+`PUBLIC_BASE_URL` is a required canonical HTTPS origin for a usable service. Never derive the issuer from Host or forwarded headers. `CREDENTIAL_TABLE_NAME` selects the durable state table; `AUTH_KEYRING_PARAMETER` contains only the exact SSM parameter name `/wildduck-mcp/prod/auth-keyring`. No backend credentials or encryption-key values belong in environment variables, CloudFormation, GitHub or source control.
 
-- `src/app.ts`: Hono routes and an authentication integration seam. Production authentication fails closed.
-- `src/handler.ts`: buffered Function URL adapter. Every HTTP request completes independently; no persistent SSE connection, sticky session, or always-running server is required.
-- `src/mcp.ts`: official MCP SDK, stateless JSON responses, one server/transport per authenticated request.
-- `src/config.ts`: optional public-origin validation; it never loads backend credentials from environment variables.
-- `serverless.yml`: ordinary Lambda, `nodejs26.x`, ARM64, 1024 MB, 30-second request limit, 14-day logs, and a DynamoDB table.
-- `infra/bootstrap.yml`: separate artifact bucket, fixed runtime role, and main-only GitHub OIDC deployment role. CI cannot modify IAM roles.
+Provision the keyring separately as an SSM **Standard SecureString** under the AWS-managed `aws/ssm` key. Its JSON shape is `{"activeKeyId":"v1","keys":{"v1":"<canonical base64 encoding of 32 random bytes>"}}`, at most four KiB. Use an administrator's approved secret-injection workflow: generate key bytes in memory, send the value through stdin/API request data, and avoid command arguments, files and logs. CloudFormation does not create this SecureString. The runtime can only `ssm:GetParameter` that exact ARN; the CI deployment role cannot read or write its value. No customer-managed KMS key or paid key-management service is added.
 
-The database is **DynamoDB Standard, provisioned at exactly 1 RCU and 1 WCU**, with no indexes or autoscaling. It is retained on stack deletion or replacement. The key attributes are `pk` and `sk`; this service reserves partition keys beginning `wildduck-mcp#`. Other future consumers could reserve their own prefixes without a shared credential-platform abstraction. Runtime IAM permissions enforce this service's prefix. `expiresAt` is a Unix-seconds TTL attribute for eventual cleanup, not an authorization check: the application must reject expired records immediately. Bounded throttling retries and atomic authorization-code consumption/refresh rotation belong to the credential-store implementation, which has not been added yet. Even five users can make simultaneous requests, so one capacity unit does not guarantee an unthrottled authentication burst.
+Keyring loading is lazy, bounded and cached for at most five minutes. Concurrent loads coalesce; an expired cache fails closed when SSM is unavailable. Each request consults the provider and rebuilds crypto/client services when key material changes. Add a new key and change `activeKeyId` to rotate. Retain old keys while encrypted records, issued tokens and stateless client IDs/secrets depend on them; client registration IDs and secrets do not have an automatic expiration. Removing old keys deliberately invalidates their dependents.
 
-The table enables server-side encryption. Application encryption of upstream credentials, key management, OAuth grants and token hashing are **future work**; no real credentials are stored by the scaffold. Mail remains in Wildduck.
+DynamoDB Standard remains provisioned at **exactly 1 RCU and 1 WCU**, with no secondary indexes or autoscaling. The table is retained on deletion/replacement. Its `pk`/`sk` keys use the `wildduck-mcp#` namespace, enforced by runtime IAM. `expiresAt` TTL is eventual cleanup; validity is checked synchronously. Strong reads, conditional transactions, bounded throttling retries and AWS transaction idempotency implement atomic codes and refresh rotation. Concurrent bursts can still throttle this deliberately tiny table. Backend credentials and retry receipts are encrypted with AES-GCM, purpose-separated keys and account/generation-bound authenticated context. Mail remains in Wildduck.
 
-The backend will be fixed to the configured Wildduck API origin and use account-bound credentials, with read/modify/draft/send permissions enforced in this service. The backend adapter must explicitly send the user's token in `X-Access-Token` and refuse requests without it; the existing nginx fallback must never be used accidentally for mail operations. No Wildduck server code or configuration is changed here.
+Lambda uses Node 26 preview, ARM64, 1024 MB, a 30-second request timeout and 14-day logs. Preview availability in the intended region is an accepted deployment constraint. Health is liveness; `/readyz` checks configured key availability. Neither is proof of a real account login or successful client interoperability. MCP uses the official stateless JSON transport and passes verified request identity through `authInfo` into tool context. Profile IDs are the stable opaque backend account ID.
+
+## Deployment and rollback
+
+Main and develop pushes and their pull requests validate and build. The main-only deployment job uses short-lived GitHub OIDC credentials and deploys the exact verified artifact. Bootstrap IAM is administered separately; CI cannot edit IAM. Trust pins the immutable owner/repository IDs and main branch. No long-lived AWS access key is stored in GitHub.
+
+An administrator can create/update the bootstrap stack using `infra/bootstrap.yml` and `CAPABILITY_NAMED_IAM` in the intended region. It expects the existing `GitHubOIDCProvider-Arn` export. Inspect its outputs and configure repository variables `AWS_DEPLOY_ROLE_ARN`, `AWS_DEPLOYMENT_BUCKET_NAME`, and `AWS_EXECUTION_ROLE_ARN`. Provision the SecureString separately, then set `AUTH_KEYRING_PARAMETER=/wildduck-mcp/prod/auth-keyring` and `PUBLIC_BASE_URL` to the known Function URL HTTPS origin. Set `SERVERLESS_ACCESS_KEY` as a repository secret through the normal secret UI/stdin, and `DEPLOY_ENABLED=true` last.
+
+The issuer comes from the repository variable, avoiding a cyclic CloudFormation Function URL/environment reference. Local `bun run package` uses empty auth settings and explicit infrastructure placeholders without real keys or AWS access. `bun run deploy` refuses missing settings and unexpected parameter names. For an authorized deployment, validate first and inject the same settings using normal credential tooling. Never deploy placeholders directly with raw Serverless commands.
+
+Live deployment verification checks the package version, ready key loading, unauthenticated MCP 401 challenge and discovery issuer. It does not log in a real account. Real-account connection/reconnection and Claude, ChatGPT, Codex, Dot and Duet interoperability remain acceptance checks to perform after reviewed provisioning/deployment. A valid OAuth grant does not override a host's action-approval policies.
+
+Published Lambda versions and the previous artifact permit operator rollback. Restore the previous reviewed release/configuration and verify health/version, discovery and readiness; do not use `serverless remove` as rollback. Retain encryption keys required by surviving records and clients. The retained table and versioned artifact bucket outlive stack deletion. No custom domain, CloudFront, new KMS key, index or autoscaling resource is added.
 
 ## Branches and releases
 
-The public repository is [hughescr/wildduck-mcp](https://github.com/hughescr/wildduck-mcp), with `develop` as its default branch. `develop` is the development branch; `main` is the deployed release branch. The initial reviewed scaffold is tagged `0.1.0`. Tags use bare versions such as `0.1.1`, matching the existing Gitflow convention.
+`develop` is the default development branch and `main` is the deployed branch. Tags are bare package versions. Initialize with `bun run gitflow:init`. From clean develop, `bun pm version patch --no-git-tag-version` (or npm equivalent) invokes the postversion workflow: update lockfile, validate, commit, finish a Gitflow release and merge main back into develop. Nothing pushes automatically. Inspect status before recovering any failed release. `bun run test:release` exercises the release path in a disposable local repository.
 
-After cloning, initialize the local Gitflow settings once:
-
-```sh
-git switch develop
-bun run gitflow:init
-```
-
-Start with a clean `develop`, then release with either command:
-
-```sh
-bun pm version patch --no-git-tag-version
-# Or: npm version patch --no-git-tag-version
-```
-
-The `postversion` hook updates the Bun lockfile, validates, commits the version, runs `git flow release start` and `finish`, and returns to `develop` merged with `main`. It stops on errors and refuses unrelated working-tree changes. `--no-git-tag-version` is required for npm too: Gitflow owns the release commit/tag, so npm must not create its own first. Replace `patch` with `minor` or `major` as appropriate. A failed hook can leave the new version uncommitted or a release in progress; inspect `git status` and Gitflow's output before continuing. Nothing pushes automatically.
-
-```sh
-git push origin main develop --follow-tags
-```
-
-`bun run test:release` exercises this exact Bun/postversion/Gitflow path in a disposable local repository, checking the release tag, main version, develop ancestry and clean lockfile. It does not touch a remote.
-
-## CI and deployment bootstrap
-
-Pushes to `main` and `develop`, and pull requests targeting either, run the checks and build. A separate main-only job deploys the verified artifact with short-lived AWS OIDC credentials. `develop` and pull requests cannot assume the production deployment role. The local and CI artifact is `dist/function.zip`; it contains bundled JavaScript and its source map, with no runtime package installation.
-
-**The AWS bootstrap infrastructure and GitHub deployment settings are configured.** Every successful main push deploys automatically through the main-only OIDC role. When deployed, the application remains a scaffold: health is available, while readiness and MCP reject access until OAuth and mailbox tools are implemented. The steps below document the one-time setup for recreating this deployment; a fresh clone does not require repeating them.
-
-With administrator credentials for the intended account, bootstrap in `us-west-2`:
-
-```sh
-aws cloudformation deploy \
-  --region us-west-2 \
-  --stack-name wildduck-mcp-bootstrap \
-  --template-file infra/bootstrap.yml \
-  --capabilities CAPABILITY_NAMED_IAM
-aws cloudformation describe-stacks \
-  --region us-west-2 \
-  --stack-name wildduck-mcp-bootstrap \
-  --query 'Stacks[0].Outputs'
-```
-
-This expects the account's existing GitHub OIDC stack export `GitHubOIDCProvider-Arn`, following the existing site deployment pattern. It creates no new OIDC provider. This repository uses GitHub's immutable OIDC subject format: the bootstrap trust pins the owner/repository IDs and `refs/heads/main`, rather than accepting a renamed or recreated repository with the same slug. Inspect the current prefix with `gh api repos/hughescr/wildduck-mcp/actions/oidc/customization/sub` before recreating the bootstrap; a different repository requires a reviewed trust-policy update. Set these GitHub repository variables from the outputs:
-
-| Variable | Bootstrap output |
-| --- | --- |
-| `AWS_DEPLOY_ROLE_ARN` | `GitHubDeployRoleArn` |
-| `AWS_DEPLOYMENT_BUCKET_NAME` | `ArtifactBucketName` |
-| `AWS_EXECUTION_ROLE_ARN` | `ExecutionRoleArn` |
-
-Set the repository **secret** `SERVERLESS_ACCESS_KEY` using the normal GitHub secret UI or stdin; never put the value in a command argument or commit. For a newly bootstrapped deployment, set repository variable `DEPLOY_ENABLED=true` last, then push a release to main or dispatch the workflow on main. The scaffold will expose only health and fail-closed readiness/MCP endpoints until the OAuth implementation lands. The workflow performs live HTTP checks after deployment; it does not equate successful CloudFormation creation with a working application.
-
-For a deliberate local deployment after bootstrap, export the bucket name, execution-role ARN, and Serverless access key using the normal credential-injection tooling, then:
-
-```sh
-bun run validate
-bun run deploy
-```
-
-The deploy script refuses missing settings; packaging alone uses explicit unconfigured placeholders so local infrastructure validation needs no AWS credentials. Do not deploy with the raw Serverless command and placeholder defaults. `bun run package` validates the generated CloudFormation locally, without deploying. The bootstrap policy is scoped to this service's named resources. Release `0.1.2` was deployed successfully through the main-push CI workflow, including live version/readiness/MCP checks. Future CloudFormation resource changes still require reviewing the deployment role's handler permissions.
-
-Changing IAM policies requires an administrator bootstrap-stack update. The retained table and versioned artifact bucket outlive stack deletion; deleting them is a separate administrative action. Published Lambda versions allow an operator to roll back; use the prior known-good artifact/release and verify the health/version after deployment. Do not use `serverless remove` as a rollback.
-
-No custom hostname is selected yet. When one is needed, use Route 53, ACM and CloudFront as in the existing Serverless site projects; those resources and costs are intentionally absent from this scaffold.
-
-## Next implementation phase
-
-1. Implement browser login/MFA and OAuth discovery, PKCE, consent, client registration, refresh rotation and revocation.
-2. Resolve durable mailbox-bound upstream credentials. Ordinary backend user sessions currently expire after 14 inactive days or 180 total days; this service's refresh token cannot renew a dead upstream session. Periodic human reconnection remains a fallback.
-3. Add credential encryption and DynamoDB persistence with bounded retries under the fixed capacity budget.
-4. Implement bounded read/search, draft and submit tools. Never automatically retry an uncertain send.
-5. Test actual account connection/reconnection in Claude, ChatGPT/Codex and unattended-agent clients. A valid OAuth token does not override the host's action-approval policies.
+Release 0.1.2 was the deployed scaffold baseline. This auth implementation still requires reviewed key provisioning, IAM/bootstrap configuration and release deployment; source changes alone do not change the live service. Future phases add bounded mail tools and uncertain-send handling after OAuth acceptance.

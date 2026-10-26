@@ -18,6 +18,8 @@ provider:
   iam:
     role: ${env:AWS_EXECUTION_ROLE_ARN, 'arn:aws:iam::000000000000:role/wildduck-mcp-prod-execution'}
   environment:
+    PUBLIC_BASE_URL: ${env:PUBLIC_BASE_URL, ''}
+    AUTH_KEYRING_PARAMETER: ${env:AUTH_KEYRING_PARAMETER, ''}
     CREDENTIAL_TABLE_NAME:
       Ref: CredentialTable
   stackTags:

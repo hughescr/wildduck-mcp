@@ -1,18 +1,11 @@
-export interface Config {
-    readonly publicBaseUrl?: string;
-    readonly credentialTableName?: string;
-}
-
+export interface Config { readonly publicBaseUrl?: string; readonly credentialTableName?: string; readonly authKeyringParameter?: string }
 export function loadConfig(env: Record<string, string | undefined> = process.env): Config {
-    const publicBaseUrl = env['PUBLIC_BASE_URL'];
-    if (publicBaseUrl !== undefined) {
-        const url = new URL(publicBaseUrl);
-        if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || url.pathname !== '/') {
-            throw new Error('PUBLIC_BASE_URL must be an HTTPS origin without credentials, query, or fragment');
-        }
+    const raw = env['PUBLIC_BASE_URL'];
+    let publicBaseUrl: string | undefined;
+    if (raw) {
+        const url = new URL(raw);
+        if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || url.pathname !== '/') { throw new Error('PUBLIC_BASE_URL must be an HTTPS origin'); }
+        publicBaseUrl = url.origin;
     }
-    return {
-        ...(publicBaseUrl === undefined ? {} : { publicBaseUrl }),
-        ...(env['CREDENTIAL_TABLE_NAME'] === undefined ? {} : { credentialTableName: env['CREDENTIAL_TABLE_NAME'] }),
-    };
+    return { ...(publicBaseUrl ? { publicBaseUrl } : {}), ...(env['CREDENTIAL_TABLE_NAME'] ? { credentialTableName: env['CREDENTIAL_TABLE_NAME'] } : {}), ...(env['AUTH_KEYRING_PARAMETER'] ? { authKeyringParameter: env['AUTH_KEYRING_PARAMETER'] } : {}) };
 }

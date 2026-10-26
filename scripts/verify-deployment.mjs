@@ -8,9 +8,13 @@ const base = stack.Stacks[0].Outputs.find((entry) => entry.OutputKey === 'ApiLam
 assert.ok(base, 'Function URL missing from stack outputs');
 const health = await fetch(new URL('/healthz', base), { signal: AbortSignal.timeout(10_000) });
 assert.equal(health.status, 200);
-assert.deepEqual(await health.json(), { service: 'wildduck-mcp', version, status: 'scaffold' }, 'Live service must serve the checked-out release');
+assert.deepEqual(await health.json(), { service: 'wildduck-mcp', version, status: 'oauth' }, 'Live service must serve the checked-out release');
 const ready = await fetch(new URL('/readyz', base), { signal: AbortSignal.timeout(10_000) });
-assert.equal(ready.status, 503);
-assert.deepEqual(await ready.json(), { ready: false, reason: 'oauth_not_implemented' });
+assert.equal(ready.status, 200);
+assert.deepEqual(await ready.json(), { ready: true });
 const mcp = await fetch(new URL('/mcp', base), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}', signal: AbortSignal.timeout(10_000) });
-assert.equal(mcp.status, 503, 'Scaffold must not expose mailbox access before OAuth exists');
+assert.equal(mcp.status, 401, 'MCP requires OAuth authentication');
+assert.ok(mcp.headers.get('www-authenticate')?.includes('resource_metadata='));
+const metadata = await fetch(new URL('/.well-known/oauth-authorization-server', base), { signal: AbortSignal.timeout(10_000) });
+assert.equal(metadata.status, 200);
+assert.equal((await metadata.json()).issuer, new URL(base).origin);
