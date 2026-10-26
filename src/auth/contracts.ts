@@ -6,10 +6,11 @@ export interface Connection extends BaseRecord {
     kind: 'connection'; accountId: string; credentialGeneration: number;
     status: ConnectionStatus; credentials: Sealed;
 }
+export interface UpstreamCredentials { accessToken: string; profile: { id: string; name?: string; email?: string }; issuedAt: number }
 export interface Grant extends BaseRecord {
     kind: 'grant'; clientId: string; connectionId: string; accountId: string;
     resource: string; scopes: string[]; status: 'active' | 'revoked';
-    tokenVersion: number; refreshGeneration: number; refreshHash: string;
+    credentialGeneration: number; tokenVersion: number; refreshGeneration: number; refreshHash: string;
     previousRefreshHash?: string; receiptUntil?: number; receipt?: Sealed;
     receiptBinding?: string;
 }
@@ -25,7 +26,11 @@ export interface AtomicStore {
     /** Must be strongly consistent. Implementations reject expired records at callers. */
     get(kind: AuthRecord['kind'], id: string): Promise<AuthRecord | undefined>;
     /** All conditions and writes commit together. false means a known condition conflict.
-     * Unknown outcomes MUST throw TemporaryUnavailable, never claim a conflict. */
+     * Each operationId binds the exact write payload; identical retries return the original success.
+     * Adapters retry unknown outcomes with the SAME operationId and payload within the bounded deadline.
+     * Exhausted unknown outcomes MUST throw TemporaryUnavailable, never claim a conflict.
+     * DynamoDB ClientRequestToken deduplication lasts ten minutes; never retry beyond that window.
+     * Every put must have its revision/absence condition; reject duplicate key operations. */
     transact(write: AtomicWrite): Promise<boolean>;
 }
 export interface ClientIdentity { clientId: string; redirectUris: readonly string[] }
