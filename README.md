@@ -83,7 +83,7 @@ aws cloudformation describe-stacks \
   --query 'Stacks[0].Outputs'
 ```
 
-This expects the account's existing GitHub OIDC stack export `GitHubOIDCProvider-Arn`, following the existing site deployment pattern. It creates no new OIDC provider. Set these GitHub repository variables from the outputs:
+This expects the account's existing GitHub OIDC stack export `GitHubOIDCProvider-Arn`, following the existing site deployment pattern. It creates no new OIDC provider. This repository uses GitHub's immutable OIDC subject format: the bootstrap trust pins the owner/repository IDs and `refs/heads/main`, rather than accepting a renamed or recreated repository with the same slug. Inspect the current prefix with `gh api repos/hughescr/wildduck-mcp/actions/oidc/customization/sub` before recreating the bootstrap; a different repository requires a reviewed trust-policy update. Set these GitHub repository variables from the outputs:
 
 | Variable | Bootstrap output |
 | --- | --- |

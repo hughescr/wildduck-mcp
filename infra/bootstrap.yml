@@ -67,7 +67,9 @@ Resources:
             Condition:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
-                token.actions.githubusercontent.com:sub: repo:hughescr/wildduck-mcp:ref:refs/heads/main
+                # New repositories use immutable owner/repository IDs in the subject.
+                # Verify with: gh api repos/hughescr/wildduck-mcp/actions/oidc/customization/sub
+                token.actions.githubusercontent.com:sub: repo:hughescr@46348/wildduck-mcp@1434754693:ref:refs/heads/main
       Policies:
         - PolicyName: deploy
           PolicyDocument:

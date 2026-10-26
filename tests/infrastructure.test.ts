@@ -55,3 +55,31 @@ test('deployment can discover log groups without granting account-wide log mutat
         { 'Fn::Sub': 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/wildduck-mcp-prod-api:*' },
     ]);
 });
+
+interface TrustDocument {
+    Resources: {
+        GitHubDeployRole: {
+            Properties: {
+                AssumeRolePolicyDocument: {
+                    Statement: {
+                        Action: string;
+                        Condition: { StringEquals: Record<string, string> };
+                    }[];
+                };
+            };
+        };
+    };
+}
+
+test('OIDC trust binds the actual immutable repository identity and main branch only', async () => {
+    const bootstrap = Bun.YAML.parse(await Bun.file('infra/bootstrap.yml').text()) as TrustDocument;
+    const trust = bootstrap.Resources.GitHubDeployRole.Properties.AssumeRolePolicyDocument.Statement;
+    expect(trust).toHaveLength(1);
+    expect(trust[0]?.Action).toBe('sts:AssumeRoleWithWebIdentity');
+    expect(trust[0]?.Condition).toEqual({
+        StringEquals: {
+            'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
+            'token.actions.githubusercontent.com:sub': 'repo:hughescr@46348/wildduck-mcp@1434754693:ref:refs/heads/main',
+        },
+    });
+});
