@@ -10,7 +10,7 @@ import type { UpstreamCredentials } from '../src/auth/contracts';
 import { lambdaEvent } from './app.test';
 const issuer = 'https://service.example';
 const credentials: UpstreamCredentials = { accessToken: 'a'.repeat(40), profile: { id: 'a'.repeat(24), name: '<Account>' }, issuedAt: Math.floor(Date.now() / 1000) };
-function setup(totp = false) {
+function setup(totp = false, authMethod: 'none' | 'client_secret_basic' = 'none') {
     const crypto = new AuthCrypto({ activeKeyId: 'v1', keys: { v1: new Uint8Array(32).fill(3) } });
     const store = new MemoryStore();
     let state: 'valid' | 'expired' | 'temporary' = 'valid';
@@ -19,10 +19,10 @@ function setup(totp = false) {
     let loginCalls = 0;
     const runtime: AuthRuntime = { issuer, crypto, store, engine, clients, wildduck: { beginLogin: async (username, password) => { expect(username).toBe('user'); expect(password).toBe('password'); loginCalls++; return totp ? { kind: 'pendingTotp', accountId: credentials.profile.id, profile: credentials.profile, nonce: 'b'.repeat(40), provisionalToken: credentials.accessToken, issuedAt: credentials.issuedAt } : { kind: 'authenticated', credentials }; }, completeTotp: async (pending, code) => { expect(pending.accountId).toBe(credentials.profile.id); expect(code).toBe('123456'); return credentials; }, validateCredentials: async () => state, logout: async () => true } };
     const app = createApp({ config: { publicBaseUrl: issuer }, runtime: async () => runtime });
-    const registration = clients.register({ client_name: '<Client>', redirect_uris: ['http://127.0.0.1/callback'], token_endpoint_auth_method: 'none', application_type: 'native', grant_types: ['authorization_code', 'refresh_token'] });
+    const registration = clients.register({ client_name: '<Client>', redirect_uris: ['http://127.0.0.1/callback'], token_endpoint_auth_method: authMethod, application_type: 'native', grant_types: ['authorization_code', 'refresh_token'] });
     const verifier = 'v'.repeat(43);
     const params = new URLSearchParams({ response_type: 'code', client_id: registration.client_id, redirect_uri: 'http://127.0.0.1:5678/callback', resource: `${issuer}/mcp`, scope: 'profile mail:read', code_challenge_method: 'S256', code_challenge: digest(verifier), state: 'original-state' });
-    return { app, runtime, params, verifier, setState: (value: typeof state) => { state = value; }, loginCalls: () => loginCalls };
+    return { app, runtime, params, verifier, registration, setState: (value: typeof state) => { state = value; }, loginCalls: () => loginCalls };
 }
 function page(response: Response, html: string) {
     const fields = new URLSearchParams();
@@ -32,18 +32,19 @@ function page(response: Response, html: string) {
 async function post(app: ReturnType<typeof createApp>, path: string, fields: URLSearchParams, cookie?: string, origin = issuer) {
     return app.request(path, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', origin, ...(cookie ? { cookie } : {}) }, body: fields.toString() });
 }
-async function connect(env: ReturnType<typeof setup>) {
-    const start = await env.app.request(`/authorize?${env.params}`); expect(start.status).toBe(200);
+async function connect(env: ReturnType<typeof setup>, duplicate = false) {
+    const start = await env.app.request(`/authorize?${env.params}`); expect(start.status).toBe(200); expect(start.headers.get('referrer-policy')).toBe('same-origin'); expect(start.headers.get('content-security-policy')).toContain("form-action 'self' http://127.0.0.1:5678");
     const login = page(start, await start.text()); login.fields.set('username', 'user'); login.fields.set('password', 'password');
     let consent = await post(env.app, '/auth/login', login.fields, login.cookie);
     let html = await consent.text();
     if (html.includes('name="totp"')) { const mfa = page(consent, html); expect(html).not.toContain(credentials.accessToken); mfa.fields.set('totp', '123456'); consent = await post(env.app, '/auth/mfa', mfa.fields, mfa.cookie); html = await consent.text(); }
     expect(consent.status).toBe(200); expect(html).toContain('&lt;Account&gt;'); expect(html).not.toContain(credentials.accessToken); expect(html).not.toContain('value="password"');
     const approval = page(consent, html); approval.fields.set('decision', 'allow');
-    const redirect = await post(env.app, '/auth/consent', approval.fields, approval.cookie); expect(redirect.status).toBe(302);
+    const redirect = await post(env.app, '/auth/consent', approval.fields, approval.cookie); expect(redirect.status).toBe(302); expect(redirect.headers.get('referrer-policy')).toBe('no-referrer');
     const target = new URL(redirect.headers.get('location') ?? ''); expect(target.searchParams.get('iss')).toBe(issuer); expect(target.searchParams.get('state')).toBe('original-state');
+    if (duplicate) { expect((await post(env.app, '/auth/consent', approval.fields, approval.cookie)).status).toBe(302); }
     const fields = new URLSearchParams({ grant_type: 'authorization_code', client_id: env.params.get('client_id') ?? '', redirect_uri: env.params.get('redirect_uri') ?? '', resource: `${issuer}/mcp`, code: target.searchParams.get('code') ?? '', code_verifier: env.verifier });
-    const response = await post(env.app, '/token', fields); expect(response.status).toBe(200); return { tokens: await response.json(), fields };
+    const response = env.registration.client_secret ? await env.app.request('/token', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', authorization: `Basic ${Buffer.from(`${encodeURIComponent(env.registration.client_id)}:${encodeURIComponent(env.registration.client_secret)}`).toString('base64')}` }, body: fields.toString() }) : await post(env.app, '/token', fields); expect(response.status).toBe(200); return { tokens: await response.json(), fields };
 }
 test.each([false, true])('browser consent, PKCE, native callback and authenticated MCP (TOTP=%s)', async totp => {
     const env = setup(totp); const { tokens, fields } = await connect(env);
@@ -108,4 +109,26 @@ test('PKCE failure preserves code for the correct verifier and HTTP revocation i
     expect((await post(env.app, '/token', fields)).status).toBe(400); fields.set('code_verifier', env.verifier); const response = await post(env.app, '/token', fields); expect(response.status).toBe(200); const tokens = await response.json();
     expect((await post(env.app, '/revoke', new URLSearchParams({ client_id: env.params.get('client_id') ?? '', token: tokens.refresh_token }))).status).toBe(200);
     expect((await env.app.request('/mcp', { headers: { authorization: `Bearer ${tokens.access_token}` } })).status).toBe(401);
+});
+test('matching Basic body client_id completes a confidential authorization-code exchange', async () => {
+    const env = setup(false, 'client_secret_basic'); const { tokens } = await connect(env); expect(tokens.refresh_token).toBeString();
+    const body = new URLSearchParams({ grant_type: 'refresh_token', resource: `${issuer}/mcp`, refresh_token: tokens.refresh_token, client_id: env.registration.client_id });
+    const headers = { 'content-type': 'application/x-www-form-urlencoded', authorization: `Basic ${Buffer.from(`${encodeURIComponent(env.registration.client_id)}:${encodeURIComponent(env.registration.client_secret ?? '')}`).toString('base64')}` };
+    expect((await env.app.request('/token', { method: 'POST', headers, body: body.toString() })).status).toBe(200);
+    body.set('client_id', 'mismatched'); expect((await env.app.request('/token', { method: 'POST', headers, body: body.toString() })).status).toBe(401);
+    body.set('client_id', env.registration.client_id); body.set('client_secret', env.registration.client_secret ?? ''); expect((await env.app.request('/token', { method: 'POST', headers, body: body.toString() })).status).toBe(401);
+    body.delete('client_secret'); body.set('client_assertion', 'unsupported'); expect((await env.app.request('/token', { method: 'POST', headers, body: body.toString() })).status).toBe(401);
+    body.delete('client_assertion'); expect((await env.app.request('/token', { method: 'POST', headers: { ...headers, authorization: `${headers.authorization}, ${headers.authorization}` }, body: body.toString() })).status).toBe(401);
+});
+test('a duplicate consent preserves the first callback credential generation', async () => {
+    const env = setup(); const { tokens } = await connect(env, true); expect(tokens.access_token).toBeString();
+    expect((await env.runtime.store.get('connection', credentials.profile.id))?.kind).toBe('connection');
+    const connection = await env.runtime.store.get('connection', credentials.profile.id); if (connection?.kind !== 'connection') { throw new Error(); } expect(connection.credentialGeneration).toBe(1);
+});
+test.each(['expired', 'revoked', 'reconnect_required'])('identical consent cannot revive %s stored credentials', async state => {
+    const env = setup(); const start = await env.app.request(`/authorize?${env.params}`); const login = page(start, await start.text()); login.fields.set('username', 'user'); login.fields.set('password', 'password');
+    const consent = await post(env.app, '/auth/login', login.fields, login.cookie); const approve = page(consent, await consent.text()); approve.fields.set('decision', 'allow'); expect((await post(env.app, '/auth/consent', approve.fields, approve.cookie)).status).toBe(302);
+    const previous = await env.runtime.store.get('connection', credentials.profile.id); if (previous?.kind !== 'connection') { throw new Error(); }
+    await env.runtime.store.transact({ conditions: [{ kind: 'connection', id: previous.id, revision: previous.revision }], puts: [{ ...previous, revision: previous.revision + 1, ...(state === 'expired' ? { expiresAt: Math.floor(Date.now() / 1000) - 1 } : { status: state as 'revoked' | 'reconnect_required' }) }], operationId: `test-${state}` });
+    expect((await post(env.app, '/auth/consent', approve.fields, approve.cookie)).status).toBe(400);
 });

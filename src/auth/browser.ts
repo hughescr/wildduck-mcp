@@ -1,7 +1,7 @@
 import type { Context } from 'hono';
 import type { AuthRuntime } from './runtime';
 import { AUTH_FIELDS, authorization, form, required, unique, type Authorization } from './http';
-import { digest, equal, randomId } from './crypto';
+import { connectionAAD, digest, equal, randomId } from './crypto';
 import { OAuthError, type Sealed, type UpstreamCredentials } from './contracts';
 import { WildduckError, type PendingTotp } from '../wildduck';
 const COOKIE = '__Host-wildduck-flow';
@@ -24,25 +24,26 @@ function read(context: Context, runtime: AuthRuntime): Flow {
         return flow;
     } catch { throw new OAuthError('invalid_request'); }
 }
-function page(context: Context, title: string, body: string) {
-    context.header('Content-Security-Policy', "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
-    context.header('Referrer-Policy', 'no-referrer');
+function page(context: Context, title: string, body: string, callbackOrigin?: string) {
+    context.header('Content-Security-Policy', `default-src 'none'; form-action 'self'${callbackOrigin ? ` ${callbackOrigin}` : ''}; frame-ancestors 'none'; base-uri 'none'`);
+    context.header('Referrer-Policy', 'same-origin');
     return context.html(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${escape(title)}</title><main><h1>${escape(title)}</h1>${body}</main></html>`);
 }
 function render(context: Context, runtime: AuthRuntime, auth: Authorization, flow: Flow) {
     cookie(context, runtime, flow);
     const hidden = [...Object.entries(auth.fields), ['csrf', flow.csrf]].map(([key, value]) => `<input type="hidden" name="${escape(key ?? '')}" value="${escape(value ?? '')}">`).join('');
     const start = (path: string) => `<form method="post" action="${path}">${hidden}`;
-    const cancel = '<button name="decision" value="cancel">Cancel</button></form>';
-    if (flow.pending) { return page(context, 'Verify your account', `${start('/auth/mfa')}<label>Authenticator code <input name="totp" autocomplete="one-time-code" inputmode="numeric" pattern="[0-9]{6}" required></label><button>Verify</button>${cancel}`); }
+    const cancel = '<button name="decision" value="cancel" formnovalidate>Cancel</button></form>';
+    if (flow.pending) { return page(context, 'Verify your account', `${start('/auth/mfa')}<label>Authenticator code <input name="totp" autocomplete="one-time-code" inputmode="numeric" pattern="[0-9]{6}" required></label><button>Verify</button>${cancel}`, new URL(auth.redirectUri).origin); }
     if (flow.credentials) {
         const profile = flow.credentials.profile;
         const identity = auth.client.clientId.startsWith('https://') ? new URL(auth.client.clientId).hostname : 'Registered OAuth client';
-        return page(context, 'Authorize connection', `<p>${escape(auth.client.name)} (${escape(identity)}) requests account ${escape(profile.name ?? profile.id)}.</p><p>Redirect destination: ${escape(new URL(auth.redirectUri).hostname)}</p><p>Keep this connection for up to 180 days. Your mail service may require reconnection sooner.</p>${start('/auth/consent')}<ul>${auth.scopes.map(scope => `<li>${escape(scope)}</li>`).join('')}</ul>${auth.scopes.includes('mail:send') ? '<label><input type="checkbox" name="allow_send" value="yes" required> Allow sending mail when future tools support it</label>' : ''}<button name="decision" value="allow">Allow connection</button>${cancel}`);
+        return page(context, 'Authorize connection', `<p>${escape(auth.client.name)} (${escape(identity)}) requests account ${escape(profile.name ?? profile.id)}.</p><p>Redirect destination: ${escape(new URL(auth.redirectUri).hostname)}</p><p>Keep this connection for up to 180 days. Your mail service may require reconnection sooner.</p>${start('/auth/consent')}<ul>${auth.scopes.map(scope => `<li>${escape(scope)}</li>`).join('')}</ul>${auth.scopes.includes('mail:send') ? '<label><input type="checkbox" name="allow_send" value="yes" required> Allow sending mail when future tools support it</label>' : ''}<button name="decision" value="allow">Allow connection</button>${cancel}`, new URL(auth.redirectUri).origin);
     }
-    return page(context, 'Connect your mail account', `<p>Sign in to continue to ${escape(auth.client.name)}. TOTP authenticator codes are supported. Passkey-only accounts must use webmail; this origin cannot use existing webmail passkeys.</p>${start('/auth/login')}<label>Username <input name="username" autocomplete="username" required maxlength="254"></label><label>Password <input type="password" name="password" autocomplete="current-password" required maxlength="256"></label><button>Sign in</button>${cancel}`);
+    return page(context, 'Connect your mail account', `<p>Sign in to continue to ${escape(auth.client.name)}. TOTP authenticator codes are supported. Passkey-only accounts must use webmail; this origin cannot use existing webmail passkeys.</p>${start('/auth/login')}<label>Username <input name="username" autocomplete="username" required maxlength="254"></label><label>Password <input type="password" name="password" autocomplete="current-password" required maxlength="256"></label><button>Sign in</button>${cancel}`, new URL(auth.redirectUri).origin);
 }
 function redirect(context: Context, runtime: AuthRuntime, auth: Authorization, values: Record<string, string>) {
+    context.header('Referrer-Policy', 'no-referrer');
     cookie(context, runtime); const target = new URL(auth.redirectUri);
     for (const [key, value] of Object.entries({ ...values, iss: runtime.issuer, ...(auth.fields.state === undefined ? {} : { state: auth.fields.state }) })) { target.searchParams.set(key, value); }
     return context.redirect(target.href, 302);
@@ -77,7 +78,13 @@ export async function postBrowser(context: Context, runtime: AuthRuntime) {
             const accountId = flow.credentials.profile.id;
             const previous = await runtime.store.get('connection', accountId);
             if (previous && (previous.kind !== 'connection' || previous.accountId !== accountId)) { throw new OAuthError('invalid_request'); }
-            const connection = await runtime.engine.connectOrReconnect({ accountId, credentials: flow.credentials, expiresAt: now() + 180 * 86400, ...(previous?.kind === 'connection' ? { expectedCredentialGeneration: previous.credentialGeneration } : {}) });
+            const stored = previous?.kind === 'connection' ? runtime.crypto.open<UpstreamCredentials>('upstream-credentials', connectionAAD(previous), previous.credentials) : undefined;
+            const identical = stored !== undefined && equal(stored.accessToken, flow.credentials.accessToken) && stored.issuedAt === flow.credentials.issuedAt && stored.profile.id === flow.credentials.profile.id && stored.profile.name === flow.credentials.profile.name && stored.profile.email === flow.credentials.profile.email;
+            if (identical && previous && (previous.expiresAt <= now() || previous.status !== 'active')) { throw new OAuthError('invalid_grant'); }
+            // Duplicate delivery of this consent must not rotate the canonical credential
+            // generation and invalidate an already returned code. issueCode validates the
+            // backend session and conditions its write on the unchanged connection.
+            const connection = identical && previous ? previous : await runtime.engine.connectOrReconnect({ accountId, credentials: flow.credentials, expiresAt: now() + 180 * 86400, ...(previous?.kind === 'connection' ? { expectedCredentialGeneration: previous.credentialGeneration } : {}) });
             const code = await runtime.engine.issueCode({ client: auth.client, connectionId: connection.id, redirectUri: auth.redirectUri, resource: auth.resource, scopes: auth.scopes, challenge: auth.challenge });
             return redirect(context, runtime, auth, { code });
         }

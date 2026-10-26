@@ -36,8 +36,8 @@ export async function authenticate(runtime: AuthRuntime, request: Request, field
     const header = request.headers.get('authorization');
     let id = fields.client_id; let secret = fields.client_secret; let method: 'none' | 'client_secret_basic' | 'client_secret_post' = secret === undefined ? 'none' : 'client_secret_post';
     if (header !== null) {
-        if (id !== undefined || secret !== undefined || !/^Basic [A-Za-z0-9+/]+=*$/i.test(header)) { throw new ClientError('invalid_client'); }
-        try { const raw = Buffer.from(header.slice(6), 'base64').toString('utf8'); const split = raw.indexOf(':'); if (split < 1) { throw new Error(); } id = decodeURIComponent(raw.slice(0, split).replace(/\+/g, ' ')); secret = decodeURIComponent(raw.slice(split + 1).replace(/\+/g, ' ')); method = 'client_secret_basic'; }
+        if (secret !== undefined || !/^Basic [A-Za-z0-9+/]+=*$/i.test(header)) { throw new ClientError('invalid_client'); }
+        try { const raw = Buffer.from(header.slice(6), 'base64').toString('utf8'); const split = raw.indexOf(':'); if (split < 1) { throw new Error(); } const basicId = decodeURIComponent(raw.slice(0, split).replaceAll('+', ' ')); if (id !== undefined && id !== basicId) { throw new Error(); } id = basicId; secret = decodeURIComponent(raw.slice(split + 1).replace(/\+/g, ' ')); method = 'client_secret_basic'; }
         catch { throw new ClientError('invalid_client'); }
     }
     if (!id) { throw new ClientError('invalid_client'); }

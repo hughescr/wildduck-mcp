@@ -14,8 +14,8 @@ export interface AppOptions { config?: Config; runtime?: RuntimeProvider }
 export function createApp(options: AppOptions = {}) {
     const config = options.config ?? loadConfig(); const runtime = options.runtime ?? createRuntimeProvider(config);
     const app = new Hono();
-    app.use('*', secureHeaders());
-    app.use('*', async (context, next) => { context.header('Cache-Control', 'no-store'); await next(); });
+    app.use('*', secureHeaders({ referrerPolicy: false }));
+    app.use('*', async (context, next) => { context.header('Cache-Control', 'no-store'); context.header('Referrer-Policy', 'no-referrer'); await next(); });
     app.use('/mcp', bodyLimit({ maxSize: 1024 * 1024, onError: context => context.json({ error: 'payload_too_large' }, 413) }));
     app.use('*', async (context, next) => {
         if (context.req.method === 'OPTIONS') { context.header('Access-Control-Allow-Origin', '*'); context.header('Access-Control-Allow-Headers', 'Authorization, Content-Type, MCP-Protocol-Version'); context.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS'); return context.body(null, 204); }
