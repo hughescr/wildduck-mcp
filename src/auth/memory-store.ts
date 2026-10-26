@@ -8,6 +8,9 @@ export class MemoryStore implements AtomicStore {
         const value = this.records.get(this.key(kind, id)); return value && structuredClone(value);
     }
     async transact(write: AtomicWrite): Promise<boolean> {
+        const conditionKeys = write.conditions.map(c => this.key(c.kind, c.id));
+        const putKeys = write.puts.map(record => this.key(record.kind, record.id));
+        if (new Set(conditionKeys).size !== conditionKeys.length || new Set(putKeys).size !== putKeys.length || putKeys.some(key => !conditionKeys.includes(key))) { throw new Error('Every unique put requires a unique condition'); }
         const payload = JSON.stringify({ conditions: write.conditions, puts: write.puts });
         const previous = this.operations.get(write.operationId);
         if (previous !== undefined) {

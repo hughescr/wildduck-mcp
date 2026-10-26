@@ -11,7 +11,7 @@ export function digest(value: string): string { return createHash('sha256').upda
 export function randomId(): string { return randomBytes(32).toString('base64url'); }
 export class AuthCrypto {
     constructor(private readonly keyring: Keyring) {
-        if (!keyring.keys[keyring.activeKeyId] || Object.values(keyring.keys).some(key => key.byteLength !== 32)) {throw new Error('A versioned 256-bit keyring is required');}
+        if (Object.keys(keyring.keys).some(id => !/^[A-Za-z0-9_-]{1,64}$/.test(id)) || !Object.hasOwn(keyring.keys, keyring.activeKeyId) || Object.values(keyring.keys).some(key => key.byteLength !== 32)) {throw new Error('A versioned 256-bit keyring is required');}
     }
     private key(id: string, purpose: string): Buffer {
         const root = this.keyring.keys[id]; if (!root) {throw new OAuthError('invalid_token');}

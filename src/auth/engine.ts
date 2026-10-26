@@ -31,8 +31,10 @@ export class AuthEngine {
             revision: existing ? existing.revision + 1 : 0, status: 'active', expiresAt: request.expiresAt,
             credentials: { keyId: '', nonce: '', ciphertext: '', tag: '' },
         };
-        connection.credentials = this.crypto.seal('upstream-credentials', connectionAAD(connection), request.credentials);
-        await this.validateConnection(connection);
+        const { accessToken, profile, issuedAt } = request.credentials;
+        const credentials: UpstreamCredentials = { accessToken, profile: { id: profile.id, ...(profile.name === undefined ? {} : { name: profile.name }), ...(profile.email === undefined ? {} : { email: profile.email }) }, issuedAt };
+        connection.credentials = this.crypto.seal('upstream-credentials', connectionAAD(connection), credentials);
+        await this.validateConnection(connection, false);
         if (!await this.store.transact({ conditions: [{ kind: 'connection', id: connection.id, revision: existing?.revision ?? null }], puts: [connection], operationId: randomId() })) { throw new TemporaryUnavailable(); }
         return connection;
     }
@@ -41,12 +43,12 @@ export class AuthEngine {
         if (record?.kind !== 'connection' || record.expiresAt <= this.now() || record.status !== 'active') {throw new OAuthError('invalid_grant');}
         return record;
     }
-    private async validateConnection(connection: Connection): Promise<void> {
+    private async validateConnection(connection: Connection, persisted = true): Promise<void> {
         let result: 'valid' | 'expired' | 'temporary';
         try { result = await this.backend.validate(connection); } catch { throw new TemporaryUnavailable(); }
         if (result === 'temporary') {throw new TemporaryUnavailable();}
         if (result === 'expired') {
-            await this.store.transact({ conditions: [condition(connection)], puts: [{ ...connection, revision: connection.revision + 1, status: 'reconnect_required' }], operationId: randomId() });
+            if (persisted) { await this.store.transact({ conditions: [condition(connection)], puts: [{ ...connection, revision: connection.revision + 1, status: 'reconnect_required' }], operationId: randomId() }); }
             throw new OAuthError('invalid_grant');
         }
     }
@@ -54,7 +56,7 @@ export class AuthEngine {
         if (request.resource !== this.resource || !request.client.redirectUris.includes(request.redirectUri) || !/^[A-Za-z0-9_-]{43}$/.test(request.challenge) || request.scopes.length === 0 || request.scopes.some(s => !['mail:read', 'mail:modify', 'mail:draft', 'mail:send', 'profile'].includes(s))) {throw new OAuthError('invalid_request');}
         const connection = await this.connection(request.connectionId);
         await this.validateConnection(connection);
-        const code = randomId();
+        const code = this.crypto.sign('authorization-code', randomId());
         const record: AuthorizationCode = { kind: 'code', id: digest(code), revision: 0, expiresAt: this.now() + 120, clientId: request.client.clientId, connectionId: connection.id, accountId: connection.accountId, credentialGeneration: connection.credentialGeneration, redirectUri: request.redirectUri, resource: request.resource, scopes: scopesKey(request.scopes).split(' '), challenge: request.challenge };
         if (!await this.store.transact({ conditions: [condition(connection), { kind: 'code', id: record.id, revision: null }], puts: [record], operationId: randomId() })) {throw new TemporaryUnavailable();}
         return code;
@@ -65,12 +67,14 @@ export class AuthEngine {
         return { access_token: this.crypto.token({ ...common, kind: 'access', generation: grant.refreshGeneration, expiresAt: now + expiresIn, secret: randomId() }), refresh_token: this.crypto.token({ ...common, kind: 'refresh', generation: grant.refreshGeneration, secret: randomId() }), token_type: 'Bearer', expires_in: expiresIn, scope: scopesKey(grant.scopes) };
     }
     async exchange(request: ExchangeRequest): Promise<TokenResponse> {
-        if (!/^[A-Za-z0-9_-]{43}$/.test(request.code) || !/^[A-Za-z0-9._~-]{43,128}$/.test(request.verifier)) {throw new OAuthError('invalid_grant');}
+        if (!/^[A-Za-z0-9._~-]{43,128}$/.test(request.verifier)) {throw new OAuthError('invalid_grant');}
+        try { if (!/^[A-Za-z0-9_-]{43}$/.test(this.crypto.verify('authorization-code', request.code))) { throw new Error('Invalid code'); } } catch { throw new OAuthError('invalid_grant'); }
         const code = await this.store.get('code', digest(request.code));
         if (code?.kind !== 'code' || code.expiresAt <= this.now() || code.consumedGrantId || code.clientId !== request.client.clientId || code.redirectUri !== request.redirectUri || !request.client.redirectUris.includes(request.redirectUri) || code.resource !== request.resource || request.resource !== this.resource || !equal(code.challenge, digest(request.verifier))) {throw new OAuthError('invalid_grant');}
         const connection = await this.connection(code.connectionId);
         if (connection.accountId !== code.accountId || connection.credentialGeneration !== code.credentialGeneration) {throw new OAuthError('invalid_grant');}
         await this.validateConnection(connection);
+        if (code.expiresAt <= this.now() || connection.expiresAt <= this.now()) { throw new OAuthError('invalid_grant'); }
         const grant: Grant = { kind: 'grant', id: randomId(), revision: 0, expiresAt: this.now() + this.grantSeconds, clientId: code.clientId, connectionId: code.connectionId, accountId: code.accountId, resource: code.resource, scopes: code.scopes, status: 'active', credentialGeneration: connection.credentialGeneration, tokenVersion: 0, refreshGeneration: 0, refreshHash: '' };
         const response = this.tokens(grant); grant.refreshHash = digest(response.refresh_token);
         if (!await this.store.transact({ conditions: [condition(code), condition(connection), { kind: 'grant', id: grant.id, revision: null }], puts: [{ ...code, revision: code.revision + 1, consumedGrantId: grant.id }, grant], operationId: randomId() })) {throw new OAuthError('invalid_grant');}
@@ -118,6 +122,7 @@ export class AuthEngine {
         const connection = await this.connection(grant.connectionId);
         if (connection.accountId !== grant.accountId) {throw new OAuthError('invalid_grant');}
         await this.validateConnection(connection);
+        if (grant.expiresAt <= this.now() || connection.expiresAt <= this.now()) { throw new OAuthError('invalid_grant'); }
         const next: Grant = { ...grant, revision: grant.revision + 1, refreshGeneration: grant.refreshGeneration + 1, credentialGeneration: connection.credentialGeneration, scopes: (request.scopes === undefined ? grant.scopes : scopesKey(request.scopes).split(' ')), previousRefreshHash: hash, receiptBinding: binding, receiptUntil: this.now() + this.grace };
         const response = this.tokens(next); next.refreshHash = digest(response.refresh_token);
         next.receipt = this.crypto.seal('refresh-receipt', this.receiptAAD(next, binding), response);
@@ -138,11 +143,15 @@ export class AuthEngine {
     }
     async revoke(token: string, client: ClientIdentity): Promise<void> {
         let found: { grant: Grant; generation: number };
-        try { found = await this.grant(token, 'refresh'); } catch (error) { if (error instanceof OAuthError && error.error === 'invalid_token') { return; } throw error; }
+        try { found = await this.grant(token, 'refresh'); } catch (error) {
+            if (!(error instanceof OAuthError) || error.error !== 'invalid_token') { throw error; }
+            try { found = await this.grant(token, 'access'); } catch (accessError) {
+                if (accessError instanceof OAuthError && accessError.error === 'invalid_token') { return; }
+                throw accessError;
+            }
+        }
         const { grant } = found;
-        if (grant.clientId !== client.clientId) {return;}
-        const hash = digest(token);
-        if (!equal(grant.refreshHash, hash) && !(grant.previousRefreshHash && equal(grant.previousRefreshHash, hash))) {return;}
+        if (grant.clientId !== client.clientId) { return; }
         if (!await this.store.transact({ conditions: [condition(grant)], puts: [{ ...grant, revision: grant.revision + 1, status: 'revoked', tokenVersion: grant.tokenVersion + 1 }], operationId: randomId() })) {throw new TemporaryUnavailable();}
     }
 }
