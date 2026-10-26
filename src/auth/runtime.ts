@@ -6,7 +6,7 @@ import { ClientRegistry } from './clients';
 import { DynamoAtomicStore } from './dynamo-store';
 import { SsmKeyringProvider } from './keyring-provider';
 import type { AtomicStore } from './contracts';
-export interface AuthRuntime { issuer: string; crypto: AuthCrypto; engine: AuthEngine; clients: ClientRegistry; store: AtomicStore; wildduck: Pick<WildduckClient, 'beginLogin' | 'completeTotp' | 'validateCredentials' | 'logout'> }
+export interface AuthRuntime { issuer: string; crypto: AuthCrypto; engine: AuthEngine; clients: ClientRegistry; store: AtomicStore; wildduck: Pick<WildduckClient, 'beginLogin' | 'completeTotp' | 'validateCredentials' | 'logout' | 'listInboxSubjects'> }
 export type RuntimeProvider = () => Promise<AuthRuntime | undefined>;
 /** Refresh the keyring cache on every request; never pin retired keys in a singleton engine. */
 export function createRuntimeProvider(config: Config): RuntimeProvider {

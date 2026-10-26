@@ -3,6 +3,7 @@ import { bodyLimit } from 'hono/body-limit';
 import { secureHeaders } from 'hono/secure-headers';
 import { version } from '../package.json';
 import { handleMcp } from './mcp';
+import { WildduckError } from './wildduck';
 import { loadConfig, type Config } from './config';
 import { createRuntimeProvider, type RuntimeProvider } from './auth/runtime';
 import { authenticate, authorization, boundedText, challenge, form, metadata, required, scopes, unique, SCOPES } from './auth/http';
@@ -66,7 +67,11 @@ export function createApp(options: AppOptions = {}) {
                 if (state === 'temporary') { return context.json({ error: 'temporarily_unavailable' }, 503); }
                 if (state === 'expired') { return unauthorized(); }
             }
-            return handleMcp(context.req.raw, { token, clientId: grant.clientId, scopes: identity.scopes, resource: new URL(auth.engine.resource), extra: { ...identity } }, identity, credentials.profile);
+            if (record.accountId !== identity.accountId || record.id !== identity.connectionId || credentials.profile?.id !== identity.accountId) { return unauthorized(); }
+            return handleMcp(context.req.raw, { token, clientId: grant.clientId, scopes: identity.scopes, resource: new URL(auth.engine.resource), extra: { ...identity } }, identity, credentials.profile, limit => {
+                if (record.status !== 'active' || record.expiresAt <= Math.floor(Date.now() / 1000)) { throw new WildduckError('authentication_failed'); }
+                return auth.wildduck.listInboxSubjects(identity.accountId, credentials, limit);
+            });
         } catch (error) { if (error instanceof OAuthError && error.error !== 'temporarily_unavailable') { return unauthorized(); } throw error; }
     });
     app.notFound(context => context.json({ error: 'not_found' }, 404));

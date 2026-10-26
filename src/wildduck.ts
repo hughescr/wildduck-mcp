@@ -11,6 +11,7 @@ export interface PendingTotp {
     provisionalToken?: string; issuedAt: number;
 }
 export type LoginResult = { kind: 'authenticated'; credentials: UpstreamCredentials } | PendingTotp;
+export interface InboxSubject { uid: number; subject: string }
 export type WildduckErrorCode = 'invalid_input' | 'authentication_failed' | 'action_required' | 'unsupported_mfa' | 'temporary';
 /** Messages deliberately contain neither upstream bodies nor credentials. */
 export class WildduckError extends Error {
@@ -142,6 +143,32 @@ export class WildduckClient {
             if (result.status === 403 && result.body['code'] === 'InvalidToken') { return 'expired'; }
             return result.status === 200 && result.body['success'] === true && result.body['error'] === undefined && result.body['code'] === undefined ? 'valid' : 'temporary';
         } catch { return 'temporary'; }
+    }
+    /** Resolve only this account's canonical INBOX, then batch-list newest received mail.
+     * The backend summary includes extra metadata; discard it without fetching messages. */
+    async listInboxSubjects(accountId: string, credentials: UpstreamCredentials, limit = 10): Promise<InboxSubject[]> {
+        if (!ACCOUNT.test(accountId) || !credentials || !validToken(credentials.accessToken) ||
+            !profileValid(credentials.profile, accountId) || !Number.isSafeInteger(credentials.issuedAt) ||
+            !Number.isInteger(limit) || limit < 1 || limit > 20) { throw new WildduckError('invalid_input'); }
+        const get = async (path: string) => {
+            const response = await this.request(path, 'GET', undefined, credentials.accessToken);
+            if (response.status === 403 && response.body['code'] === 'InvalidToken') { throw new WildduckError('authentication_failed'); }
+            if (response.status !== 200 || response.body['success'] !== true || response.body['error'] !== undefined || response.body['code'] !== undefined) { throw new WildduckError('temporary'); }
+            return response.body;
+        };
+        const mailbox = await get(`/users/${accountId}/mailboxes/resolve?path=INBOX`);
+        if (mailbox['path'] !== 'INBOX' || typeof mailbox['id'] !== 'string' || !ACCOUNT.test(mailbox['id'])) { throw new WildduckError('temporary'); }
+        // Omit unseen entirely: false would restrict results to already-seen messages.
+        const listing = await get(`/users/${accountId}/mailboxes/${mailbox['id']}/messages?limit=${limit}&order=desc`);
+        const messages = listing['results'];
+        if (!Array.isArray(messages) || messages.length > limit) { throw new WildduckError('temporary'); }
+        const seen = new Set<number>();
+        return messages.map((message: unknown) => {
+            if (!object(message) || !Number.isSafeInteger(message['id']) || typeof message['id'] !== 'number' || message['id'] < 1 || message['id'] > 4294967295 ||
+                typeof message['subject'] !== 'string' || seen.has(message['id']) || message['mailbox'] !== mailbox['id']) { throw new WildduckError('temporary'); }
+            seen.add(message['id']);
+            return { uid: message['id'], subject: message['subject'] };
+        });
     }
     /** Best effort only: upstream may report success despite a Redis revocation failure. */
     async logout(accessToken: string): Promise<boolean> {
