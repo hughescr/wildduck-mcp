@@ -100,7 +100,7 @@ bun run validate
 bun run deploy
 ```
 
-The deploy script refuses missing settings; packaging alone uses explicit unconfigured placeholders so local infrastructure validation needs no AWS credentials. Do not deploy with the raw Serverless command and placeholder defaults. `bun run package` validates the generated CloudFormation locally, without deploying. The initial bootstrap policy is scoped to this service's named resources, but live deployment and its exact CloudFormation-handler permission matrix have not been tested yet.
+The deploy script refuses missing settings; packaging alone uses explicit unconfigured placeholders so local infrastructure validation needs no AWS credentials. Do not deploy with the raw Serverless command and placeholder defaults. `bun run package` validates the generated CloudFormation locally, without deploying. The bootstrap policy is scoped to this service's named resources. Release `0.1.2` was deployed successfully through the main-push CI workflow, including live version/readiness/MCP checks. Future CloudFormation resource changes still require reviewing the deployment role's handler permissions.
 
 Changing IAM policies requires an administrator bootstrap-stack update. The retained table and versioned artifact bucket outlive stack deletion; deleting them is a separate administrative action. Published Lambda versions allow an operator to roll back; use the prior known-good artifact/release and verify the health/version after deployment. Do not use `serverless remove` as a rollback.
 
