@@ -6,6 +6,39 @@
   "private": true,
   "license": "UNLICENSED",
   "author": "Craig Hughes",
-  "repository": { "type": "git", "url": "https://github.com/hughescr/wildduck-mcp.git" },
-  "engines": { "node": ">=26 <27", "bun": ">=1.4.4" }
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hughescr/wildduck-mcp.git"
+  },
+  "engines": {
+    "node": ">=26 <27",
+    "bun": ">=1.4.4"
+  },
+  "dependencies": {
+    "@hono/aws-lambda": "^1.0.1",
+    "@modelcontextprotocol/server": "^2.4.0",
+    "hono": "^4.13.14"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.4",
+    "oxlint": "^1.89.0",
+    "serverless": "^4.45.0"
+  },
+  "scripts": {
+    "dev": "bun --hot src/dev.ts",
+    "typecheck": "bun check --no-script",
+    "lint": "oxlint --deny-warnings .",
+    "test": "bun test",
+    "build": "bun scripts/build.ts",
+    "smoke": "node scripts/smoke.mjs",
+    "validate": "bun check --no-script && bun run lint && bun test && bun run build && bun run smoke",
+    "package": "serverless package --stage prod",
+    "deploy": "bash scripts/deploy.sh",
+    "postversion": "bash scripts/postversion.sh",
+    "gitflow:init": "bash scripts/init-gitflow.sh",
+    "test:release": "bash scripts/test-release.sh"
+  },
+  "trustedDependencies": [
+    "serverless"
+  ]
 }

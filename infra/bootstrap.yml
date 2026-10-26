@@ -1,0 +1,121 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: One-time artifact bucket and IAM roles for wildduck-mcp production CI
+
+Resources:
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: OldArtifactVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: wildduck-mcp-prod-execution
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: runtime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/wildduck-mcp-prod-api:*
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:ConditionCheckItem]
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/wildduck-mcp-prod-state
+                Condition:
+                  ForAllValues:StringLike:
+                    dynamodb:LeadingKeys: ['wildduck-mcp#*']
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: wildduck-mcp-github-deploy
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated:
+                Fn::ImportValue: GitHubOIDCProvider-Arn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: repo:hughescr/wildduck-mcp:ref:refs/heads/main
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [cloudformation:CreateStack, cloudformation:UpdateStack, cloudformation:CreateChangeSet, cloudformation:DeleteChangeSet, cloudformation:DescribeChangeSet, cloudformation:ExecuteChangeSet, cloudformation:DescribeStacks, cloudformation:DescribeStackEvents, cloudformation:DescribeStackResource, cloudformation:DescribeStackResources, cloudformation:GetTemplate, cloudformation:GetTemplateSummary, cloudformation:ListStackResources, cloudformation:ListChangeSets, cloudformation:CancelUpdateStack, cloudformation:ContinueUpdateRollback]
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/wildduck-mcp-prod/*
+              - Effect: Allow
+                Action: cloudformation:ValidateTemplate
+                Resource: '*'
+              - Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation, s3:GetBucketVersioning, s3:GetEncryptionConfiguration, s3:GetBucketPublicAccessBlock]
+                Resource:
+                  Fn::GetAtt: [ArtifactBucket, Arn]
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource:
+                  Fn::Sub: ${ArtifactBucket.Arn}/serverless/wildduck-mcp/prod/*
+              - Effect: Allow
+                Action: ['lambda:*']
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:wildduck-mcp-prod-api
+                  - Fn::Sub: arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:wildduck-mcp-prod-api:*
+              - Effect: Allow
+                Action: [iam:GetRole, iam:PassRole]
+                Resource:
+                  Fn::GetAtt: [ExecutionRole, Arn]
+                Condition:
+                  StringEqualsIfExists:
+                    iam:PassedToService: lambda.amazonaws.com
+              - Effect: Allow
+                Action: ['logs:*']
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/wildduck-mcp-prod-api:*
+              - Effect: Allow
+                Action: ['dynamodb:*']
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/wildduck-mcp-prod-state
+
+Outputs:
+  ArtifactBucketName:
+    Value:
+      Ref: ArtifactBucket
+  ExecutionRoleArn:
+    Value:
+      Fn::GetAtt: [ExecutionRole, Arn]
+  GitHubDeployRoleArn:
+    Value:
+      Fn::GetAtt: [GitHubDeployRole, Arn]
