@@ -110,3 +110,35 @@ test('CIMD SEP-3149 capabilities explicitly negotiate none; legacy preference al
         await expect(new ClientRegistry({ crypto, fetchMetadata: async () => json(document(id, extra)) }).resolve(id)).rejects.toThrow('invalid_client_metadata');
     }
 });
+
+test('underlying transport slots survive caller deadlines; late settlement frees exactly one and never caches', async () => {
+    const transports: { id: string; signal: AbortSignal | null | undefined; settle: (response: Response) => void }[] = [];
+    let cancelled = 0;
+    const registry = new ClientRegistry({ crypto, timeoutMs: 10, fetchMetadata: (input, options) => new Promise<Response>(settle => { transports.push({ id: String(input), signal: options?.signal, settle }); }) });
+    const results = await Promise.allSettled(Array.from({ length: 8 }, (_, index) => registry.resolve(`https://client.example/${index}.json`)));
+    expect(transports.length).toBe(8);
+    for (const result of results) { expect(result.status).toBe('rejected'); if (result.status === 'rejected') { expect(String(result.reason)).toBe('Error: temporarily_unavailable'); } }
+    expect(transports.every(item => item.signal?.aborted)).toBe(true);
+    for (let attempt = 0; attempt < 3; attempt++) { await expect(registry.resolve('https://client.example/ninth.json')).rejects.toThrow('temporarily_unavailable'); }
+    expect(transports.length).toBe(8);
+    const first = transports[0]; if (!first) { throw new Error('Missing transport'); }
+    first.settle(new Response(new ReadableStream({ cancel() { cancelled++; } }), { headers: { 'content-type': 'application/json' } }));
+    // Flush the settled underlying operation and its independent slot release.
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(cancelled).toBe(1);
+    const nextId = 'https://client.example/ninth.json';
+    const next = registry.resolve(nextId);
+    expect(transports.length).toBe(9);
+    await expect(registry.resolve('https://client.example/tenth.json')).rejects.toThrow('temporarily_unavailable');
+    const ninth = transports[8]; if (!ninth) { throw new Error('Missing ninth transport'); }
+    ninth.settle(json(document(nextId)));
+    expect((await next).clientId).toBe(nextId);
+    // The expired first lookup must refetch, rather than yielding metadata from a late response.
+    const retry = registry.resolve(first.id);
+    expect(transports.length).toBe(10);
+    const retryTransport = transports[9]; if (!retryTransport) { throw new Error('Missing retry transport'); }
+    retryTransport.settle(json(document(first.id)));
+    expect((await retry).clientId).toBe(first.id);
+    // Release remaining controlled transports after the assertions.
+    for (const transport of transports.slice(1, 8)) { transport.settle(json(document(transport.id))); }
+});

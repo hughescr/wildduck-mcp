@@ -93,6 +93,8 @@ export function matchesRedirectUri(client: ResolvedClient, requested: string): b
 export class ClientRegistry {
     private readonly cache = new Map<string, { client: ResolvedClient; until: number }>();
     private readonly pending = new Map<string, Promise<ResolvedClient>>();
+    // DNS lookup is not abortable: reserve capacity until the actual load settles, even after callers time out.
+    private activeTransports = 0;
     private readonly now: () => number;
     private readonly capacity: number;
     private readonly timeout: number;
@@ -121,7 +123,7 @@ export class ClientRegistry {
         const cached = this.cache.get(clientId);
         if (cached && cached.until > this.now()) { this.cache.delete(clientId); this.cache.set(clientId, cached); return structuredClone(cached.client); }
         const existing = this.pending.get(clientId); if (existing) { return structuredClone(await existing); }
-        if (this.pending.size >= 8) { throw new ClientError('temporarily_unavailable'); }
+        if (this.activeTransports >= 8) { throw new ClientError('temporarily_unavailable'); }
         const work = this.fetch(clientId); this.pending.set(clientId, work);
         try { return structuredClone(await work); } finally { this.pending.delete(clientId); }
     }
@@ -131,11 +133,13 @@ export class ClientRegistry {
         try { if (!secret || !equal(this.options.crypto.verify('client-secret', secret), client.clientId)) { throw new Error('Invalid secret'); } } catch { throw new ClientError('invalid_client'); }
     }
     private async fetch(clientId: string): Promise<ResolvedClient> {
+        this.activeTransports++;
         const controller = new AbortController(); let timer: ReturnType<typeof setTimeout> | undefined;
         const deadline = new Promise<never>((_resolve, reject) => { timer = setTimeout(() => { controller.abort(); reject(new ClientError('temporarily_unavailable')); }, this.timeout); });
         const load = async () => {
             const response = await (this.options.fetchMetadata ?? fetchClientMetadataResource)(clientId, { signal: controller.signal, redirect: 'manual', headers: { accept: 'application/json', 'accept-encoding': 'identity' } });
             try {
+                if (controller.signal.aborted) { await response.body?.cancel(); controller.signal.throwIfAborted(); }
                 if (response.status !== 200 || response.redirected || (response.url && response.url !== clientId) || !/^application\/json(?:\s*;|$)/iu.test(response.headers.get('content-type') ?? '') || !['', 'identity'].includes(response.headers.get('content-encoding') ?? '') || Number(response.headers.get('content-length') ?? 0) > MAX_BYTES || !response.body) { throw new ClientError('invalid_client_metadata'); }
                 const reader = response.body.getReader(); let size = 0; const chunks: Uint8Array[] = [];
                 try {
@@ -151,7 +155,9 @@ export class ClientRegistry {
                 this.cache.set(clientId, { client, until: this.now() + 300000 }); return client;
             } finally { controller.abort(); }
         };
-        try { return await Promise.race([load(), deadline]); }
+        const loading = load();
+        void loading.then(() => { this.activeTransports--; }, () => { this.activeTransports--; });
+        try { return await Promise.race([loading, deadline]); }
         catch (error) { if (error instanceof ClientError) { throw error; } throw new ClientError('invalid_client_metadata'); }
         finally { clearTimeout(timer); }
     }
