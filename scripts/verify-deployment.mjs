@@ -27,6 +27,20 @@ for (const authorization of [undefined, 'Bearer fabricated']) {
 const invalidClient = await request('/token', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: 'grant_type=authorization_code' });
 assert.equal(invalidClient.status, 401);
 assert.equal(invalidClient.headers.get('www-authenticate'), 'Basic realm="oauth"');
+// A malformed bearer fails with or without forwarding, so it cannot prove that
+// CloudFront preserves Authorization. Correct confidential Basic authentication
+// must succeed while absent/wrong authentication fails. Keep the generated secret
+// in this process only; the fabricated revocation token causes no database write.
+const confidentialRegistration = await request('/register', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ client_name: 'Deployment authorization-header check', application_type: 'native', redirect_uris: ['http://127.0.0.1:1/callback'], token_endpoint_auth_method: 'client_secret_basic', grant_types: ['authorization_code', 'refresh_token'] }) });
+assert.equal(confidentialRegistration.status, 201);
+const confidential = await confidentialRegistration.json();
+assert.ok(typeof confidential.client_id === 'string' && typeof confidential.client_secret === 'string', 'Confidential registration must return credentials');
+const basic = secret => `Basic ${Buffer.from(`${encodeURIComponent(confidential.client_id)}:${encodeURIComponent(secret)}`).toString('base64')}`;
+for (const [authorization, expected] of [[undefined, 401], [basic('wrong-secret'), 401], [basic(confidential.client_secret), 200]]) {
+    const revoke = await request('/revoke', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...(authorization ? { Authorization: authorization } : {}) }, body: new URLSearchParams({ client_id: confidential.client_id, token: 'fabricated' }).toString() });
+    assert.equal(revoke.status, expected, 'The public endpoint must forward correct Basic credentials and reject missing/wrong credentials');
+    if (expected === 401) { assert.equal(revoke.headers.get('www-authenticate'), 'Basic realm="oauth"'); }
+}
 const metadata = await request('/.well-known/oauth-authorization-server');
 assert.equal(metadata.status, 200);
 assert.equal((await metadata.json()).issuer, issuer);
