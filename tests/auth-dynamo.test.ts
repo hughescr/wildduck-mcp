@@ -110,29 +110,26 @@ test.skipIf(process.env.DYNAMO_LOCAL_AUTH_TEST !== '1')('actual DynamoDB Local: 
 
 test('real SDK throttling consumes only the unified three-attempt HTTP budget', async () => {
     const { Readable } = await import('node:stream');
-    const store = new DynamoAtomicStore({ tableName: 'AuthTable', timeoutMs: 5000 });
-    // Keep the production-created SDK client and retry stack. Replace only its
-    // transport and identity providers so no HTTP or credential lookup escapes.
-    const { client } = store as unknown as { client: import('@aws-sdk/lib-dynamodb').DynamoDBDocumentClient };
-    client.config.region = async () => 'us-east-1';
-    client.config.credentials = async () => ({ accessKeyId: 'local', secretAccessKey: 'local' });
     let attempts = 0;
     const payloads: string[] = [];
     let failure = { __type: 'com.amazonaws.dynamodb.v20120810#ProvisionedThroughputExceededException', message: 'local synthetic throttle' } as Record<string, unknown>;
-    client.config.requestHandler = {
-        async handle(request) {
-            attempts++;
-            payloads.push(typeof request.body === 'string' ? request.body : Buffer.from(request.body as Uint8Array).toString('utf8'));
-            return { response: { statusCode: 400, headers: { 'content-type': 'application/x-amz-json-1.0' }, body: Readable.from([JSON.stringify(failure)]) } };
+    // Provide transport and identity before SDK construction: its middleware
+    // captures resolved providers, so mutating config later can still read the
+    // host AWS configuration and fail before reaching the HTTP handler.
+    const store = new DynamoAtomicStore({ tableName: 'AuthTable', timeoutMs: 5000, clientConfig: {
+        region: 'us-east-1', credentials: { accessKeyId: 'local', secretAccessKey: 'local' }, requestHandler: {
+            async handle(request: { body?: unknown }) {
+                attempts++;
+                payloads.push(typeof request.body === 'string' ? request.body : Buffer.from(request.body as Uint8Array).toString('utf8'));
+                return { response: { statusCode: 400, headers: { 'content-type': 'application/x-amz-json-1.0' }, body: Readable.from([JSON.stringify(failure)]) } };
+            },
         },
-    };
-    try {
-        await expect(store.transact(write())).rejects.toThrow('temporarily_unavailable');
-        expect(attempts).toBe(3);
-        expect(new Set(payloads).size).toBe(1);
-        attempts = 0;
-        failure = { __type: 'com.amazonaws.dynamodb.v20120810#TransactionCanceledException', CancellationReasons: [{ Code: 'ConditionalCheckFailed' }] };
-        expect(await store.transact(write())).toBe(false);
-        expect(attempts).toBe(1);
-    } finally { client.destroy(); }
+    } });
+    await expect(store.transact(write())).rejects.toThrow('temporarily_unavailable');
+    expect(attempts).toBe(3);
+    expect(new Set(payloads).size).toBe(1);
+    attempts = 0;
+    failure = { __type: 'com.amazonaws.dynamodb.v20120810#TransactionCanceledException', CancellationReasons: [{ Code: 'ConditionalCheckFailed' }] };
+    expect(await store.transact(write())).toBe(false);
+    expect(attempts).toBe(1);
 });

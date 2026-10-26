@@ -1,12 +1,16 @@
 import { createHash } from 'node:crypto';
-import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBClient, type DynamoDBClientConfig } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, TransactWriteCommand, type GetCommandOutput, type TransactWriteCommandInput } from '@aws-sdk/lib-dynamodb';
 import { TemporaryUnavailable, type AtomicStore, type AtomicWrite, type AuthRecord } from './contracts';
 
 export interface DynamoSender {
     send(command: GetCommand | TransactWriteCommand, options?: { abortSignal?: AbortSignal }): Promise<unknown>;
 }
-export interface DynamoStoreOptions { tableName: string; client?: DynamoSender; timeoutMs?: number }
+export interface DynamoStoreOptions {
+    tableName: string; client?: DynamoSender; timeoutMs?: number;
+    /** Resolve identity, region and transport at SDK construction; retries remain adapter-owned. */
+    clientConfig?: Pick<DynamoDBClientConfig, 'region' | 'credentials' | 'requestHandler'>;
+}
 const SK = 'STATE';
 const safeId = (value: unknown): value is string => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value);
 const integer = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
@@ -52,7 +56,7 @@ export class DynamoAtomicStore implements AtomicStore {
         this.timeoutMs = options.timeoutMs ?? 5000;
         if (!Number.isInteger(this.timeoutMs) || this.timeoutMs < 1 || this.timeoutMs > 10000) { throw new Error('Invalid auth timeout'); }
         // The outer transaction loop owns retries; nested SDK retries multiply writes.
-        this.client = options.client ?? DynamoDBDocumentClient.from(new DynamoDBClient({ maxAttempts: 1 }), { marshallOptions: { removeUndefinedValues: false } });
+        this.client = options.client ?? DynamoDBDocumentClient.from(new DynamoDBClient({ ...options.clientConfig, maxAttempts: 1 }), { marshallOptions: { removeUndefinedValues: false } });
     }
     private async send(command: GetCommand | TransactWriteCommand): Promise<unknown> {
         const controller = new AbortController();
