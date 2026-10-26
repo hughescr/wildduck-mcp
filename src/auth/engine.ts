@@ -98,6 +98,7 @@ export class AuthEngine {
         if (this.grace === 0 || grant.status !== 'active' || !grant.receipt || grant.receiptUntil === undefined || this.now() >= grant.receiptUntil || grant.receiptBinding !== binding) { return undefined; }
         const connection = await this.connection(grant.connectionId);
         if (connection.accountId !== grant.accountId || connection.credentialGeneration !== grant.credentialGeneration) { throw new OAuthError('invalid_grant'); }
+        if (this.now() >= grant.receiptUntil) { return undefined; }
         return this.crypto.open<TokenResponse>('refresh-receipt', this.receiptAAD(grant, binding), grant.receipt);
     }
     async refresh(request: RefreshRequest): Promise<TokenResponse> {
@@ -105,20 +106,26 @@ export class AuthEngine {
         try { found = await this.grant(request.refreshToken, 'refresh'); } catch (error) { if (error instanceof OAuthError && error.error === 'invalid_token') { throw new OAuthError('invalid_grant'); } throw error; }
         const { grant, generation } = found;
         if (grant.clientId !== request.client.clientId || request.resource !== grant.resource || request.resource !== this.resource) {throw new OAuthError('invalid_grant');}
-        const binding = this.binding(request, grant); const hash = digest(request.refreshToken);
+        const hash = digest(request.refreshToken);
         if (!equal(grant.refreshHash, hash) || generation !== grant.refreshGeneration) {
             if (generation < grant.refreshGeneration) {
                 // A valid authenticated routing envelope proves this generation was issued by us.
                 // Client, resource and effective scope bindings have already been checked.
                 if (grant.previousRefreshHash && equal(grant.previousRefreshHash, hash) && generation === grant.refreshGeneration - 1) {
-                    const receipt = await this.recoverReceipt(grant, binding);
-                    if (receipt) { return receipt; }
+                    // Scope errors restrict disclosure inside the grace window; they cannot
+                    // conceal authenticated replay once the fixed window has elapsed.
+                    if (this.grace > 0 && grant.receiptUntil !== undefined && this.now() < grant.receiptUntil) {
+                        const binding = this.binding(request, grant);
+                        const receipt = await this.recoverReceipt(grant, binding);
+                        if (receipt) { return receipt; }
+                        if (this.now() < grant.receiptUntil) { throw new OAuthError('invalid_grant'); }
+                    }
                 }
-                if (grant.receiptBinding !== binding) { throw new OAuthError('invalid_grant'); }
                 if (!await this.store.transact({ conditions: [condition(grant)], puts: [{ ...grant, revision: grant.revision + 1, status: 'revoked', tokenVersion: grant.tokenVersion + 1 }], operationId: randomId() })) { throw new TemporaryUnavailable(); }
             }
             throw new OAuthError('invalid_grant');
         }
+        const binding = this.binding(request, grant);
         const connection = await this.connection(grant.connectionId);
         if (connection.accountId !== grant.accountId) {throw new OAuthError('invalid_grant');}
         await this.validateConnection(connection);

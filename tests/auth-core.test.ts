@@ -110,3 +110,54 @@ test('strong-read outages are temporary rather than invalid credentials', async 
     await expect(engine.refresh({ client: f.client, resource: engine.resource, refreshToken: tokens.refresh_token })).rejects.toThrow(TemporaryUnavailable);
     await expect(engine.revoke(tokens.refresh_token, f.client)).rejects.toThrow(TemporaryUnavailable);
 });
+test('delayed expired reconnect candidate cannot overwrite a concurrent valid reconnect', async () => {
+    const f = setup(); await f.seed();
+    let releaseExpired: (result: 'expired') => void = () => { throw new Error('Barrier not installed'); };
+    let signalStarted: () => void = () => { throw new Error('Barrier not installed'); };
+    const started = new Promise<void>(resolve => { signalStarted = resolve; });
+    const pendingExpired = new Promise<'expired'>(resolve => { releaseExpired = resolve; });
+    const engine = new AuthEngine(f.store, f.crypto, { validate: async connection => {
+        const credentials = f.crypto.open<{ accessToken: string }>('upstream-credentials', connectionAAD(connection), connection.credentials);
+        if (credentials.accessToken === 'expired-candidate') { signalStarted(); return pendingExpired; }
+        return 'valid';
+    } }, { issuer: 'https://auth.example' }, () => 1000);
+    const common = { accountId: 'account', expiresAt: 999999, expectedCredentialGeneration: 1 };
+    const failed = engine.connectOrReconnect({ ...common, credentials: { accessToken: 'expired-candidate', profile: { id: 'account' }, issuedAt: 1000 } });
+    const rejected = failed.catch(error => error as Error);
+    await started;
+    const winner = await engine.connectOrReconnect({ ...common, credentials: { accessToken: 'valid-candidate', profile: { id: 'account' }, issuedAt: 1000 } });
+    releaseExpired('expired'); const result = await rejected; expect(result).toBeInstanceOf(Error); if (result instanceof Error) { expect(result.message).toBe('invalid_grant'); }
+    expect(await f.store.get('connection', 'account')).toEqual(winner);
+    expect(winner.status).toBe('active');
+});
+test('old token replay after grace revokes despite a different allowed scope subset', async () => {
+    const f = setup(); await f.seed(); const original = await f.exchange();
+    const next = await f.engine.refresh({ client: f.client, resource: f.engine.resource, refreshToken: original.refresh_token });
+    await expect(f.engine.refresh({ client: f.client, resource: f.engine.resource, refreshToken: original.refresh_token, scopes: ['profile'] })).rejects.toThrow('invalid_grant');
+    await expect(f.engine.verifyAccess(next.access_token)).resolves.toMatchObject({ accountId: 'account' });
+    f.tick(10);
+    await expect(f.engine.refresh({ client: f.client, resource: f.engine.resource, refreshToken: original.refresh_token, scopes: ['profile'] })).rejects.toThrow('invalid_grant');
+    await expect(f.engine.verifyAccess(next.access_token)).rejects.toThrow('invalid_token');
+});
+test('downscoping cannot conceal old-token replay with original explicit scopes after grace', async () => {
+    const f = setup(); await f.seed(); const original = await f.exchange();
+    const next = await f.engine.refresh({ client: f.client, resource: f.engine.resource, refreshToken: original.refresh_token, scopes: ['profile'] });
+    f.tick(10);
+    await expect(f.engine.refresh({ client: f.client, resource: f.engine.resource, refreshToken: original.refresh_token, scopes: ['profile', 'mail:read'] })).rejects.toThrow('invalid_grant');
+    await expect(f.engine.verifyAccess(next.access_token)).rejects.toThrow('invalid_token');
+});
+test('receipt deadline is rechecked after awaited connection lookup before disclosure', async () => {
+    const f = setup(); await f.seed(); const original = await f.exchange();
+    const next = await f.engine.refresh({ client: f.client, resource: f.engine.resource, refreshToken: original.refresh_token });
+    let now = 1000;
+    const engine = new AuthEngine({ get: async (kind, id) => { const result = await f.store.get(kind, id); if (kind === 'connection') { now = 1010; } return result; }, transact: f.store.transact.bind(f.store) }, f.crypto, { validate: async () => 'valid' }, { issuer: 'https://auth.example', refreshRetrySeconds: 10 }, () => now);
+    await expect(engine.refresh({ client: f.client, resource: engine.resource, refreshToken: original.refresh_token })).rejects.toThrow('invalid_grant');
+    await expect(engine.verifyAccess(next.access_token)).rejects.toThrow('invalid_token');
+});
+test('strict policy has a single refresh winner without a receipt retry exception', async () => {
+    const f = setup(0); await f.seed(); const original = await f.exchange();
+    const request = { client: f.client, resource: f.engine.resource, refreshToken: original.refresh_token };
+    const outcomes = await Promise.allSettled([f.engine.refresh(request), f.engine.refresh(request)]);
+    expect(outcomes.filter(outcome => outcome.status === 'fulfilled')).toHaveLength(1);
+    await expect(f.engine.refresh(request)).rejects.toThrow('invalid_grant');
+});
