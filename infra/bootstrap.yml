@@ -1,7 +1,160 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: One-time artifact bucket and IAM roles for wildduck-mcp production CI
+Description: Stable CloudFront endpoint, artifact bucket and IAM roles for wildduck-mcp production CI
+
+Parameters:
+  FunctionUrlOrigin:
+    Type: String
+    Description: Existing service Function URL HTTPS origin, without a trailing slash
+    AllowedPattern: '^https://[a-z0-9]+\.lambda-url\.[a-z0-9-]+\.on\.aws$'
+  PublicDomainName:
+    Type: String
+    Default: wildduck-mcp.rungie.com
+    AllowedValues: [wildduck-mcp.rungie.com]
+    Description: Approved stable public OAuth hostname
+  HostedZoneId:
+    Type: String
+    Default: Z1VXUCOF8PCGCR
+    AllowedValues: [Z1VXUCOF8PCGCR]
+    Description: Existing rungie.com hosted zone
 
 Resources:
+  # Same shared certificate custom-resource contract as webservices.
+  SSLCertificate:
+    Type: Custom::DNSCertificate
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      DomainName:
+        Ref: PublicDomainName
+      ValidationMethod: DNS
+      Region: us-east-1
+      DomainValidationOptions:
+        - DomainName:
+            Ref: PublicDomainName
+          HostedZoneId:
+            Ref: HostedZoneId
+      ServiceToken:
+        Fn::ImportValue: CertificateAccepterLambda-Arn
+  BearerResponseHeaders:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: wildduck-mcp-prod-bearer
+        CustomHeadersConfig:
+          Items:
+            - Header: WWW-Authenticate
+              Value:
+                Fn::Sub: 'Bearer resource_metadata="https://${PublicDomainName}/.well-known/oauth-protected-resource/mcp"'
+              Override: false
+  BasicResponseHeaders:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: wildduck-mcp-prod-basic
+        CustomHeadersConfig:
+          Items:
+            - Header: WWW-Authenticate
+              Value: 'Basic realm="oauth"'
+              Override: false
+  PublicDistribution:
+    Type: AWS::CloudFront::Distribution
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      DistributionConfig:
+        Aliases:
+          - Ref: PublicDomainName
+        Comment: wildduck-mcp canonical OAuth endpoint
+        Enabled: true
+        IPV6Enabled: true
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          AcmCertificateArn:
+            Ref: SSLCertificate
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+          - Id: lambda-function-url
+            DomainName:
+              Fn::Select: [2, {Fn::Split: ['/', {Ref: FunctionUrlOrigin}]}]
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+        DefaultCacheBehavior:
+          TargetOriginId: lambda-function-url
+          ViewerProtocolPolicy: https-only
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+          CachedMethods: [GET, HEAD]
+          # AWS managed CachingDisabled and AllViewerExceptHostHeader policies.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          ResponseHeadersPolicyId:
+            Ref: BearerResponseHeaders
+        CacheBehaviors:
+          - PathPattern: /token
+            TargetOriginId: lambda-function-url
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            ResponseHeadersPolicyId:
+              Ref: BasicResponseHeaders
+          - PathPattern: /revoke
+            TargetOriginId: lambda-function-url
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+            ResponseHeadersPolicyId:
+              Ref: BasicResponseHeaders
+        # 401 is not a configurable CloudFront custom-error status. Supported
+        # errors keep their actual status/body, with no edge error-cache lifetime.
+        CustomErrorResponses:
+          - {ErrorCode: 400, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 403, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 404, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 405, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 414, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 416, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 500, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 501, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 502, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 503, ErrorCachingMinTTL: 0}
+          - {ErrorCode: 504, ErrorCachingMinTTL: 0}
+      Tags:
+        - Key: Project
+          Value: wildduck-mcp
+  PublicDnsA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId:
+        Ref: HostedZoneId
+      Name:
+        Ref: PublicDomainName
+      Type: A
+      AliasTarget:
+        DNSName:
+          Fn::GetAtt: [PublicDistribution, DomainName]
+        HostedZoneId: Z2FDTNDATAQYW2
+  PublicDnsAAAA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId:
+        Ref: HostedZoneId
+      Name:
+        Ref: PublicDomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName:
+          Fn::GetAtt: [PublicDistribution, DomainName]
+        HostedZoneId: Z2FDTNDATAQYW2
   ArtifactBucket:
     Type: AWS::S3::Bucket
     DeletionPolicy: Retain
@@ -121,6 +274,17 @@ Resources:
                   Fn::Sub: arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/wildduck-mcp-prod-state
 
 Outputs:
+  DistributionId:
+    Value:
+      Ref: PublicDistribution
+  DistributionDomainName:
+    Value:
+      Fn::GetAtt: [PublicDistribution, DomainName]
+  PublicBaseUrl:
+    Value:
+      Fn::Sub: https://${PublicDomainName}
+    Export:
+      Name: wildduck-mcp-prod-public-origin
   ArtifactBucketName:
     Value:
       Ref: ArtifactBucket
