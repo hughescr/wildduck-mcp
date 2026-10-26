@@ -39,7 +39,7 @@ The backend will be fixed to the configured Wildduck API origin and use account-
 
 ## Branches and releases
 
-`develop` is the development branch; `main` is the deployed release branch. Tags use bare versions such as `0.1.1`, matching the existing Gitflow convention.
+The public repository is [hughescr/wildduck-mcp](https://github.com/hughescr/wildduck-mcp), with `develop` as its default branch. `develop` is the development branch; `main` is the deployed release branch. The initial reviewed scaffold is tagged `0.1.0`. Tags use bare versions such as `0.1.1`, matching the existing Gitflow convention.
 
 After cloning, initialize the local Gitflow settings once:
 
