@@ -51,7 +51,8 @@ export class DynamoAtomicStore implements AtomicStore {
         if (!/^[A-Za-z0-9_.-]{3,255}$/.test(options.tableName)) { throw new Error('Invalid auth table name'); }
         this.timeoutMs = options.timeoutMs ?? 5000;
         if (!Number.isInteger(this.timeoutMs) || this.timeoutMs < 1 || this.timeoutMs > 10000) { throw new Error('Invalid auth timeout'); }
-        this.client = options.client ?? DynamoDBDocumentClient.from(new DynamoDBClient({ maxAttempts: 3 }), { marshallOptions: { removeUndefinedValues: false } });
+        // The outer transaction loop owns retries; nested SDK retries multiply writes.
+        this.client = options.client ?? DynamoDBDocumentClient.from(new DynamoDBClient({ maxAttempts: 1 }), { marshallOptions: { removeUndefinedValues: false } });
     }
     private async send(command: GetCommand | TransactWriteCommand): Promise<unknown> {
         const controller = new AbortController();

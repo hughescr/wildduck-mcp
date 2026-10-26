@@ -107,3 +107,32 @@ test.skipIf(process.env.DYNAMO_LOCAL_AUTH_TEST !== '1')('actual DynamoDB Local: 
         expect(table.Table?.ProvisionedThroughput?.WriteCapacityUnits).toBe(1);
     } finally { await client.send(new DeleteTableCommand({ TableName: tableName })); client.destroy(); }
 });
+
+test('real SDK throttling consumes only the unified three-attempt HTTP budget', async () => {
+    const { Readable } = await import('node:stream');
+    const store = new DynamoAtomicStore({ tableName: 'AuthTable', timeoutMs: 5000 });
+    // Keep the production-created SDK client and retry stack. Replace only its
+    // transport and identity providers so no HTTP or credential lookup escapes.
+    const { client } = store as unknown as { client: import('@aws-sdk/lib-dynamodb').DynamoDBDocumentClient };
+    client.config.region = async () => 'us-east-1';
+    client.config.credentials = async () => ({ accessKeyId: 'local', secretAccessKey: 'local' });
+    let attempts = 0;
+    const payloads: string[] = [];
+    let failure = { __type: 'com.amazonaws.dynamodb.v20120810#ProvisionedThroughputExceededException', message: 'local synthetic throttle' } as Record<string, unknown>;
+    client.config.requestHandler = {
+        async handle(request) {
+            attempts++;
+            payloads.push(typeof request.body === 'string' ? request.body : Buffer.from(request.body as Uint8Array).toString('utf8'));
+            return { response: { statusCode: 400, headers: { 'content-type': 'application/x-amz-json-1.0' }, body: Readable.from([JSON.stringify(failure)]) } };
+        },
+    };
+    try {
+        await expect(store.transact(write())).rejects.toThrow('temporarily_unavailable');
+        expect(attempts).toBe(3);
+        expect(new Set(payloads).size).toBe(1);
+        attempts = 0;
+        failure = { __type: 'com.amazonaws.dynamodb.v20120810#TransactionCanceledException', CancellationReasons: [{ Code: 'ConditionalCheckFailed' }] };
+        expect(await store.transact(write())).toBe(false);
+        expect(attempts).toBe(1);
+    } finally { client.destroy(); }
+});
