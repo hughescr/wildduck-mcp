@@ -161,3 +161,82 @@ test('strict policy has a single refresh winner without a receipt retry exceptio
     expect(outcomes.filter(outcome => outcome.status === 'fulfilled')).toHaveLength(1);
     await expect(f.engine.refresh(request)).rejects.toThrow('invalid_grant');
 });
+test('a subsequent rotation during receipt connection lookup prevents stale receipt disclosure', async () => {
+    const f = setup(); await f.seed(); const original = await f.exchange();
+    const next = await f.engine.refresh({ client: f.client, resource: f.engine.resource, refreshToken: original.refresh_token });
+    let rotate = true;
+    const engine = new AuthEngine({ get: async (kind, id) => { const record = await f.store.get(kind, id); if (kind === 'connection' && rotate) { rotate = false; await f.engine.refresh({ client: f.client, resource: f.engine.resource, refreshToken: next.refresh_token }); } return record; }, transact: f.store.transact.bind(f.store) }, f.crypto, { validate: async () => 'valid' }, { issuer: 'https://auth.example', refreshRetrySeconds: 10 }, () => 1000);
+    await expect(engine.refresh({ client: f.client, resource: engine.resource, refreshToken: original.refresh_token })).rejects.toThrow('invalid_grant');
+});
+test('revocation during receipt connection lookup prevents receipt disclosure', async () => {
+    const f = setup(); await f.seed(); const original = await f.exchange();
+    const next = await f.engine.refresh({ client: f.client, resource: f.engine.resource, refreshToken: original.refresh_token });
+    let revoke = true;
+    const engine = new AuthEngine({ get: async (kind, id) => { const record = await f.store.get(kind, id); if (kind === 'connection' && revoke) { revoke = false; await f.engine.revoke(next.refresh_token, f.client); } return record; }, transact: f.store.transact.bind(f.store) }, f.crypto, { validate: async () => 'valid' }, { issuer: 'https://auth.example', refreshRetrySeconds: 10 }, () => 1000);
+    await expect(engine.refresh({ client: f.client, resource: engine.resource, refreshToken: original.refresh_token })).rejects.toThrow('invalid_grant');
+});
+test('receipt deadline is rechecked after the atomic authorization check completes', async () => {
+    const f = setup(); await f.seed(); const original = await f.exchange();
+    const next = await f.engine.refresh({ client: f.client, resource: f.engine.resource, refreshToken: original.refresh_token });
+    let now = 1000; let checks = 0;
+    const engine = new AuthEngine({ get: f.store.get.bind(f.store), transact: async write => {
+        const result = await f.store.transact(write);
+        if (write.puts.length === 0) { checks++; now = 1010; }
+        return result;
+    } }, f.crypto, { validate: async () => 'valid' }, { issuer: 'https://auth.example', refreshRetrySeconds: 10 }, () => now);
+    await expect(engine.refresh({ client: f.client, resource: engine.resource, refreshToken: original.refresh_token })).rejects.toThrow('invalid_grant');
+    expect(checks).toBe(1);
+    await expect(engine.verifyAccess(next.access_token)).rejects.toThrow('invalid_token');
+});
+test('connection expiry during the atomic receipt check prevents disclosure', async () => {
+    const f = setup(); await f.seed();
+    await f.store.transact({ conditions: [{ kind: 'connection', id: 'account', revision: 0 }], puts: [{ ...f.connection, revision: 1, expiresAt: 1005 }], operationId: randomId() });
+    const original = await f.exchange();
+    await f.engine.refresh({ client: f.client, resource: f.engine.resource, refreshToken: original.refresh_token });
+    let now = 1000;
+    const engine = new AuthEngine({ get: f.store.get.bind(f.store), transact: async write => {
+        const result = await f.store.transact(write); if (write.puts.length === 0) { now = 1005; } return result;
+    } }, f.crypto, { validate: async () => 'valid' }, { issuer: 'https://auth.example', refreshRetrySeconds: 10 }, () => now);
+    await expect(engine.refresh({ client: f.client, resource: engine.resource, refreshToken: original.refresh_token })).rejects.toThrow('invalid_grant');
+});
+test('grant and presented token expiry during the atomic receipt check prevents disclosure', async () => {
+    const f = setup(); await f.seed();
+    let now = 1000;
+    const mintEngine = new AuthEngine(f.store, f.crypto, { validate: async () => 'valid' }, { issuer: 'https://auth.example', accessSeconds: 1, grantSeconds: 5, refreshRetrySeconds: 10 }, () => now);
+    const code = await mintEngine.issueCode({ client: f.client, connectionId: 'account', redirectUri: 'https://client.example/callback', resource: mintEngine.resource, scopes: ['profile'], challenge: digest(f.verifier) });
+    const original = await mintEngine.exchange({ client: f.client, code, verifier: f.verifier, redirectUri: 'https://client.example/callback', resource: mintEngine.resource });
+    await mintEngine.refresh({ client: f.client, resource: mintEngine.resource, refreshToken: original.refresh_token });
+    const engine = new AuthEngine({ get: f.store.get.bind(f.store), transact: async write => {
+        const result = await f.store.transact(write); if (write.puts.length === 0) { now = 1005; } return result;
+    } }, f.crypto, { validate: async () => 'valid' }, { issuer: 'https://auth.example', accessSeconds: 1, grantSeconds: 5, refreshRetrySeconds: 10 }, () => now);
+    await expect(engine.refresh({ client: f.client, resource: engine.resource, refreshToken: original.refresh_token })).rejects.toThrow('invalid_grant');
+});
+test('receipt check temporary failure stays temporary and later recovery uses a fresh operation ID', async () => {
+    const f = setup(); await f.seed(); const original = await f.exchange();
+    const next = await f.engine.refresh({ client: f.client, resource: f.engine.resource, refreshToken: original.refresh_token });
+    const operationIds: string[] = []; let fail = true;
+    const engine = new AuthEngine({ get: f.store.get.bind(f.store), transact: async write => {
+        if (write.puts.length === 0) { operationIds.push(write.operationId); if (fail) { fail = false; throw new TemporaryUnavailable(); } }
+        return f.store.transact(write);
+    } }, f.crypto, { validate: async () => 'valid' }, { issuer: 'https://auth.example', refreshRetrySeconds: 10 }, () => 1000);
+    const request = { client: f.client, resource: engine.resource, refreshToken: original.refresh_token };
+    await expect(engine.refresh(request)).rejects.toThrow(TemporaryUnavailable);
+    expect(await engine.refresh(request)).toEqual(next);
+    expect(operationIds).toHaveLength(2); expect(operationIds[0]).not.toBe(operationIds[1]);
+});
+test('reconnect during receipt connection lookup prevents old-generation receipt disclosure', async () => {
+    const f = setup(); await f.seed(); const original = await f.exchange();
+    await f.engine.refresh({ client: f.client, resource: f.engine.resource, refreshToken: original.refresh_token });
+    let reconnect = true;
+    const engine = new AuthEngine({ get: async (kind, id) => {
+        const record = await f.store.get(kind, id);
+        if (kind === 'connection' && reconnect) {
+            reconnect = false;
+            await f.engine.connectOrReconnect({ accountId: 'account', credentials: { accessToken: 'reconnected-token', profile: { id: 'account' }, issuedAt: 1000 }, expiresAt: 999999, expectedCredentialGeneration: 1 });
+        }
+        return record;
+    }, transact: f.store.transact.bind(f.store) }, f.crypto, { validate: async () => 'valid' }, { issuer: 'https://auth.example', refreshRetrySeconds: 10 }, () => 1000);
+    await expect(engine.refresh({ client: f.client, resource: engine.resource, refreshToken: original.refresh_token })).rejects.toThrow('invalid_grant');
+    const connection = await f.store.get('connection', 'account');
+    expect(connection?.kind === 'connection' && connection.credentialGeneration).toBe(2);
+});

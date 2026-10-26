@@ -98,7 +98,15 @@ export class AuthEngine {
         if (this.grace === 0 || grant.status !== 'active' || !grant.receipt || grant.receiptUntil === undefined || this.now() >= grant.receiptUntil || grant.receiptBinding !== binding) { return undefined; }
         const connection = await this.connection(grant.connectionId);
         if (connection.accountId !== grant.accountId || connection.credentialGeneration !== grant.credentialGeneration) { throw new OAuthError('invalid_grant'); }
-        if (this.now() >= grant.receiptUntil) { return undefined; }
+        // A check-only transaction establishes one authorization point for both records.
+        // Its fresh operation ID is local to this recovery attempt; adapters retain it only
+        // for bounded retries of the identical check, never for a later HTTP request.
+        if (!await this.store.transact({ conditions: [condition(grant), condition(connection)], puts: [], operationId: randomId() })) {
+            throw new OAuthError('invalid_grant');
+        }
+        const now = this.now();
+        if (grant.expiresAt <= now || connection.expiresAt <= now) { throw new OAuthError('invalid_grant'); }
+        if (now >= grant.receiptUntil) { return undefined; }
         return this.crypto.open<TokenResponse>('refresh-receipt', this.receiptAAD(grant, binding), grant.receipt);
     }
     async refresh(request: RefreshRequest): Promise<TokenResponse> {
@@ -110,7 +118,7 @@ export class AuthEngine {
         if (!equal(grant.refreshHash, hash) || generation !== grant.refreshGeneration) {
             if (generation < grant.refreshGeneration) {
                 // A valid authenticated routing envelope proves this generation was issued by us.
-                // Client, resource and effective scope bindings have already been checked.
+                // Client and resource bindings have already been checked.
                 if (grant.previousRefreshHash && equal(grant.previousRefreshHash, hash) && generation === grant.refreshGeneration - 1) {
                     // Scope errors restrict disclosure inside the grace window; they cannot
                     // conceal authenticated replay once the fixed window has elapsed.
