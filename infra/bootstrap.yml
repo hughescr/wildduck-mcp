@@ -100,10 +100,15 @@ Resources:
                 Condition:
                   StringEqualsIfExists:
                     iam:PassedToService: lambda.amazonaws.com
+              # CloudFormation locates log groups using the account-level list API.
+              - Effect: Allow
+                Action: logs:DescribeLogGroups
+                Resource: '*'
               - Effect: Allow
                 Action: ['logs:*']
                 Resource:
-                  Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/wildduck-mcp-prod-api:*
+                  - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/wildduck-mcp-prod-api
+                  - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/wildduck-mcp-prod-api:*
               - Effect: Allow
                 Action: ['dynamodb:*']
                 Resource:
