@@ -40,7 +40,7 @@ test('redirect registration refuses unsafe schemes, credentials, fragments, wild
     const registry = new ClientRegistry({ crypto });
     for (const uri of ['http://evil.example/cb', 'file:///cb', 'javascript:alert(1)', 'myapp:/callback', 'https://user:password@client.example/cb', 'https://client.example/cb#', 'https://*.example/cb', 'https://client.example/ cb', 'http://127.0.0.2/cb', 'http://127.1/cb', 'http://2130706433/cb', 'http://localhost.evil/cb', 'https:\\evil.example/cb']) { expect(() => registry.register({ ...publicMetadata, redirect_uris: [uri] })).toThrow('invalid_redirect_uri'); }
     for (const extra of [{ redirect_uris: [] }, { redirect_uris: Array(4).fill('https://example.com/cb') }, { client_name: 'x'.repeat(121) }, { junk: 'x'.repeat(5120) }, { token_endpoint_auth_method: 'private_key_jwt' }, { response_types: ['token'] }, { response_types: ['code', 'token'] }, { grant_types: ['client_credentials'] }, { application_type: 'web', redirect_uris: ['http://localhost/cb'] }]) { expect(() => registry.register({ ...publicMetadata, ...extra })).toThrow(); }
-    expect(registry.register({ ...publicMetadata, grant_types: ['authorization_code', 'refresh_token', 'client_credentials'] }).grant_types).toEqual(['authorization_code', 'refresh_token']);
+    expect(() => registry.register({ ...publicMetadata, grant_types: ['authorization_code', 'refresh_token', 'client_credentials'] })).toThrow('invalid_client_metadata');
 });
 
 test('redirect matching is exact for web; native exception varies port only on the same loopback host/path/query', async () => {
@@ -141,4 +141,20 @@ test('underlying transport slots survive caller deadlines; late settlement frees
     expect((await retry).clientId).toBe(first.id);
     // Release remaining controlled transports after the assertions.
     for (const transport of transports.slice(1, 8)) { transport.settle(json(document(transport.id))); }
+});
+
+test('DCR and CIMD require the complete v1 code plus refresh flow and default omitted grants consistently', async () => {
+    const id = 'https://client.example/grants.json';
+    const registry = new ClientRegistry({ crypto });
+    for (const extra of [{}, { grant_types: ['authorization_code', 'refresh_token'] }, { grant_types: ['refresh_token', 'authorization_code'] }]) {
+        const registration = registry.register({ ...publicMetadata, ...extra });
+        expect(registration.grant_types).toEqual(['authorization_code', 'refresh_token']);
+        expect((await registry.resolve(registration.client_id)).grantTypes).toEqual(['authorization_code', 'refresh_token']);
+        const cimd = new ClientRegistry({ crypto, fetchMetadata: async () => json(document(id, extra)) });
+        expect((await cimd.resolve(id)).grantTypes).toEqual(['authorization_code', 'refresh_token']);
+    }
+    for (const grants of [null, [], 'authorization_code', ['authorization_code'], ['refresh_token'], ['authorization_code', 'authorization_code'], ['authorization_code', 'refresh_token', 'refresh_token'], ['authorization_code', 'refresh_token', 'client_credentials'], ['authorization_code', null]]) {
+        expect(() => registry.register({ ...publicMetadata, grant_types: grants })).toThrow('invalid_client_metadata');
+        await expect(new ClientRegistry({ crypto, fetchMetadata: async () => json(document(id, { grant_types: grants })) }).resolve(id)).rejects.toThrow('invalid_client_metadata');
+    }
 });
