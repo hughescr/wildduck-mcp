@@ -12,7 +12,7 @@ const owner = z.string().regex(/^[A-Za-z0-9_-]{16,128}$/u);
 const revision = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER - 1);
 const operationKey = z.strictObject({ accountId: safe, clientIdHash: versionSchema, operationId: operationIdSchema });
 const targetKey = messageKeySchema.extend({ accountId: safe });
-const createIntent = operationKey.extend({ payloadDigest: versionSchema, tool: z.literal('create_draft') });
+const createIntent = z.union([operationKey.extend({ payloadDigest: versionSchema, tool: z.literal('create_draft') }), operationKey.extend({ payloadDigest: versionSchema, tool: z.literal('create_reply_draft') })]);
 const targetIntent = operationKey.extend({ payloadDigest: versionSchema, tool: z.enum(['update_draft', 'delete_draft', 'send_draft', 'move_message', 'update_message_flags']), target: messageKeySchema, expectedVersion: versionSchema });
 const intentSchema = z.union([createIntent, targetIntent]);
 const claimSchema = z.strictObject({ key: operationKey, ownerToken: owner, revision, state: z.enum(['reserved', 'dispatched']) });
@@ -134,7 +134,7 @@ export class DynamoMailOperationStore implements MailOperationStore {
         if (existing) { return equal(existing.intent, intent) ? { kind: 'replay', record: existing } : { kind: 'conflict', reason: 'operation_conflict' }; }
         const record: MailOperationRecord = { key, intent, ownerToken, revision: 0, state: 'reserved' };
         const items = [this.absentPut(opKey(key), record)];
-        if (intent.tool !== 'create_draft') {
+        if (intent.tool !== 'create_draft' && intent.tool !== 'create_reply_draft') {
             const target: DraftGuardKey = { accountId: key.accountId, ...intent.target };
             const guard: DraftGuardRecord = { key: target, operation: key, ownerToken, revision: 0, state: 'reserved' };
             items.push(this.absentPut(guardKey(target), guard));
@@ -143,7 +143,7 @@ export class DynamoMailOperationStore implements MailOperationStore {
         // Only a proven conditional cancellation can be resolved as a conflict.
         const winner = await this.getStoredOperation(key, deadline);
         if (winner) { return equal(winner.intent, intent) ? { kind: 'replay', record: winner } : { kind: 'conflict', reason: 'operation_conflict' }; }
-        if (intent.tool !== 'create_draft' && await this.getGuard({ accountId: key.accountId, ...intent.target }, deadline)) { return { kind: 'conflict', reason: 'draft_fenced' }; }
+        if (intent.tool !== 'create_draft' && intent.tool !== 'create_reply_draft' && await this.getGuard({ accountId: key.accountId, ...intent.target }, deadline)) { return { kind: 'conflict', reason: 'draft_fenced' }; }
         throw unavailable();
     }
     private checkedPut(key: { pk: string; sk: string }, before: unknown, after: unknown): NonNullable<TransactWriteCommandInput['TransactItems']>[number] {
@@ -161,7 +161,7 @@ export class DynamoMailOperationStore implements MailOperationStore {
         // Revalidate the complete stored value before any write.
         operation(after, claim.key);
         const items = [this.checkedPut(opKey(claim.key), before, after)];
-        if (before.intent.tool !== 'create_draft') {
+        if (before.intent.tool !== 'create_draft' && before.intent.tool !== 'create_reply_draft') {
             const target = { accountId: before.key.accountId, ...before.intent.target };
             const guard = await this.getGuard(target, deadline);
             if (!guard || !equal(guard.operation, before.key) || guard.ownerToken !== before.ownerToken || guard.revision !== before.revision || guard.state !== expected) { throw unavailable(); }

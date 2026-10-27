@@ -6,7 +6,7 @@ import { DynamoMailOperationStore } from '../src/mail/dynamo-store';
 import type { ConfirmedReceipt, MailOperationStore, OperationClaim, OperationKey, SourceGrade, WriteIntent } from '../src/mail/contracts';
 const mailboxId = 'a'.repeat(24); const digest = 'd'.repeat(43); const owner = 'owner-token-'.padEnd(43, 'a');
 const key = (operationId = 'operation-00000001', clientIdHash = 'c'.repeat(43), accountId = '1'.repeat(24)): OperationKey => ({ accountId, clientIdHash, operationId });
-const intent = (operationId = 'operation-00000001', tool: Exclude<WriteIntent['tool'], 'create_draft'> = 'send_draft'): Exclude<WriteIntent, { tool: 'create_draft' }> => ({ ...key(operationId), tool, payloadDigest: digest, target: { mailboxId, uid: 1 }, expectedVersion: digest });
+const intent = (operationId = 'operation-00000001', tool: Exclude<WriteIntent['tool'], 'create_draft' | 'create_reply_draft'> = 'send_draft'): Exclude<WriteIntent, { tool: 'create_draft' | 'create_reply_draft' }> => ({ ...key(operationId), tool, payloadDigest: digest, target: { mailboxId, uid: 1 }, expectedVersion: digest });
 const verifiedDraft = (uid: number, targetMailbox = mailboxId) => ({ draft: { mailboxId: targetMailbox, uid, version: digest }, verified: true as const, proof: { accountId: key().accountId, mailboxId: targetMailbox, uid, version: digest, contentDigest: 'a'.repeat(64), sourceGrade: 'mcp_authored' as const } });
 const verifiedMessage = (uid: number, targetMailbox = mailboxId, sourceGrade: SourceGrade = 'observed') => { const { draft, verified, proof } = verifiedDraft(uid, targetMailbox); return { message: draft, verified, proof: { ...proof, sourceGrade } }; };
 const claim = async (store: MailOperationStore, value: WriteIntent): Promise<OperationClaim<'reserved'>> => { const result = await store.reserve(value, owner); expect(result.kind).toBe('acquired'); if (result.kind !== 'acquired') { throw new Error('expected acquisition'); } return result.claim; };
@@ -303,4 +303,15 @@ test.skipIf(process.env.DYNAMO_LOCAL_MAIL_TEST !== '1')('actual DynamoDB Local m
         const table = await client.send(new DescribeTableCommand({ TableName: tableName }));
         expect(table.Table?.ProvisionedThroughput?.ReadCapacityUnits).toBe(1); expect(table.Table?.ProvisionedThroughput?.WriteCapacityUnits).toBe(1);
     } finally { await client.send(new DeleteTableCommand({ TableName: tableName })); client.destroy(); }
+});
+
+test('reply draft ledger reserves without original guard and validates authored create receipts', async () => {
+    const f = fixture(); const value: WriteIntent = { ...key(), tool: 'create_reply_draft', payloadDigest: digest };
+    const reservation = await f.store.reserve(value, owner); expect(reservation.kind).toBe('acquired'); if (reservation.kind !== 'acquired') { throw new Error('expected acquisition'); }
+    expect(f.client.records.size).toBe(1);
+    const dispatched = await f.store.markDispatched(reservation.claim);
+    await expect(f.store.complete(dispatched, { status: 'completed', operation_id: value.operationId, ...verifiedDraft(9), proof: { ...verifiedDraft(9).proof, sourceGrade: 'observed' } } as unknown as ConfirmedReceipt)).rejects.toThrow('temporarily_unavailable');
+    const receipt = { status: 'completed' as const, operation_id: value.operationId, ...verifiedDraft(9) }; await f.store.complete(dispatched, receipt);
+    expect(await f.store.getOperation(key())).toMatchObject({ state: 'settled', receipt }); expect((await f.store.reserve(value, owner)).kind).toBe('replay');
+    expect(await f.store.reserve({ ...value, payloadDigest: 'e'.repeat(43) }, owner)).toEqual({ kind: 'conflict', reason: 'operation_conflict' }); expect(f.client.records.size).toBe(1);
 });

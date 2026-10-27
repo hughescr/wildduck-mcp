@@ -1,9 +1,11 @@
 import { createHash } from 'node:crypto';
 import { isEmailValid } from '@hapi/address';
 import { WILDDUCK_ORIGIN } from '../wildduck';
-import { remainingRequestTimeMs } from '../request-budget';
+import { remainingRequestTimeMs, withRequestBudget } from '../request-budget';
 import { MailError, MAIL_OPERATION_METADATA_KEY, type BackendMailSession, type MailBackendReader, type MailBackendWriter, type Mailbox, type MailInput, type MailOutput, type MessageKey, type DraftContent, type DraftPatch, type MessageSnapshot, type PreparedDraft, type MailOperationMarker, type MessageRef, type MessageSummary, type MailAddress, type AttachmentMetadata, type AttachmentDownload, type VerifiedMessageMutation, type AuthoredSourceDescriptor } from './contracts';
-import { draftContentSchema, mailboxIdSchema, messageKeySchema, mailInputSchemas, mailOutputSchemas, mailOperationMarkerSchema, addFlagSchema, labelSchema, MAX_READ_TEXT_BYTES, MAX_HTML_BYTES, MAX_ATTACHMENT_BYTES } from './schemas';
+import { draftContentSchema, mailboxIdSchema, messageKeySchema, mailInputSchemas, mailOutputSchemas, mailOperationMarkerSchema, addFlagSchema, labelSchema, MAX_READ_TEXT_BYTES, MAX_HTML_BYTES, MAX_ATTACHMENT_BYTES, MAX_SNIPPET_BYTES } from './schemas';
+import { MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS, type AttachmentDownloadStager } from './downloads';
+import { deriveReply } from './reply';
 import { createMime, inspectSource, preparePatch, verifyCandidate, MimeError, MIME_LIMITS, type MimeEnvelope } from './mime';
 
 const META_BYTES = 512 * 1024;
@@ -15,7 +17,7 @@ type Json = Record<string, unknown>;
 type SearchCategory = 'deadline' | 'network' | 'http_status' | 'invalid_json' | 'invalid_shape' | 'too_large';
 export interface SearchDiagnostic { event: 'wildduck_search'; outcome: 'success' | 'failure'; scope: 'global' | 'mailbox'; category?: SearchCategory; durationMs: number; headersMs?: number; bodyMs?: number; validationMs?: number; status?: number; timeoutMs?: number }
 interface SearchTiming { category: SearchCategory; headersMs?: number; bodyMs?: number; status?: number; timeoutMs?: number }
-export interface MailBackendOptions { fetch?: typeof globalThis.fetch; timeoutMs?: number; searchTimeoutMs?: number; onSearchDiagnostic?: (diagnostic: SearchDiagnostic) => void }
+export interface MailBackendOptions { fetch?: typeof globalThis.fetch; timeoutMs?: number; searchTimeoutMs?: number; downloadStager?: AttachmentDownloadStager; onSearchDiagnostic?: (diagnostic: SearchDiagnostic) => void }
 const fail = (): never => { throw new MailError('temporarily_unavailable'); };
 function object(value: unknown): value is Json { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 function string(value: unknown): string { return typeof value === 'string' ? value : fail(); }
@@ -83,7 +85,7 @@ function summary(raw: Json, mailbox?: string): MessageSummary {
     const mailboxId = id(raw['mailbox']); if (mailbox !== undefined && mailboxId !== mailbox) { return fail(); }
     if (raw['flags'] !== undefined && (!Array.isArray(raw['flags']) || raw['flags'].some(flag => typeof flag !== 'string'))) { return fail(); }
     return {
-        mailboxId, uid: uid(raw['id']), subject: string(raw['subject']), from: addresses(raw['from']), to: addresses(raw['to']),
+        mailboxId, uid: uid(raw['id']), snippet: typeof raw['intro'] === 'string' ? truncate(raw['intro'], MAX_SNIPPET_BYTES).text : typeof raw['text'] === 'string' ? truncate(raw['text'].replace(/\s+/gu, ' ').trim(), MAX_SNIPPET_BYTES).text : null, threadId: raw['thread'] === undefined || raw['thread'] === null ? null : id(raw['thread']), subject: string(raw['subject']), from: addresses(raw['from']), to: addresses(raw['to']),
         date: date(raw['date']), receivedAt: date(raw['idate']), imapFlags: strings(raw['flags']), labels: strings(raw['labels']),
         flags: { seen: bool(raw['seen']), flagged: bool(raw['flagged']), draft: bool(raw['draft']), answered: bool(raw['answered']), deleted: bool(raw['deleted']), forwarded: bool(raw['forwarded']) },
         hasAttachments: Array.isArray(raw['attachments']) ? raw['attachments'].length > 0 : bool(raw['attachments']),
@@ -130,6 +132,7 @@ function normalizeMailbox(raw: unknown): Mailbox {
         ...(raw['total'] === undefined ? {} : { total: count(raw['total']) }), ...(raw['unseen'] === undefined ? {} : { unseen: count(raw['unseen']) }) };
 }
 class MailBackend implements MailBackendReader, MailBackendWriter {
+    private readonly downloadStager: AttachmentDownloadStager | undefined;
     private readonly fetcher: typeof globalThis.fetch;
     private readonly timeoutMs: number;
     private readonly searchTimeoutMs: number;
@@ -137,6 +140,7 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
     private readonly snapshots = new WeakMap<MessageSnapshot, SnapshotState>();
     private readonly preparations = new WeakMap<PreparedDraft, PreparationState>();
     constructor(options: MailBackendOptions) {
+        this.downloadStager = options.downloadStager;
         this.fetcher = options.fetch ?? globalThis.fetch; this.timeoutMs = options.timeoutMs ?? 10_000;
         this.searchTimeoutMs = options.searchTimeoutMs ?? options.timeoutMs ?? 45_000;
         this.onSearchDiagnostic = options.onSearchDiagnostic ?? (diagnostic => {
@@ -185,7 +189,9 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
                 if (response.status === 404) { throw new MailError('not_found'); }
                 if (response.status === 401 || response.status === 403) { throw new MailError('forbidden'); }
                 if (response.status === 400) { throw new MailError('invalid_input'); }
-                return fail();
+                const retry = response.headers.get('retry-after');
+                const retryAfter = retry !== null && /^\d{1,5}$/u.test(retry) && Number(retry) <= 86400 ? Number(retry) : undefined;
+                throw new MailError('temporarily_unavailable', retryAfter);
             } finally { controller.signal.removeEventListener('abort', cancel); cancel(); }
         };
         try { return await Promise.race([operation(), new Promise<never>((_, reject) => { timer = setTimeout(() => { deadline = true; if (timing) { timing.category = 'deadline'; } controller.abort(); reject(new MailError('upstream_timeout')); }, timeoutMs); })]); }
@@ -220,6 +226,21 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         const next = cursor(raw['nextCursor']); const previous = cursor(raw['previousCursor']);
         return { messages, ...(next === undefined ? {} : { next }), ...(previous === undefined ? {} : { previous }) };
     }
+    async getThread(session: BackendMailSession, input: MailInput<'get_thread'>): Promise<MailOutput<'get_thread'>> {
+        sessionValid(session); const parsed = mailInputSchemas.get_thread.safeParse(input); if (!parsed.success) { throw new MailError('invalid_input'); }
+        const data = parsed.data;
+        const threadId = data.threadId ?? (data.message ? (await this.readMessage(session, data.message)).message.threadId : null);
+        if (!threadId) { throw new MailError('unsupported_content'); }
+        const query = new URLSearchParams({ thread: threadId, order: 'asc', limit: String(data.limit), metaData: 'true' });
+        if (data.next !== undefined) { query.set('next', data.next); } if (data.previous !== undefined) { query.set('previous', data.previous); }
+        const timing: SearchTiming = { category: 'network' };
+        const raw = json((await this.transport(session, '/search?' + query, 'GET', undefined, META_BYTES, 'json', timing)).bytes);
+
+        if (raw['success'] !== true || raw['error'] !== undefined || raw['code'] !== undefined) { return fail(); }
+        const page = this.page(raw, data.limit, session.accountId);
+        if (page.messages.some(message => message.threadId !== threadId)) { throw new MailError('verification_failed'); }
+        return { threadId, ...page };
+    }
     async listMessages(session: BackendMailSession, input: MailInput<'list_messages'>): Promise<MailOutput<'list_messages'>> {
         sessionValid(session); const parsed = mailInputSchemas.list_messages.safeParse(input); if (!parsed.success) { throw new MailError('invalid_input'); }
         const query = new URLSearchParams({ order: 'desc', limit: String(parsed.data.limit), metaData: 'true' });
@@ -229,11 +250,13 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
     async searchMessages(session: BackendMailSession, input: MailInput<'search_messages'>): Promise<MailOutput<'search_messages'>> {
         sessionValid(session); const parsed = mailInputSchemas.search_messages.safeParse(input); if (!parsed.success) { throw new MailError('invalid_input'); }
         const data = parsed.data;
+        if (data.flagged === false || data.hasAttachments === false) { throw new MailError('invalid_input'); }
         // Backend query fulltext has a 255-character limit; reject rather than silently narrow/truncate the requested search.
         if (data.text !== undefined && data.text.length > 255) { throw new MailError('invalid_input'); }
         const query = new URLSearchParams({ order: 'desc', limit: String(data.limit), metaData: 'true' });
-        const fields = { mailboxId: 'mailbox', from: 'from', to: 'to', subject: 'subject', text: 'query', receivedSince: 'datestart', receivedUntil: 'dateend', seen: 'seen', flagged: 'flagged', hasAttachments: 'attachments', next: 'next', previous: 'previous' } as const;
+        const fields = { mailboxId: 'mailbox', from: 'from', to: 'to', subject: 'subject', text: 'query', receivedSince: 'datestart', receivedUntil: 'dateend', flagged: 'flagged', hasAttachments: 'attachments', next: 'next', previous: 'previous' } as const;
         for (const [key, field] of Object.entries(fields)) { const value = data[key as keyof typeof fields]; if (value !== undefined) { query.set(field, String(value)); } }
+        if (data.seen !== undefined) { query.set(data.seen ? 'seen' : 'unseen', 'true'); }
         const started = performance.now(); const timing: SearchTiming = { category: 'network' }; let validationStarted: number | undefined; let outcome: 'success' | 'failure' = 'failure';
         try {
             const response = await this.transport(session, `/search?${query}`, 'GET', undefined, META_BYTES, 'json', timing);
@@ -283,6 +306,60 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
             attachments: (raw['attachments'] as unknown[]).map(attachment), version: snapshot.version };
         if (!mailOutputSchemas.read_message.safeParse(message).success) { return fail(); }
         const marker = markerOf(raw); return { message, ...(marker ? { marker } : {}) };
+    }
+    async getAttachmentDownload(session: BackendMailSession, input: MailInput<'get_attachment_download'>): Promise<MailOutput<'get_attachment_download'>> {
+        sessionValid(session); const parsed = mailInputSchemas.get_attachment_download.safeParse(input); if (!parsed.success) { throw new MailError('invalid_input'); }
+        const stager = this.downloadStager; if (!stager) { throw new MailError('temporarily_unavailable'); }
+        const inherited = remainingRequestTimeMs(); const deadline = performance.now() + Math.min(inherited ?? DOWNLOAD_TIMEOUT_MS + 2000, DOWNLOAD_TIMEOUT_MS + 2000);
+        return withRequestBudget(() => Math.max(0, deadline - performance.now()), async () => {
+            const { raw } = await this.rawMessage(session, parsed.data);
+            const rawAttachment = (raw['attachments'] as unknown[]).find(item => object(item) && item['id'] === parsed.data.attachmentId);
+            if (!object(rawAttachment)) { throw new MailError('not_found'); }
+            const metadata = attachment(rawAttachment);
+            if (metadata.size !== null && !metadata.sizeIsApproximate && metadata.size > MAX_DOWNLOAD_BYTES) { throw new MailError('too_large'); }
+            const bodyHash = rawAttachment['hash'];
+            if (typeof bodyHash !== 'string' || !/^[a-f0-9]{64}$/u.test(bodyHash)) { throw new MailError('unsupported_content'); }
+            // The backend hash identifies immutable transfer-encoded attachment bytes,
+            // not the decoded download checksum. Flags, versions and OAuth clients
+            // deliberately do not affect this private account-scoped cache identity.
+            const cacheIdentity = createHash('sha256').update(JSON.stringify(['wildduck-mcp/attachment-cache/v1', session.accountId, parsed.data.mailboxId, parsed.data.uid, parsed.data.attachmentId, bodyHash])).digest('hex');
+            const controller = new AbortController(); let timer: ReturnType<typeof setTimeout> | undefined; let response: Response | undefined;
+            const budget = Math.max(0, deadline - performance.now() - 2000); if (budget === 0) { throw new MailError('upstream_timeout'); }
+            const open = async (signal: AbortSignal) => {
+                if (controller.signal.aborted || signal.aborted) { throw new MailError('upstream_timeout'); }
+                response = await this.fetcher(WILDDUCK_ORIGIN + '/users/' + session.accountId + '/mailboxes/' + parsed.data.mailboxId + '/messages/' + parsed.data.uid + '/attachments/' + parsed.data.attachmentId, { method: 'GET', redirect: 'error', signal, headers: { Accept: '*/*', 'Accept-Encoding': 'identity', 'X-Access-Token': session.accessToken } });
+                if (controller.signal.aborted || signal.aborted) { void response.body?.cancel().catch(() => {}); throw new MailError('upstream_timeout'); }
+                if (response.redirected || response.status >= 300 && response.status < 400) { throw new MailError('temporarily_unavailable'); }
+                if (response.status !== 200) {
+                    // Read a bounded error body only to distinguish expired tokens.
+                    const bytes: Uint8Array[] = []; let length = 0;
+                    if (response.body) { const reader = response.body.getReader(); try { while (true) { const part = await reader.read(); if (part.done) { break; } length += part.value.byteLength; if (length > 8192) { throw new MailError('temporarily_unavailable'); } bytes.push(part.value); } } finally { void reader.cancel().catch(() => {}); } }
+                    let invalidToken = false; try { invalidToken = json(Buffer.concat(bytes))['code'] === 'InvalidToken'; } catch { /* Never expose error bodies. */ }
+                    if (response.status === 403 && invalidToken) { throw new MailError('reconnect_required'); }
+                    if (response.status === 404) { throw new MailError('not_found'); }
+                    if (response.status === 401 || response.status === 403) { throw new MailError('forbidden'); }
+                    const retry = response.headers.get('retry-after'); const retryAfter = retry !== null && /^\d{1,5}$/u.test(retry) && Number(retry) <= 86400 ? Number(retry) : undefined;
+                    throw new MailError('temporarily_unavailable', retryAfter);
+                }
+                const declared = response.headers.get('content-length');
+                if (declared !== null && (!/^\d+$/u.test(declared) || Number(declared) > MAX_DOWNLOAD_BYTES)) { throw new MailError('too_large'); }
+                if (!response.body || response.headers.has('content-encoding') && response.headers.get('content-encoding') !== 'identity') { throw new MailError('temporarily_unavailable'); }
+                if (declared !== null && metadata.size !== null && !metadata.sizeIsApproximate && Number(declared) !== metadata.size) { throw new MailError('verification_failed'); }
+                const expectedSize = declared === null ? metadata.size !== null && !metadata.sizeIsApproximate ? metadata.size : undefined : Number(declared);
+                return { body: response.body, ...(expectedSize === undefined ? {} : { expectedSize }) };
+            };
+            const operation = async () => {
+                const staged = await stager.stage({ cacheIdentity, metadata, open }, controller.signal);
+                if (controller.signal.aborted) { throw new MailError('upstream_timeout'); }
+                if (metadata.size !== null && !metadata.sizeIsApproximate && metadata.size !== staged.size) { throw new MailError('verification_failed'); }
+                const result = { ...parsed.data, filename: metadata.filename, contentType: metadata.contentType, ...staged };
+                if (!mailOutputSchemas.get_attachment_download.safeParse(result).success) { throw new MailError('verification_failed'); }
+                return result;
+            };
+            try { return await Promise.race([operation(), new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new MailError('upstream_timeout')); }, budget); })]); }
+            catch (error) { if (error instanceof MailError) { throw error; } throw new MailError('temporarily_unavailable'); }
+            finally { if (timer !== undefined) { clearTimeout(timer); } controller.abort(); if (response && !response.bodyUsed) { void response.body?.cancel().catch(() => {}); } }
+        });
     }
     async readAttachment(session: BackendMailSession, input: MailInput<'read_attachment'>): Promise<AttachmentDownload> {
         sessionValid(session); const parsed = mailInputSchemas.read_attachment.safeParse(input); if (!parsed.success) { throw new MailError('invalid_input'); }
@@ -340,6 +417,23 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
             if (address.includes('*') || !Array.isArray(aliases['results']) || aliases['results'].length > 1000 || !aliases['results'].some(item => object(item) && item['address'] === address && !String(item['address']).includes('*'))) { throw new MailError('forbidden'); }
         }
         return desired ?? { address, ...(typeof user['name'] === 'string' && user['name'] ? { name: user['name'] } : {}) };
+    }
+    async prepareReply(session: BackendMailSession, input: MailInput<'create_reply_draft'>, marker: MailOperationMarker): Promise<PreparedDraft> {
+        sessionValid(session); this.checkMarker(session, marker);
+        const parsed = mailInputSchemas.create_reply_draft.safeParse(input); if (!parsed.success) { throw new MailError('invalid_input'); }
+        const data = parsed.data;
+        try {
+            const [original, defaultFrom, aliases, mailbox] = await Promise.all([this.readMessage(session, data.original), this.ownedFrom(session), this.request(session, '/addresses', 'GET'), this.resolveDraftMailbox(session)]);
+            if (!Array.isArray(aliases['results']) || aliases['results'].length > 1000 || aliases['results'].some(item => !object(item) || typeof item['address'] !== 'string')) { return fail(); }
+            const ownedAddresses = [defaultFrom.address, ...(aliases['results'] as Json[]).map(item => string(item['address'])).filter(address => !address.includes('*'))];
+            const from = data.from ?? defaultFrom; if (!ownedAddresses.includes(from.address) || from.address.includes('*')) { throw new MailError('forbidden'); }
+            const reply = deriveReply({ original: original.message, ownedAddresses, mode: data.mode, body: data.body, quoteOriginal: data.quoteOriginal, ...(data.to === undefined && data.cc === undefined ? {} : { recipients: { to: data.to ?? [], cc: data.cc ?? [] } }) });
+            const mime = await createMime({ ...reply, from, attachments: data.attachments });
+            const envelope = outbound(mime.envelope); if (envelope.from !== from.address) { throw new MailError('unsupported_content'); }
+            const prepared: PreparedDraft = { mailboxId: mailbox.mailboxId, mime, marker };
+            this.preparations.set(prepared, { accountId: session.accountId, envelope, flags: ['\\Seen', '\\Draft'], labels: [], metadata: { [MAIL_OPERATION_METADATA_KEY]: marker }, receivedAt: new Date().toISOString(), files: [] });
+            return prepared;
+        } catch (error) { return mimeError(error); }
     }
     async prepareCreate(session: BackendMailSession, input: DraftContent, marker: MailOperationMarker): Promise<PreparedDraft> {
         sessionValid(session); this.checkMarker(session, marker);

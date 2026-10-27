@@ -5,7 +5,8 @@ export type { ActivationProof, AttachmentMetadata, CompletedReceipt, ConfirmedRe
 
 /** Catch/map only code. Never expose raw upstream errors, bodies, causes or tokens. */
 export class MailError extends Error {
-    constructor(public readonly code: MailFailureCode) { super(code); this.name = 'MailError'; }
+    declare readonly retryAfter?: number;
+    constructor(public readonly code: MailFailureCode, retryAfter: number | undefined = undefined) { super(code); this.name = 'MailError'; if (typeof retryAfter === 'number' && Number.isSafeInteger(retryAfter) && retryAfter >= 0 && retryAfter <= 86400) { this.retryAfter = retryAfter; } }
 }
 /** Reserved upstream metaData field. Raw marker contents are never public output. */
 export const MAIL_OPERATION_METADATA_KEY = 'wildduckMcpOperationV1';
@@ -20,11 +21,13 @@ export interface AttachmentDownload { readonly metadata: MailOutput<'read_attach
 export interface MailBackendReader {
     listMailboxes(session: BackendMailSession): Promise<MailOutput<'list_mailboxes'>>;
     listMessages(session: BackendMailSession, input: MailInput<'list_messages'>): Promise<MailOutput<'list_messages'>>;
+    getThread(session: BackendMailSession, input: MailInput<'get_thread'>): Promise<MailOutput<'get_thread'>>;
     searchMessages(session: BackendMailSession, input: MailInput<'search_messages'>): Promise<MailOutput<'search_messages'>>;
     /** No mark-as-seen mutation. HTML and incoming MIME fields are untrusted data.
      * Include private marker in this same GET so service can check one operation,
      * without a second backend GET or N+1 operation lookups on list pages. */
     readMessage(session: BackendMailSession, input: MailInput<'read_message'>): Promise<ReadMessageResult>;
+    getAttachmentDownload(session: BackendMailSession, input: MailInput<'get_attachment_download'>): Promise<MailOutput<'get_attachment_download'>>;
     readAttachment(session: BackendMailSession, input: MailInput<'read_attachment'>): Promise<AttachmentDownload>;
 }
 export interface MessageSnapshot {
@@ -68,6 +71,7 @@ export interface MailBackendWriter {
     verifyAuthoredSource(session: BackendMailSession, snapshot: MessageSnapshot, source: AuthoredSourceDescriptor): Promise<void>;
     /** Read/validate/compose completely BEFORE markDispatched. Pick owned default
      * From when omitted. Patch omissions preserve exact existing MIME and files. */
+    prepareReply?(session: BackendMailSession, input: MailInput<'create_reply_draft'>, marker: MailOperationMarker): Promise<PreparedDraft>;
     prepareCreate(session: BackendMailSession, input: DraftContent, marker: MailOperationMarker): Promise<PreparedDraft>;
     prepareUpdate(session: BackendMailSession, snapshot: MessageSnapshot, patch: DraftPatch, marker: MailOperationMarker, source: AuthoredSourceDescriptor): Promise<PreparedDraft>;
     /** Single raw upload WITH marker before visibility; NEVER replacePrevious. */
@@ -96,7 +100,8 @@ export interface MailBackendWriter {
 export interface OperationKey { readonly accountId: string; readonly clientIdHash: string; readonly operationId: string }
 export type WriteIntent = OperationKey & { readonly payloadDigest: string } & (
     | { readonly tool: 'create_draft' }
-    | { readonly tool: Exclude<MailWriteTool, 'create_draft'>; readonly target: MessageKey; readonly expectedVersion: string }
+    | { readonly tool: 'create_reply_draft' }
+    | { readonly tool: Exclude<MailWriteTool, 'create_draft' | 'create_reply_draft'>; readonly target: MessageKey; readonly expectedVersion: string }
 );
 export interface OperationClaim<State extends 'reserved' | 'dispatched' = 'reserved' | 'dispatched'> {
     readonly key: OperationKey; readonly ownerToken: string; readonly revision: number; readonly state: State;

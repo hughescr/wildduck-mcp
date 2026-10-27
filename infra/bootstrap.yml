@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: Stable CloudFront endpoint, artifact bucket and IAM roles for wildduck-mcp production CI
+Description: Stable CloudFront endpoint, private attachment staging, artifact bucket and IAM roles for wildduck-mcp production CI
 
 Parameters:
   FunctionUrlOrigin:
@@ -178,6 +178,59 @@ Resources:
             Status: Enabled
             NoncurrentVersionExpiration:
               NoncurrentDays: 30
+  DownloadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpirePrivateDownloads
+            Status: Enabled
+            Prefix: downloads/
+            ExpirationInDays: 1
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      # Browser clients holding the bearer URL can read/range-fetch it; no cookie
+      # credentials, uploads, bucket listing or public object access are enabled.
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: ['*']
+            AllowedMethods: [GET, HEAD]
+            AllowedHeaders: [Range]
+            ExposedHeaders: [Content-Length, Content-Range, Accept-Ranges, Content-Disposition]
+            MaxAge: 300
+      Tags:
+        - Key: Project
+          Value: wildduck-mcp
+  DownloadBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Ref: DownloadBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: RequireTLS
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - Fn::GetAtt: [DownloadBucket, Arn]
+              - Fn::Sub: ${DownloadBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: false
   ExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -198,6 +251,16 @@ Resources:
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
                 Resource:
                   Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/wildduck-mcp-prod-api:*
+              # HEAD must distinguish a missing object (404) from access denial.
+              # This dedicated bucket contains only temporary MCP downloads.
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource:
+                  Fn::GetAtt: [DownloadBucket, Arn]
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject, s3:AbortMultipartUpload]
+                Resource:
+                  Fn::Sub: ${DownloadBucket.Arn}/downloads/*
               - Effect: Allow
                 Action: ssm:GetParameter
                 Resource:
@@ -289,6 +352,11 @@ Outputs:
   ArtifactBucketName:
     Value:
       Ref: ArtifactBucket
+  DownloadBucketName:
+    Value:
+      Ref: DownloadBucket
+    Export:
+      Name: wildduck-mcp-prod-download-bucket
   ExecutionRoleArn:
     Value:
       Fn::GetAtt: [ExecutionRole, Arn]

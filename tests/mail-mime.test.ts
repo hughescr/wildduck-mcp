@@ -236,6 +236,15 @@ describe('MIME rejects ambiguous or unsupported semantics before any candidate',
         const converted = await preparePatch(source, { body: { text: 'plain', html: null }, deleteAttachmentIds: ['ATT00001'] });
         expect(converted.raw.includes(Buffer.from(logo))).toBe(false);
     });
+    test('new threading rejects injection and malformed reference chains before MIME preparation', async () => {
+        for (const threading of [
+            { inReplyTo: '<parent@example.test>\r\nBcc: injected@example.test', references: ['<parent@example.test>'] },
+            { inReplyTo: '<parent@example.test>', references: ['<parent@example.test>\nX: injected'] },
+            { inReplyTo: '<parent@example.test>', references: [] },
+            { inReplyTo: '<parent@example.test>', references: ['<other@example.test>'] },
+            { inReplyTo: '<parent@example.test>', references: ['<parent@example.test>', '<parent@example.test>'] },
+        ]) { await expect(createMime({ ...fresh, threading })).rejects.toMatchObject({ code: 'invalid_mime_patch' }); }
+    });
     test('header injection and noncanonical base64 fail, including nonzero pad bits', async () => {
         const source = await inspectSource(rich());
         for (const patch of [{ subject: 'bad\r\nBcc: evil@example.test' }, { from: { address: 'x@example.test\r\nX: bad' } }, { to: [{ address: 'x@example.test', name: 'bad\nName' }] }]) {await expect(preparePatch(source, patch)).rejects.toBeInstanceOf(MimeError);}

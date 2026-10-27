@@ -25,7 +25,8 @@ export interface MimePatch {
     readonly from?: MimeAddress | undefined; readonly replyTo?: readonly MimeAddress[] | undefined; readonly to?: readonly MimeAddress[] | undefined; readonly cc?: readonly MimeAddress[] | undefined; readonly bcc?: readonly MimeAddress[] | undefined;
     readonly subject?: string | undefined; readonly body?: MimeBody | undefined; readonly deleteAttachmentIds?: readonly string[] | undefined; readonly attachments?: readonly MimeAttachment[] | undefined;
 }
-export interface MimeCreate extends MimePatch { readonly from: MimeAddress; readonly subject: string; readonly body: MimeBody; readonly to: readonly MimeAddress[]; readonly cc: readonly MimeAddress[]; readonly bcc: readonly MimeAddress[] }
+export interface MimeThreading { readonly inReplyTo: string; readonly references: readonly string[] }
+export interface MimeCreate extends MimePatch { readonly threading?: MimeThreading | undefined; readonly from: MimeAddress; readonly subject: string; readonly body: MimeBody; readonly to: readonly MimeAddress[]; readonly cc: readonly MimeAddress[]; readonly bcc: readonly MimeAddress[] }
 export interface MimePartProof { readonly rawSha256: string; readonly encodedBodySha256: string; readonly contentType: string; readonly cid: string | null; readonly rawBytes: number }
 export interface InspectedMime { readonly sha256: string; readonly envelope: MimeEnvelope; readonly attachments: readonly MimePartProof[] }
 export interface PreparedMime { readonly raw: Buffer; readonly sha256: string; readonly envelope: MimeEnvelope; readonly retainedAttachments: readonly MimePartProof[] }
@@ -49,6 +50,17 @@ function headerControls(value: string, folding = false): boolean {
 const TOKEN = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/u;
 const MEDIA = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+\/[A-Za-z0-9!#$%&'*+.^_`|~-]+$/u;
 const EMAIL = /^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/u;
+// Deliberately bounded dot-atom subset of RFC message-id; no comments, folding or recovery.
+const MESSAGE_ID = /^<[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?>$/u;
+export function validateMessageId(value: string): void {
+    requireMime(typeof value === 'string' && value.length <= 320 && MESSAGE_ID.test(value) && !value.includes('..'), 'invalid_mime_patch');
+}
+export function validateThreading(value: MimeThreading): void {
+    validateMessageId(value.inReplyTo);
+    requireMime(Array.isArray(value.references) && value.references.length > 0 && value.references.length <= 100, 'invalid_mime_patch');
+    for (const id of value.references) { validateMessageId(id); }
+    requireMime(new Set(value.references).size === value.references.length && value.references.at(-1) === value.inReplyTo && Buffer.byteLength(value.references.join(' ')) <= 2048, 'invalid_mime_patch');
+}
 const SINGLE = new Set(['from', 'sender', 'reply-to', 'to', 'cc', 'bcc', 'subject', 'date', 'message-id', 'in-reply-to', 'references', 'mime-version']);
 const utf8 = new TextDecoder('utf-8', { fatal: true });
 function decodeUtf8(bytes: Uint8Array): string { try { return utf8.decode(bytes); } catch { return fail(); } }
@@ -361,17 +373,21 @@ export async function inspectSource(input: Uint8Array, attachmentBindings: reado
 }
 
 function builder(): Builder { return new Builder(undefined, { keepBcc: true, disableFileAccess: true, disableUrlAccess: true }); }
+/** Apply the same outbound address gate to reply-derived recipients and MIME headers. */
+export function validateMimeAddresses(list: readonly MimeAddress[]): void {
+    requireMime(Array.isArray(list) && list.length <= 100, 'invalid_mime_patch');
+    for (const address of list) {
+        safeText(address.address, 320); requireMime(EMAIL.test(address.address) && !address.address.includes('..'), 'invalid_mime_patch');
+        if (address.name !== undefined) { safeText(address.name, 320); requireMime(!/=\?[^?]+\?[bq]\?/iu.test(address.name), 'invalid_mime_patch'); }
+    }
+}
 function generatedHeaders(values: Record<string, string | MimeAddress | readonly MimeAddress[]>): Map<string, Buffer | null> {
     const node = builder();
     for (const [key, value] of Object.entries(values)) {
         if (typeof value === 'string') {safeText(value, 2048);}
         else {
             const list = Array.isArray(value) ? value : [value as MimeAddress];
-            requireMime(list.length <= 100, 'invalid_mime_patch');
-            for (const address of list) {
-                safeText(address.address, 320); requireMime(EMAIL.test(address.address) && !address.address.includes('..'), 'invalid_mime_patch');
-                if (address.name !== undefined) { safeText(address.name, 320); requireMime(!/=\?[^?]+\?[bq]\?/iu.test(address.name), 'invalid_mime_patch'); }
-            }
+            validateMimeAddresses(list);
         }
         node.setHeader(key, typeof value === 'string' ? key === 'Subject' && value ? encodeWord(value, 'B', 52) : value : Array.isArray(value) ? [...value] : value as MimeAddress);
     }
@@ -417,10 +433,13 @@ function multipart(type: 'multipart/alternative' | 'multipart/mixed' | 'multipar
         body: Buffer.concat([...children.flatMap(child => [Buffer.from(`--${boundary}\r\n`), child, Buffer.from('\r\n')]), Buffer.from(`--${boundary}--\r\n`)]), type,
     };
 }
-function bodyEntity(body: MimeBody): Entity {
+export function validateMimeBody(body: MimeBody): void {
     requireMime(body && typeof body.text === 'string' && (body.html === null || typeof body.html === 'string'), 'invalid_mime_patch');
     requireMime(body.text.isWellFormed() && Buffer.byteLength(body.text) <= 128 * 1024, 'invalid_mime_patch');
     requireMime(body.html === null || (body.html.isWellFormed() && Buffer.byteLength(body.html) <= 256 * 1024 && !/attachment:ATT[0-9]+/iu.test(body.html)), 'invalid_mime_patch');
+}
+function bodyEntity(body: MimeBody): Entity {
+    validateMimeBody(body);
     const plain = textEntity('text/plain', body.text);
     return body.html === null ? plain : multipart('multipart/alternative', [serialize(plain), serialize(textEntity('text/html', body.html))]);
 }
@@ -618,7 +637,9 @@ export async function createMime(input: MimeCreate): Promise<PreparedMime> {
     const additions = attachmentEntities(input.attachments ?? []);
     if (additions.inline.length) {entity = multipart('multipart/related', [serialize(entity), ...additions.inline]);}
     if (additions.regular.length) {entity = multipart('multipart/mixed', [serialize(entity), ...additions.regular]);}
-    const generated = generatedHeaders({ From: input.from, To: input.to, Cc: input.cc, Bcc: input.bcc, Subject: input.subject, ...(input.replyTo ? { 'Reply-To': input.replyTo } : {}) });
+    if (input.threading !== undefined) { validateThreading(input.threading); }
+    const generated = generatedHeaders({ From: input.from, To: input.to, Cc: input.cc, Bcc: input.bcc, Subject: input.subject, ...(input.replyTo ? { 'Reply-To': input.replyTo } : {}),
+        ...(input.threading ? { 'In-Reply-To': input.threading.inReplyTo, References: input.threading.references.join(' ') } : {}) });
     const root = builder(); root.setHeader('Date', new Date()); root.setHeader('Message-ID', `<${randomUUID()}@mcp.invalid>`); root.setHeader('MIME-Version', '1.0');
     const required = Buffer.from(root.buildHeaders() + '\r\n\r\n');
     const metadata = headersAt(required, 0, required.length).headers.filter(header => ['date', 'message-id', 'mime-version'].includes(header.key));

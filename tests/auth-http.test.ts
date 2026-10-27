@@ -25,7 +25,7 @@ function setup(totp = false, authMethod: 'none' | 'client_secret_basic' = 'none'
         list_messages: unavailable, search_messages: unavailable, read_message: unavailable,
         read_attachment: async (context, input) => { expect(context.accountId).toBe(credentials.profile.id); expect(context.accessToken).toBe(credentials.accessToken); expect(context.clientId).toBeString(); return { metadata: { ...input, filename: null, contentType: 'text/plain', size: 5, resourceUri: 'wildduck://attachment/ATT1' }, bytes: Buffer.from('hello') }; },
         move_message: unavailable, update_message_flags: unavailable,
-        create_draft: unavailable, update_draft: unavailable, delete_draft: unavailable, send_draft: unavailable,
+        get_attachment_download: unavailable, get_thread: unavailable, read_messages: unavailable, create_reply_draft: unavailable, create_draft: unavailable, update_draft: unavailable, delete_draft: unavailable, send_draft: unavailable,
     };
 
     const runtime: AuthRuntime = { issuer, crypto, store, engine, clients, mail, wildduck: { beginLogin: async (username, password) => { expect(username).toBe('user'); expect(password).toBe('password'); loginCalls++; return totp ? { kind: 'pendingTotp', accountId: credentials.profile.id, profile: credentials.profile, nonce: 'b'.repeat(40), provisionalToken: credentials.accessToken, issuedAt: credentials.issuedAt } : { kind: 'authenticated', credentials }; }, completeTotp: async (pending, code) => { expect(pending.accountId).toBe(credentials.profile.id); expect(code).toBe('123456'); return credentials; }, validateCredentials: async () => state, logout: async () => true } };

@@ -1,3 +1,4 @@
+import { withRequestBudget } from '../src/request-budget';
 import { expect, test } from 'bun:test';
 import { digest } from '../src/auth/crypto';
 import { createMailService } from '../src/mail/service';
@@ -9,7 +10,7 @@ const operation_id = 'operation_test_001';
 const target = { uid: 7, expected_version: version, operation_id };
 const content = { to: [{ address: 'to@example.com' }], cc: [], bcc: [], subject: 'private subject', body: { text: 'private body', html: '<p>private body</p>' }, attachments: [] };
 const keyOf = (key: OperationKey) => JSON.stringify([key.accountId, key.clientIdHash, key.operationId]);
-const guardOf = (intent: WriteIntent) => intent.tool === 'create_draft' ? undefined : JSON.stringify([intent.accountId, intent.target.mailboxId, intent.target.uid]);
+const guardOf = (intent: WriteIntent) => intent.tool === 'create_draft' || intent.tool === 'create_reply_draft' ? undefined : JSON.stringify([intent.accountId, intent.target.mailboxId, intent.target.uid]);
 class Store implements MailOperationStore {
     records = new Map<string, MailOperationRecord>(); guards = new Map<string, string>(); calls: string[] = [];
     completeFault: 'none' | 'before' | 'after' = 'none'; markFault: 'none' | 'before' | 'after' = 'none'; unknownFault = false; preflightFault = false;
@@ -53,7 +54,7 @@ class Store implements MailOperationStore {
 function fixture(authored = true) {
     const operations = new Store(); const calls: { method: string; args: unknown[] }[] = [];
     const mailbox = { mailboxId, path: 'Drafts', specialUse: '\\Drafts' };
-    const message = { mailboxId, uid: 7, subject: 'subject', from: [], to: [], date: null, receivedAt: null, flags: { seen: false, flagged: false, draft: true, answered: false, deleted: false, forwarded: false }, imapFlags: [], labels: [], hasAttachments: false };
+    const message = { mailboxId, uid: 7, subject: 'subject', snippet: null, threadId: null, from: [], to: [], date: null, receivedAt: null, flags: { seen: false, flagged: false, draft: true, answered: false, deleted: false, forwarded: false }, imapFlags: [], labels: [], hasAttachments: false };
     const snapshot = { message: { mailboxId, uid: 7, version }, isDraft: true, hasHtml: true, hasAttachments: true, hasRecipients: true };
     const messages = new Map<string, MessageSnapshot>();
     const seedKey = { accountId, clientIdHash: digest('seed-client'), operationId: 'seed_authored_001' };
@@ -65,6 +66,8 @@ function fixture(authored = true) {
     const record = (method: string, ...args: unknown[]) => { calls.push({ method, args }); };
     const find = (key: { mailboxId: string; uid: number }): MessageSnapshot => messages.get(JSON.stringify(key)) ?? { ...behavior.snapshot, ...(behavior.marker ? { marker: behavior.marker } : {}) };
     const reader: MailBackendReader = {
+        getAttachmentDownload: async (_bound, input) => ({ ...input, filename: null, contentType: 'text/plain', size: 5, url: 'https://example.s3.amazonaws.com/file', expiresAt: '2026-10-26T10:00:00.000Z' }),
+        getThread: async (_bound, input) => ({ threadId: input.threadId ?? mailboxId, messages: [message] }),
         listMailboxes: async (...args) => { record('listMailboxes', ...args); return { mailboxes: [mailbox] }; },
         listMessages: async (...args) => { record('listMessages', ...args); return { messages: [message] }; },
         searchMessages: async (...args) => { record('searchMessages', ...args); return { messages: [message] }; },
@@ -79,6 +82,7 @@ function fixture(authored = true) {
         resolveDraftMailbox: async (...args) => { record('resolve', ...args); return mailbox; },
         inspectMessage: async (...args) => { record('inspect', ...args); await behavior.beforeInspect(); if (behavior.originalReadError) { throw new MailError('temporarily_unavailable'); } return find(args[1]); },
         verifyAuthoredSource: async (...args) => { record('sourcecheck', ...args); if (behavior.sourceMismatch) { throw new MailError('verification_failed'); } },
+        prepareReply: async (...args) => { record('prepareReply', ...args); if (behavior.preparationError) { throw new MailError('unsupported_content'); } return prepare(args[2]); },
         prepareCreate: async (...args) => { record('prepareCreate', ...args); if (behavior.preparationError) { throw new MailError('unsupported_content'); } return prepare(args[2]); },
         prepareUpdate: async (...args) => { record('prepareUpdate', ...args); if (behavior.sourceMismatch) { throw new MailError('verification_failed'); } if (behavior.preparationError) { throw new MailError('source_integrity_unavailable'); } return prepare(args[3]); },
         uploadPreparedDraft: async (...args) => {
@@ -457,4 +461,44 @@ test('read and search upstream_timeout stay read errors without operation record
     await expect(f.service.read_message(context, { mailboxId, uid: 7 })).rejects.toMatchObject({ code: 'upstream_timeout', message: 'upstream_timeout' });
     await expect(f.service.search_messages(context, { text: 'needle', limit: 20 })).rejects.toMatchObject({ code: 'upstream_timeout', message: 'upstream_timeout' });
     expect(f.operations.calls).toHaveLength(0); expect(f.operations.records.size).toBe(0); expect(f.operations.guards.size).toBe(0); expect(posts(f)).toHaveLength(0);
+});
+
+test('batch reads preserve order, cap concurrency and return isolated sanitized failures', async () => {
+    const f = fixture(false); const original = f.reader.readMessage; let active = 0; let high = 0;
+    f.reader.readMessage = async (bound, key) => { active++; high = Math.max(high, active); try { await Bun.sleep(2); if (key.uid === 3) { throw new MailError('not_found'); } const result = await original(bound, key); return { message: { ...result.message, ...key } }; } finally { active--; } };
+    const result = await f.service.read_messages(context, { messages: Array.from({ length: 8 }, (_, index) => ({ mailboxId, uid: index + 1 })) });
+    expect(high).toBe(3); expect(result.results.map(item => item.status === 'ok' ? item.message.uid : item.uid)).toEqual([1,2,3,4,5,6,7,8]);
+    expect(result.results[2]).toEqual({ status: 'failed', mailboxId, uid: 3, error: { code: 'not_found', message: 'not_found' } }); expect(result.bytesReturned).toBe(Buffer.byteLength(JSON.stringify(result))); expect(f.operations.calls).toHaveLength(0);
+});
+test('batch serialized budget includes metadata, envelope and reserved failure slots', async () => {
+    const f = fixture(false); const original = f.reader.readMessage;
+    f.reader.readMessage = async (bound, key) => ({ message: { ...(await original(bound, key)).message, ...key, text: 'x'.repeat(128 * 1024), html: ['x'.repeat(256 * 1024)] } });
+    const result = await f.service.read_messages(context, { messages: Array.from({ length: 10 }, (_, index) => ({ mailboxId, uid: index + 1 })) });
+    expect(result.results.filter(item => item.status === 'ok')).toHaveLength(2); expect(result.results.filter(item => item.status === 'failed').every(item => item.status === 'failed' && item.error.code === 'too_large')).toBe(true); expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(1048576); expect(result.bytesReturned).toBe(Buffer.byteLength(JSON.stringify(result)));
+});
+
+test('reply draft uses distinct durable create intent, skips preparation on replay, and requires both read and draft', async () => {
+    const f = fixture(false); const reply = { original: { mailboxId, uid: 7 }, mode: 'reply_all' as const, body: { text: 'Reply', html: null }, quoteOriginal: false, attachments: [], operation_id };
+    const created = await f.service.create_reply_draft(context, reply); expect(created.status).toBe('completed'); expect(f.calls.filter(call => call.method === 'prepareReply')).toHaveLength(1); expect(f.calls.some(call => call.method === 'inspect')).toBe(false);
+    const calls = f.calls.length; expect(await f.service.create_reply_draft(context, reply)).toEqual(created); expect(f.calls).toHaveLength(calls); expect(await f.service.create_reply_draft(context, { ...reply, body: { text: 'Changed', html: null } })).toMatchObject({ status: 'conflict', reason: 'operation_conflict' });
+    expect([...f.operations.records.values()][0]?.intent.tool).toBe('create_reply_draft');
+    const denied = fixture(false); await expect(denied.service.create_reply_draft({ ...context, scopes: ['mail:draft'] }, reply)).rejects.toMatchObject({ code: 'forbidden' }); expect(denied.calls).toHaveLength(0); expect(denied.operations.calls).toHaveLength(0);
+});
+test('reply preparation failure settles preflight without upload and authored reply can later send', async () => {
+    const f = fixture(false); const reply = { original: { mailboxId, uid: 7 }, mode: 'reply' as const, body: { text: 'Reply', html: null }, quoteOriginal: false, attachments: [], operation_id };
+    f.behavior.preparationError = true; expect(await f.service.create_reply_draft(context, reply)).toMatchObject({ status: 'failed', reason: 'unsupported_content' }); expect(f.calls.some(call => call.method === 'upload')).toBe(false); expect(f.operations.calls).not.toContain('dispatch');
+    const good = fixture(false); const created = await good.service.create_reply_draft(context, reply); if (created.status !== 'completed') { throw new Error('expected created draft'); }
+    const sent = await good.service.send_draft(context, { uid: created.draft.uid, expected_version: created.draft.version, operation_id: 'reply-send-operation' }); expect(sent.status).toBe('queued');
+});
+test('thread body pages reuse bounded batch reader, retaining per-item failures and limiting body page size', async () => {
+    const f = fixture(false); const original = f.reader.readMessage;
+    f.reader.getThread = async () => { const summary = (await f.reader.listMessages(context, { mailboxId, limit: 20 })).messages[0]; if (!summary) { throw new Error('missing summary'); } return { threadId: mailboxId, messages: [summary, { ...summary, uid: 8 }], next: 'thread-next' }; };
+    f.reader.readMessage = async (bound, key) => { if (key.uid === 8) { throw new MailError('not_found'); } return original(bound, key); };
+    const page = await f.service.get_thread(context, { threadId: mailboxId, limit: 2, includeBodies: true }); expect(page.next).toBe('thread-next'); expect(page.bodies?.results.map(item => item.status)).toEqual(['ok', 'failed']);
+    await expect(f.service.get_thread(context, { threadId: mailboxId, limit: 11, includeBodies: true })).rejects.toMatchObject({ code: 'invalid_input' });
+});
+test('batch deadline includes a stalled provenance lookup and returns item timeout', async () => {
+    const f = fixture(); f.operations.getOperation = async () => new Promise(() => {}); const deadline = performance.now() + 2020;
+    const started = performance.now(); const result = await withRequestBudget(() => Math.max(0, deadline - performance.now()), () => f.service.read_messages(context, { messages: [{ mailboxId, uid: 7 }] }));
+    expect(performance.now() - started).toBeLessThan(500); expect(result.results[0]).toMatchObject({ status: 'failed', error: { code: 'upstream_timeout' } });
 });

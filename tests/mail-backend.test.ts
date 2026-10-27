@@ -82,11 +82,11 @@ test('list uses one fixed descending page, encoded opaque cursor and no unseen o
     expect(f.calls[0]?.url).toBe(`${WILDDUCK_ORIGIN}/users/${accountId}/mailboxes/${mailboxId}/messages?order=desc&limit=2&metaData=true&next=opaque%2B%2F%3D`);
     expect(mailOutputSchemas.list_messages.safeParse(result).success).toBe(true);
 });
-test('search maps structured filters with preserved false booleans, dates and previous cursor', async () => {
+test('search maps supported structured predicates, dates and previous cursor', async () => {
     const f = fixture([{ success: true, results: [], nextCursor: false, previousCursor: 'back' }]);
-    expect(await f.backend.searchMessages(session, { mailboxId, limit: 3, from: 'a+b@example.com', to: 'person', subject: 'A & B', text: 'words', receivedSince: '2026-10-01T00:00:00Z', receivedUntil: '2026-10-26T00:00:00Z', seen: false, flagged: false, hasAttachments: false, previous: 'cursor+/=' })).toEqual({ messages: [], previous: 'back' });
+    expect(await f.backend.searchMessages(session, { mailboxId, limit: 3, from: 'a+b@example.com', to: 'person', subject: 'A & B', text: 'words', receivedSince: '2026-10-01T00:00:00Z', receivedUntil: '2026-10-26T00:00:00Z', seen: false, flagged: true, hasAttachments: true, previous: 'cursor+/=' })).toEqual({ messages: [], previous: 'back' });
     const url = new URL(f.calls[0]?.url ?? ''); expect(url.pathname).toBe(`/users/${accountId}/search`);
-    expect(Object.fromEntries(url.searchParams)).toEqual({ order: 'desc', limit: '3', metaData: 'true', mailbox: mailboxId, from: 'a+b@example.com', to: 'person', subject: 'A & B', query: 'words', datestart: '2026-10-01T00:00:00Z', dateend: '2026-10-26T00:00:00Z', seen: 'false', flagged: 'false', attachments: 'false', previous: 'cursor+/=' });
+    expect(Object.fromEntries(url.searchParams)).toEqual({ order: 'desc', limit: '3', metaData: 'true', mailbox: mailboxId, from: 'a+b@example.com', to: 'person', subject: 'A & B', query: 'words', datestart: '2026-10-01T00:00:00Z', dateend: '2026-10-26T00:00:00Z', flagged: 'true', attachments: 'true', previous: 'cursor+/=', unseen: 'true' });
     const wrong = fixture([{ success: true, results: [message({ mailbox: 'd'.repeat(24) })] }]); await errorCode(wrong.backend.searchMessages(session, { mailboxId, limit: 20 }), 'temporarily_unavailable');
 });
 test('all adapter entry points reject missing token and invalid account before any request', async () => {
@@ -388,4 +388,112 @@ test('body and validation timings are retained and throwing logger or late fetch
     const slow = createMailBackend({ timeoutMs: 5, onSearchDiagnostic: value => { late.push(value); }, fetch: (async _url => { await pause(20); return Response.json({ success: true, results: [] }); }) as typeof fetch });
     await errorCode(slow.searchMessages(session, { subject: 'synthetic', limit: 1 }), 'upstream_timeout');
     const first = JSON.stringify(late); await pause(30); expect(late).toHaveLength(1); expect(JSON.stringify(late)).toBe(first);
+});
+
+test('search false predicates never become silently ignored broad queries', async () => {
+    for (const predicate of [{ flagged: false }, { hasAttachments: false }]) {
+        const f = fixture([]); await errorCode(f.backend.searchMessages(session, { ...predicate, limit: 20 }), 'invalid_input'); expect(f.calls).toHaveLength(0);
+    }
+    for (const seen of [true, false]) {
+        const f = fixture([{ success: true, results: [] }]); await f.backend.searchMessages(session, { seen, limit: 20 });
+        const query = new URL((f.calls[0]?.url ?? '')).searchParams; expect(query.get(seen ? 'seen' : 'unseen')).toBe('true'); expect(query.has(seen ? 'unseen' : 'seen')).toBe(false);
+    }
+});
+test('thread pages search the entire account including Sent, preserve identities and cursors, and reject a dropped filter', async () => {
+    const threadId = 'e'.repeat(24); const sent = 'f'.repeat(24);
+    const f = fixture([message({ thread: threadId }), { success: true, results: [message({ thread: threadId, attachments: false }), message({ thread: threadId, mailbox: sent, id: 12, attachments: false })], nextCursor: 'next-thread' }]);
+    const page = await f.backend.getThread(session, { message: target, limit: 2, includeBodies: false });
+    expect(page.threadId).toBe(threadId); expect(page.messages.map(item => [item.mailboxId, item.uid])).toEqual([[mailboxId, 12], [sent, 12]]); expect(page.next).toBe('next-thread');
+    const query = new URL((f.calls[1]?.url ?? '')).searchParams; expect(query.get('thread')).toBe(threadId); expect(query.has('mailbox')).toBe(false); expect(query.get('order')).toBe('asc');
+    const mismatch = fixture([{ success: true, results: [message({ thread: 'a'.repeat(24), attachments: false })] }]);
+    await errorCode(mismatch.backend.getThread(session, { threadId, limit: 20, previous: 'back', includeBodies: false }), 'verification_failed');
+    expect(new URL((mismatch.calls[0]?.url ?? '')).searchParams.get('previous')).toBe('back');
+});
+test('message previews preserve explicit missing data and bound multibyte snippets', async () => {
+    const f = fixture([{ success: true, results: [message({ intro: 'é'.repeat(400), thread: 'e'.repeat(24), attachments: false })] }, message()]);
+    const listed = (await f.backend.listMessages(session, { mailboxId, limit: 20 })).messages[0]; if (!listed) { throw new Error('missing result'); }
+    expect(Buffer.byteLength(listed.snippet ?? '')).toBe(512); expect(listed.threadId).toBe('e'.repeat(24));
+    const read = (await f.backend.readMessage(session, target)).message; expect(read.threadId).toBeNull(); expect(read.snippet).toBe(read.text.replace(/\s+/gu, ' ').trim());
+});
+test('only bounded valid Retry-After seconds are retained from unavailable responses', async () => {
+    for (const [value, expected] of [['30', 30], ['0', 0], ['-1', undefined], ['1.5', undefined], ['90000', undefined], ['private token', undefined]] as const) {
+        const f = fixture([Response.json({ code: 'RateLimited', error: 'private' }, { status: 429, headers: { 'Retry-After': value } })]);
+        try { await f.backend.readMessage(session, target); throw new Error('expected failure'); } catch (error) { expect(error).toBeInstanceOf(MailError); expect((error as MailError).retryAfter).toBe(expected); }
+    }
+});
+
+test('reply preparation derives recipients and MIME threading without changing the original', async () => {
+    const f = model(['alias@example.com']); f.patch({ from: [{ address: 'author@example.com' }], replyTo: [{ address: 'help@example.com' }], to: [{ address: 'sender@example.com' }, { address: 'alias@example.com' }, { address: 'visible@example.com' }], cc: [{ address: 'copy@example.com' }], bcc: [{ address: 'blind@example.com' }], text: 'Original <text>', references: ['<ancestor@example.com>'] });
+    const prepared = await f.backend.prepareReply?.(session, { original: target, mode: 'reply_all', body: { text: 'Response', html: '<p>Response</p>' }, quoteOriginal: true, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    expect(prepared?.mime.envelope.to.map(item => item.address)).toEqual(['help@example.com', 'visible@example.com']); expect(prepared?.mime.envelope.cc.map(item => item.address)).toEqual(['copy@example.com']); expect(prepared?.mime.envelope.bcc).toEqual([]);
+    const mime = prepared?.mime.raw.toString() ?? ''; expect(mime).toContain('In-Reply-To: <test@example.com>'); expect(mime).toContain('References: <ancestor@example.com> <test@example.com>'); expect(mime).not.toContain('blind@example.com'); expect(mime).not.toContain('Bcc:'); expect(f.calls.every(call => call.init.method === 'GET')).toBe(true);
+    const invalid = model(); invalid.patch({ messageId: null }); await errorCode(invalid.backend.prepareReply?.(session, { original: target, mode: 'reply', body: { text: 'Response', html: null }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' }) ?? Promise.resolve(), 'unsupported_content'); expect(invalid.calls.every(call => call.init.method === 'GET')).toBe(true);
+});
+test('staged download streams only the validated attachment and returns binary-free bounded metadata', async () => {
+    const calls: { url: string; init: RequestInit }[] = []; let staged = 0; let bytes = 0;
+    const backend = createMailBackend({ fetch: (async (url, init) => { calls.push({ url: String(url), init: init ?? {} }); return calls.length === 1 ? Response.json(message({ attachments: [{ id: 'ATT1', hash: 'e'.repeat(64), filename: 'file.bin', contentType: 'application/octet-stream', size: 3 }] })) : new Response(new Uint8Array([0,1,255]), { headers: { 'content-length': '3' } }); }) as typeof fetch, downloadStager: { stage: async source => { staged++; const opened = await source.open(new AbortController().signal); expect(opened.expectedSize).toBe(3); const reader = opened.body.getReader(); while (true) { const part = await reader.read(); if (part.done) { break; } bytes += part.value.byteLength; } return { url: 'https://bucket.s3.amazonaws.com/downloads/opaque?signature=temporary', size: bytes, expiresAt: '2026-10-26T10:00:00.000Z' }; } } });
+    const result = await backend.getAttachmentDownload(session, { ...target, attachmentId: 'ATT1' }); expect(staged).toBe(1); expect(bytes).toBe(3); expect(result.size).toBe(3); expect(result.attachmentId).toBe('ATT1'); expect(result).not.toHaveProperty('blob'); expect(result).not.toHaveProperty('bytes'); expect(calls).toHaveLength(2); expect(calls[0]?.url).toEndWith('?markAsSeen=false&replaceCidLinks=false'); expect(calls[1]?.url).toEndWith('/attachments/ATT1'); expect(calls.every(call => call.init.method === 'GET' && new Headers(call.init.headers).get('X-Access-Token') === token)).toBe(true);
+});
+test('staged download rejects absent or oversized metadata before fetching bytes and fails closed on mismatch', async () => {
+    for (const attachments of [[], [{ id: 'ATT1', hash: 'e'.repeat(64), contentType: 'text/plain', size: 20 * 1024 * 1024 + 1 }]]) {
+        let calls = 0; const backend = createMailBackend({ fetch: (async (_url: string | URL | Request) => { calls++; return Response.json(message({ attachments })); }) as typeof fetch, downloadStager: { stage: async () => { throw new Error('must not stage'); } } });
+        await errorCode(backend.getAttachmentDownload(session, { ...target, attachmentId: 'ATT1' }), attachments.length ? 'too_large' : 'not_found'); expect(calls).toBe(1);
+    }
+    let calls = 0; const backend = createMailBackend({ fetch: (async (_url: string | URL | Request) => ++calls === 1 ? Response.json(message({ attachments: [{ id: 'ATT1', hash: 'e'.repeat(64), contentType: 'text/plain', size: 3 }] })) : new Response('abc', { headers: { 'content-length': '3' } })) as typeof fetch, downloadStager: { stage: async source => { const opened = await source.open(new AbortController().signal); await opened.body.cancel(); return { url: 'https://bucket.s3.amazonaws.com/file', size: 2, expiresAt: '2026-10-26T10:00:00.000Z' }; } } });
+    await errorCode(backend.getAttachmentDownload(session, { ...target, attachmentId: 'ATT1' }), 'verification_failed');
+});
+
+test('conflicting exact attachment lengths fail before staging and cancel the body', async () => {
+    let calls = 0; let stages = 0; let cancelled = false;
+    const backend = createMailBackend({ fetch: (async (_url: string | URL | Request) => ++calls === 1 ? Response.json(message({ attachments: [{ id: 'ATT1', hash: 'e'.repeat(64), contentType: 'text/plain', size: 3 }] })) : new Response(new ReadableStream({ cancel() { cancelled = true; } }), { headers: { 'content-length': '4' } })) as typeof fetch, downloadStager: { stage: async source => { stages++; await source.open(new AbortController().signal); throw new Error('must not complete staging'); } } });
+    await errorCode(backend.getAttachmentDownload(session, { ...target, attachmentId: 'ATT1' }), 'verification_failed'); expect(stages).toBe(1); expect(cancelled).toBe(true);
+});
+
+test('cached attachment links revalidate message access and reuse identity across flag changes without fetching bytes again', async () => {
+    const identities: string[] = []; let metadataReads = 0; let byteReads = 0; let stages = 0; let removed = false;
+    const cached = new Map<string, number>();
+    const backend = createMailBackend({ fetch: (async (url: string | URL | Request) => {
+        if (String(url).endsWith('/attachments/ATT1')) { byteReads++; return new Response('abc', { headers: { 'content-length': '3' } }); }
+        metadataReads++; if (removed) { return Response.json({ error: 'Gone' }, { status: 404 }); }
+        return Response.json(message({ seen: metadataReads > 1, flags: metadataReads > 1 ? ['\\Seen'] : [], attachments: [{ id: 'ATT1', hash: 'e'.repeat(64), contentType: 'text/plain', filename: 'same.txt', size: 3 }] }));
+    }) as typeof fetch, downloadStager: { stage: async source => {
+        stages++; identities.push(source.cacheIdentity); let size = cached.get(source.cacheIdentity);
+        if (size === undefined) { const opened = await source.open(new AbortController().signal); const bytes = await new Response(opened.body).arrayBuffer(); size = bytes.byteLength; cached.set(source.cacheIdentity, size); }
+        return { url: 'https://bucket.s3.amazonaws.com/downloads/' + source.cacheIdentity + '?signature=' + stages, size, expiresAt: new Date(Date.now() + 300000).toISOString() };
+    } } });
+    const first = await backend.getAttachmentDownload(session, { ...target, attachmentId: 'ATT1' });
+    const renewed = await backend.getAttachmentDownload(session, { ...target, attachmentId: 'ATT1' });
+    expect(metadataReads).toBe(2); expect(byteReads).toBe(1); expect(identities[0]).toBe(identities[1]); expect(identities[0]).toMatch(/^[a-f0-9]{64}$/u); expect(first.url).not.toBe(renewed.url); expect(first.size).toBe(renewed.size);
+    removed = true; await errorCode(backend.getAttachmentDownload(session, { ...target, attachmentId: 'ATT1' }), 'not_found'); expect(stages).toBe(2); expect(byteReads).toBe(1);
+});
+test('cached attachment identity is account and message scoped and changes with immutable attachment hash', async () => {
+    const identities: string[] = []; let hash = 'e'.repeat(64);
+    const backend = createMailBackend({ fetch: (async (url: string | URL | Request) => {
+        const parts = new URL(String(url)).pathname.split('/');
+        return Response.json(message({ user: parts[2], mailbox: parts[4], id: Number(parts[6]), attachments: [{ id: 'ATT1', hash, contentType: 'text/plain', size: 3 }] }));
+    }) as typeof fetch, downloadStager: { stage: async source => { identities.push(source.cacheIdentity); return { url: 'https://bucket.s3.amazonaws.com/file', size: 3, expiresAt: new Date(Date.now() + 300000).toISOString() }; } } });
+    await backend.getAttachmentDownload(session, { ...target, attachmentId: 'ATT1' });
+    await backend.getAttachmentDownload({ ...session, accountId: 'f'.repeat(24) }, { ...target, attachmentId: 'ATT1' });
+    await backend.getAttachmentDownload(session, { mailboxId: 'd'.repeat(24), uid: target.uid, attachmentId: 'ATT1' });
+    await backend.getAttachmentDownload(session, { ...target, uid: target.uid + 1, attachmentId: 'ATT1' });
+    hash = 'f'.repeat(64); await backend.getAttachmentDownload(session, { ...target, attachmentId: 'ATT1' });
+    expect(new Set(identities).size).toBe(5); expect(identities.every(identity => /^[a-f0-9]{64}$/u.test(identity))).toBe(true);
+});
+test('missing or invalid immutable hashes fail before cache lookup or upstream byte download', async () => {
+    for (const hash of [undefined, null, '', 'x'.repeat(64), 'e'.repeat(63), 'E'.repeat(64)]) {
+        let requests = 0; let stages = 0;
+        const backend = createMailBackend({ fetch: (async (_url: string | URL | Request) => { requests++; return Response.json(message({ attachments: [{ id: 'ATT1', hash, contentType: 'text/plain', size: 3 }] })); }) as typeof fetch, downloadStager: { stage: async () => { stages++; throw new Error('must not stage'); } } });
+        await errorCode(backend.getAttachmentDownload(session, { ...target, attachmentId: 'ATT1' }), 'unsupported_content'); expect(requests).toBe(1); expect(stages).toBe(0);
+    }
+});
+
+test('lazy cache miss fetch preserves sanitized attachment status errors and supplied retry hints', async () => {
+    for (const [status, code, expected] of [[403, 'InvalidToken', 'reconnect_required'], [403, 'AccessDenied', 'forbidden'], [404, 'MessageNotFound', 'not_found'], [429, 'RateLimited', 'temporarily_unavailable']] as const) {
+        let requests = 0;
+        const backend = createMailBackend({ fetch: (async (_url: string | URL | Request) => ++requests === 1 ? Response.json(message({ attachments: [{ id: 'ATT1', hash: 'e'.repeat(64), contentType: 'text/plain', size: 3 }] })) : Response.json({ code, error: 'private upstream response' }, { status, headers: { 'Retry-After': '20' } })) as typeof fetch, downloadStager: { stage: async source => { await source.open(new AbortController().signal); throw new Error('must not complete'); } } });
+        try { await backend.getAttachmentDownload(session, { ...target, attachmentId: 'ATT1' }); throw new Error('Expected failure'); } catch (error) {
+            expect(error).toBeInstanceOf(MailError); expect((error as MailError).code).toBe(expected); expect((error as MailError).retryAfter).toBe(status === 429 ? 20 : undefined); expect(JSON.stringify(error)).not.toContain('private');
+        }
+        expect(requests).toBe(2);
+    }
 });

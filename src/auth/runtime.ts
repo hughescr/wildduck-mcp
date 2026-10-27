@@ -1,5 +1,6 @@
 import type { Config } from '../config';
 import type { MailService } from '../mail/contracts';
+import { createS3AttachmentDownloadStager } from '../mail/downloads';
 import { createMailBackend } from '../mail/backend';
 import { DynamoMailOperationStore } from '../mail/dynamo-store';
 import { createMailService } from '../mail/service';
@@ -26,7 +27,7 @@ export function createRuntimeProvider(config: Config): RuntimeProvider {
         const fingerprint = digest(JSON.stringify([keyring.activeKeyId, Object.entries(keyring.keys).map(([id, key]) => [id, Buffer.from(key).toString('base64')])]));
         if (!active || active.fingerprint !== fingerprint) {
             const crypto = new AuthCrypto(keyring);
-            const backend = createMailBackend();
+            const backend = createMailBackend(config.downloadBucketName ? { downloadStager: createS3AttachmentDownloadStager({ bucketName: config.downloadBucketName }) } : {});
             const mail = createMailService({ reader: backend, writer: backend, operations: new DynamoMailOperationStore({ tableName }) });
             active = { fingerprint, runtime: { issuer, crypto, store, wildduck, mail, clients: new ClientRegistry({ crypto }), engine: new AuthEngine(store, crypto, new WildduckSessionValidator(wildduck, crypto), { issuer, refreshRetrySeconds: 10 }) } };
         }

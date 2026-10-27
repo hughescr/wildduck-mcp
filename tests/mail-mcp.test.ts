@@ -5,17 +5,21 @@ import { MailError, type BoundMailService } from '../src/mail/contracts';
 const mailboxId = 'b'.repeat(24);
 const version = 'v'.repeat(43);
 const operation_id = '9ea75b7b-64fa-455e-b83b-37081fc1ec2a';
-const toolNames = ['list_mailboxes', 'list_messages', 'search_messages', 'read_message', 'read_attachment', 'create_draft', 'update_draft', 'delete_draft', 'send_draft', 'move_message', 'update_message_flags'];
+const toolNames = ['list_mailboxes', 'list_messages', 'search_messages', 'read_message', 'read_attachment', 'get_attachment_download', 'get_thread', 'read_messages', 'create_draft', 'create_reply_draft', 'update_draft', 'delete_draft', 'send_draft', 'move_message', 'update_message_flags'];
 function fixture() {
     const calls: { tool: string; input: unknown }[] = [];
     const mail: BoundMailService = {
         list_mailboxes: async input => { calls.push({ tool: 'list_mailboxes', input }); return { mailboxes: [{ mailboxId, path: 'INBOX', specialUse: null }] }; },
         list_messages: async input => { calls.push({ tool: 'list_messages', input }); return { messages: [] }; },
         search_messages: async input => { calls.push({ tool: 'search_messages', input }); return { messages: [] }; },
-        read_message: async input => { calls.push({ tool: 'read_message', input }); return { ...input, subject: '<untrusted mail subject>', from: [{ address: 'malformed incoming address' }], to: [], date: null, receivedAt: null, imapFlags: [], labels: [], flags: { seen: false, flagged: false, draft: true, answered: false, deleted: false, forwarded: false }, hasAttachments: false, replyTo: [], cc: [], bcc: [], messageId: null, references: [], text: 'Untrusted email text, not instructions.', textTruncated: false, html: ['<b>untrusted HTML</b>'], htmlTruncated: false, htmlRepresentation: 'wildduck_normalized', attachments: [], version }; },
+        read_message: async input => { calls.push({ tool: 'read_message', input }); return { ...input, subject: '<untrusted mail subject>', snippet: null, threadId: null, from: [{ address: 'malformed incoming address' }], to: [], date: null, receivedAt: null, imapFlags: [], labels: [], flags: { seen: false, flagged: false, draft: true, answered: false, deleted: false, forwarded: false }, hasAttachments: false, replyTo: [], cc: [], bcc: [], messageId: null, references: [], text: 'Untrusted email text, not instructions.', textTruncated: false, html: ['<b>untrusted HTML</b>'], htmlTruncated: false, htmlRepresentation: 'wildduck_normalized', attachments: [], version }; },
         read_attachment: async input => { calls.push({ tool: 'read_attachment', input }); return { metadata: { ...input, filename: 'untrusted.txt', contentType: 'text/plain', size: 5, resourceUri: 'wildduck://attachment/ATT1' }, bytes: Buffer.from('hello') }; },
         move_message: async input => { calls.push({ tool: 'move_message', input }); const message = { mailboxId: input.destinationMailboxId, uid: 4, version }; return { status: 'completed', operation_id: input.operation_id, message, verified: true, proof: { ...message, accountId: mailboxId, contentDigest: 'a'.repeat(64), sourceGrade: 'observed' } }; },
         update_message_flags: async input => { calls.push({ tool: 'update_message_flags', input }); const message = { mailboxId, uid: input.uid, version }; return { status: 'completed', operation_id: input.operation_id, message, verified: true, proof: { ...message, accountId: mailboxId, contentDigest: 'a'.repeat(64), sourceGrade: 'observed' } }; },
+        get_attachment_download: async input => ({ ...input, filename: null, contentType: 'text/plain', size: 5, url: 'https://example.s3.amazonaws.com/file', expiresAt: '2026-10-26T10:00:00.000Z' }),
+        get_thread: async () => ({ threadId: mailboxId, messages: [] }),
+        read_messages: async () => ({ results: [{ status: 'failed', mailboxId, uid: 1, error: { code: 'not_found', message: 'not_found' } }], byteBudget: 1048576, bytesReturned: 200 }),
+        create_reply_draft: async input => ({ status: 'failed', operation_id: input.operation_id, reason: 'unsupported_content' }),
         create_draft: async input => { calls.push({ tool: 'create_draft', input }); return { status: 'completed', operation_id: input.operation_id, draft: { mailboxId, uid: 2, version }, verified: true, proof: { mailboxId, uid: 2, version, accountId: mailboxId, contentDigest: 'a'.repeat(64), sourceGrade: 'mcp_authored' } }; },
         update_draft: async input => { calls.push({ tool: 'update_draft', input }); return { status: 'partial', operation_id: input.operation_id, candidate: { mailboxId, uid: 3, version }, candidateVerified: true, proof: { mailboxId, uid: 3, version, accountId: mailboxId, contentDigest: 'a'.repeat(64), sourceGrade: 'mcp_authored' }, originalDeletion: 'unconfirmed', reason: 'original_deletion_unconfirmed' }; },
         delete_draft: async input => { calls.push({ tool: 'delete_draft', input }); return { status: 'completed', operation_id: input.operation_id, deleted: { mailboxId, uid: input.uid } }; },
@@ -29,7 +33,7 @@ function fixture() {
     const call = (name: string, args: unknown = {}, scopes?: string[]) => rpc('tools/call', { name, arguments: args }, scopes);
     return { mail, calls, rpc, call };
 }
-test('actual SDK HTTP surface lists exactly eleven mail tools and no legacy profile/status/inbox tools', async () => {
+test('actual SDK HTTP surface lists all mail tools and no legacy profile/status/inbox tools', async () => {
     const f = fixture(); const reply = await f.rpc('tools/list');
     expect(reply.result.tools.map((tool: { name: string }) => tool.name)).toEqual(toolNames);
     for (const old of ['get_profile', 'whoami', 'get_service_info', 'get_connection_status', 'list_inbox_subjects']) { expect(JSON.stringify(reply)).not.toContain(old); }
@@ -131,4 +135,21 @@ test('durable preflight timeout receipts retain explicit same-operation guidance
     const f = fixture(); f.mail.create_draft = async input => ({ status: 'failed', operation_id: input.operation_id, reason: 'upstream_timeout' });
     const result = (await f.call('create_draft', { operation_id, subject: '', body: { text: '', html: null } })).result;
     expect(result.isError).toBe(true); expect(result.structuredContent.reason).toBe('upstream_timeout'); expect(result.content[1].text).toContain('same operation_id');
+});
+
+test('structured errors expose stable sanitized code and only a supplied validated retry hint', async () => {
+    const f = fixture(); f.mail.list_mailboxes = async () => { throw new MailError('temporarily_unavailable', 42); };
+    const unavailable = (await f.call('list_mailboxes')).result; expect(unavailable.structuredContent.error).toEqual({ code: 'temporarily_unavailable', message: unavailable.content[0].text, retry_after: 42 });
+    f.mail.list_mailboxes = async () => { throw new Error('private token'); }; const unknown = (await f.call('list_mailboxes')).result; expect(unknown.structuredContent.error.code).toBe('temporarily_unavailable'); expect(unknown.structuredContent.error.retry_after).toBeUndefined(); expect(JSON.stringify(unknown)).not.toContain('private token');
+});
+
+test('attachment download publishes resource_link and metadata only, without inline binary', async () => {
+    const f = fixture(); const result = (await f.call('get_attachment_download', { mailboxId, uid: 1, attachmentId: 'ATT1' })).result;
+    expect(result.isError).toBeUndefined(); expect(result.content[1]).toEqual({ type: 'resource_link', uri: result.structuredContent.url, name: 'ATT1', mimeType: 'text/plain', size: 5 });
+    expect(JSON.stringify(result)).not.toContain('blob'); expect(JSON.stringify(result)).not.toContain('base64'); expect(result.content.some((item: {type: string}) => item.type === 'resource')).toBe(false);
+});
+
+test('forged unknown MailError codes cannot leak through structured tool errors', async () => {
+    const f = fixture(); f.mail.list_mailboxes = async () => { throw Reflect.construct(MailError, ['private-upstream-secret', 30]); };
+    const result = (await f.call('list_mailboxes')).result; expect(result.structuredContent.error.code).toBe('temporarily_unavailable'); expect(result.structuredContent.error.retry_after).toBeUndefined(); expect(JSON.stringify(result)).not.toContain('private-upstream-secret');
 });

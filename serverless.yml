@@ -21,6 +21,8 @@ provider:
     PUBLIC_BASE_URL:
       Fn::ImportValue: wildduck-mcp-prod-public-origin
     AUTH_KEYRING_PARAMETER: ${env:AUTH_KEYRING_PARAMETER, ''}
+    DOWNLOAD_BUCKET_NAME:
+      Fn::ImportValue: wildduck-mcp-prod-download-bucket
     CREDENTIAL_TABLE_NAME:
       Ref: CredentialTable
   stackTags:
