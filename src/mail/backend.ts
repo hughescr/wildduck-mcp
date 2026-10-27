@@ -3,7 +3,7 @@ import { isEmailValid } from '@hapi/address';
 import { WILDDUCK_ORIGIN } from '../wildduck';
 import { remainingRequestTimeMs, withRequestBudget } from '../request-budget';
 import { MailError, MAIL_OPERATION_METADATA_KEY, type BackendMailSession, type MailBackendReader, type MailBackendWriter, type Mailbox, type MailInput, type MailOutput, type MessageKey, type DraftContent, type DraftPatch, type MessageSnapshot, type PreparedDraft, type MailOperationMarker, type MessageRef, type MessageSummary, type MailAddress, type AttachmentMetadata, type AttachmentDownload, type AttachmentDownloadLink, type VerifiedMessageMutation, type AuthoredSourceDescriptor } from './contracts';
-import { draftContentSchema, mailboxIdSchema, messageKeySchema, mailInputSchemas, mailOutputSchemas, attachmentDownloadLinkSchema, mailOperationMarkerSchema, addFlagSchema, labelSchema, MAX_READ_TEXT_BYTES, MAX_HTML_BYTES, MAX_ATTACHMENT_BYTES, MAX_SNIPPET_BYTES } from './schemas';
+import { draftContentSchema, mailboxIdSchema, messageKeySchema, mailInputSchemas, mailOutputSchemas, canonicalReadMessageOutputSchema, attachmentDownloadLinkSchema, mailOperationMarkerSchema, addFlagSchema, labelSchema, MAX_READ_TEXT_BYTES, MAX_HTML_BYTES, MAX_ATTACHMENT_BYTES, MAX_SNIPPET_BYTES } from './schemas';
 import { MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS, type AttachmentDownloadStager } from './downloads';
 import { deriveReply } from './reply';
 import { createMime, inspectSource, preparePatch, verifyCandidate, MimeError, MIME_LIMITS, type MimeEnvelope } from './mime';
@@ -214,8 +214,9 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         sessionValid(session); targetValid(target);
         return (await this.transport(session, `/mailboxes/${target.mailboxId}/messages/${target.uid}/message.eml`, 'GET', undefined, MIME_LIMITS.sourceBytes, 'source')).bytes;
     }
-    async listMailboxes(session: BackendMailSession): Promise<MailOutput<'list_mailboxes'>> {
-        const raw = await this.request(session, '/mailboxes?showHidden=true', 'GET');
+    async listMailboxes(session: BackendMailSession): Promise<MailOutput<'list_mailboxes'>> { return this.mailboxListing(session, true); }
+    private async mailboxListing(session: BackendMailSession, counters: boolean): Promise<MailOutput<'list_mailboxes'>> {
+        const raw = await this.request(session, '/mailboxes?showHidden=true' + (counters ? '&counters=true' : ''), 'GET');
         if (!Array.isArray(raw['results']) || raw['results'].length > 1000) { return fail(); }
         const mailboxes = raw['results'].map(normalizeMailbox);
         if (new Set(mailboxes.map(box => box.mailboxId)).size !== mailboxes.length) { return fail(); }
@@ -300,7 +301,7 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         const marker = markerOf(raw); if (marker && marker.accountId !== session.accountId) { throw new MailError('verification_failed'); }
         return { raw, version: version(session, target, raw) };
     }
-    async readMessage(session: BackendMailSession, input: MailInput<'read_message'>) {
+    async readMessage(session: BackendMailSession, input: MessageKey) {
         const snapshot = await this.rawMessage(session, input); const raw = snapshot.raw;
         // The API caps stored text in UTF-16 characters and HTML in UTF-8 bytes.
         // Reaching its ceiling is conservatively incomplete, even below our own cap.
@@ -311,7 +312,7 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
             messageId: typeof raw['messageId'] === 'string' ? raw['messageId'] : null, references: (raw['references'] ?? []) as string[],
             ...text, textTruncated: text.textTruncated || typeof raw['text'] === 'string' && raw['text'].length >= 100 * 1024, html, htmlTruncated, htmlRepresentation: 'wildduck_normalized' as const,
             attachments: (raw['attachments'] as unknown[]).map(attachment), version: snapshot.version };
-        if (!mailOutputSchemas.read_message.safeParse(message).success) { return fail(); }
+        if (!canonicalReadMessageOutputSchema.safeParse(message).success) { return fail(); }
         const marker = markerOf(raw); return { message, ...(marker ? { marker } : {}) };
     }
     async getAttachmentDownload(session: BackendMailSession, input: MailInput<'get_attachment_download'>): Promise<AttachmentDownloadLink> {
@@ -378,7 +379,7 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         return { metadata: { ...input, filename: found.filename, contentType: found.contentType, size: bytes.length, resourceUri: `wildduck://${session.accountId}/${input.mailboxId}/${input.uid}/${input.attachmentId}` }, bytes };
     }
     async resolveDraftMailbox(session: BackendMailSession): Promise<Mailbox> {
-        const boxes = (await this.listMailboxes(session)).mailboxes.filter(box => box.specialUse === '\\Drafts');
+        const boxes = (await this.mailboxListing(session, false)).mailboxes.filter(box => box.specialUse === '\\Drafts');
         if (boxes.length !== 1) { throw new MailError(boxes.length === 0 ? 'not_found' : 'temporarily_unavailable'); }
         return boxes[0] ?? fail();
     }

@@ -110,7 +110,7 @@ test('read methods return sanitized DTOs and bind only server credentials to rea
     expect((await f.service.list_mailboxes(context, {})).mailboxes).toHaveLength(1);
     expect((await f.service.list_messages(context, { mailboxId, limit: 20 })).messages).toHaveLength(1);
     expect((await f.service.search_messages(context, { text: 'needle', limit: 20 })).messages).toHaveLength(1);
-    expect((await f.service.read_message(context, { mailboxId, uid: 7 })).text).toBe('text');
+    expect((await f.service.read_message(context, { includeHtml: true, mailboxId, uid: 7 })).text).toBe('text');
     for (const call of f.calls) { expect(call.args[0]).toEqual({ accountId, accessToken: context.accessToken }); }
     expect(f.operations.calls).toHaveLength(0);
 });
@@ -199,7 +199,7 @@ test('replacement verifies candidate before fresh original inspection and deleti
 });
 test('write preflight uses its write scope without granting public read access', async () => {
     const f = fixture(); const sendOnly = { ...context, scopes: ['mail:send'] };
-    await expect(f.service.read_message(sendOnly, { mailboxId, uid: 7 })).rejects.toThrow('forbidden');
+    await expect(f.service.read_message(sendOnly, { includeHtml: true, mailboxId, uid: 7 })).rejects.toThrow('forbidden');
     expect((await f.service.send_draft(sendOnly, target)).status).toBe('queued');
 });
 test('attachment returns validated exact binary separately from metadata', async () => {
@@ -269,7 +269,7 @@ test('historical activation proof survives later version changes but fresh expec
 test('read marker checks one operation, never leaks private marker or performs list N+1', async () => {
     const f = fixture(); await f.service.create_draft(context, { ...content, operation_id });
     const before = f.operations.calls.length;
-    const result = await f.service.read_message(context, { mailboxId, uid: 8 });
+    const result = await f.service.read_message(context, { includeHtml: true, mailboxId, uid: 8 });
     expect(result.managedOperation).toEqual({ operationId: operation_id, verification: 'verified' });
     expect(f.operations.calls.length - before).toBe(1); expect(JSON.stringify(result)).not.toContain('payloadDigest'); expect(JSON.stringify(result)).not.toContain('clientIdHash');
     const start = f.operations.calls.length;
@@ -313,7 +313,7 @@ test('lost flag completion atomically preserves either confirmed release or an u
 test('candidate with verified MIME but lost durable completion remains unactivated', async () => {
     const f = fixture(); f.operations.completeFault = 'before';
     expect((await f.service.create_draft(context, { ...content, operation_id })).status).toBe('outcome_unknown');
-    const read = await f.service.read_message(context, { mailboxId, uid: 8 });
+    const read = await f.service.read_message(context, { includeHtml: true, mailboxId, uid: 8 });
     expect(read.managedOperation?.verification).toBe('outcome_unknown');
     expect(await f.service.send_draft(context, { ...target, uid: 8, operation_id: 'candidate_send_001' })).toEqual({ status: 'failed', operation_id: 'candidate_send_001', reason: 'verification_failed' });
     expect(f.calls.some(call => call.method === 'submit')).toBe(false);
@@ -334,7 +334,7 @@ test('unmanaged drafts cannot update or send and fail before every irreversible 
     }
 });
 test('legacy read and deletion remain available without authored provenance', async () => {
-    const f = fixture(false); expect((await f.service.read_message(context, { mailboxId, uid: 7 })).text).toBe('text');
+    const f = fixture(false); expect((await f.service.read_message(context, { includeHtml: true, mailboxId, uid: 7 })).text).toBe('text');
     expect((await f.service.delete_draft(context, target)).status).toBe('completed');
     expect(f.calls.some(call => call.method === 'sourcecheck')).toBe(false);
 });
@@ -405,7 +405,7 @@ test('queued Sent activation never carries authored bytes into later flags or pr
         return { queueId: 'sent-queue', sent };
     };
     expect((await f.service.send_draft(context, target)).status).toBe('queued');
-    expect((await f.service.read_message(context, sent)).managedOperation?.verification).toBe('verified');
+    expect((await f.service.read_message(context, { ...sent, includeHtml: true })).managedOperation?.verification).toBe('verified');
     const flagged = await f.service.update_message_flags(context, { ...sent, expected_version: version, operation_id: 'sent_flags_operation_01', seen: true });
     expect(flagged.status).toBe('completed'); if (flagged.status === 'completed') { expect(flagged.proof.sourceGrade).toBe('observed'); }
     expect(f.calls.filter(call => call.method === 'sourcecheck')).toHaveLength(1);
@@ -458,7 +458,7 @@ test('read and search upstream_timeout stay read errors without operation record
     const f = fixture(false);
     f.reader.readMessage = async () => { throw new MailError('upstream_timeout'); };
     f.reader.searchMessages = async () => { throw new MailError('upstream_timeout'); };
-    await expect(f.service.read_message(context, { mailboxId, uid: 7 })).rejects.toMatchObject({ code: 'upstream_timeout', message: 'upstream_timeout' });
+    await expect(f.service.read_message(context, { includeHtml: true, mailboxId, uid: 7 })).rejects.toMatchObject({ code: 'upstream_timeout', message: 'upstream_timeout' });
     await expect(f.service.search_messages(context, { text: 'needle', limit: 20 })).rejects.toMatchObject({ code: 'upstream_timeout', message: 'upstream_timeout' });
     expect(f.operations.calls).toHaveLength(0); expect(f.operations.records.size).toBe(0); expect(f.operations.guards.size).toBe(0); expect(posts(f)).toHaveLength(0);
 });
@@ -525,4 +525,15 @@ test('text-only batches omit HTML explicitly before aggregate budgeting and pres
     expect(result.results.every((item: { status: string }) => item.status === 'ok')).toBe(true); expect(result.includeHtml).toBe(false);
     for (const item of result.results) { if (item.status !== 'ok') { throw new Error('expected successful text-only projection'); } expect(item.message).not.toHaveProperty('html'); expect('html' in item.message).toBe(false); expect(item.message.htmlOmitted).toBe(true); expect(item.message).not.toHaveProperty('htmlTruncated'); expect(item.message).not.toHaveProperty('htmlRepresentation'); }
     expect(result.results[0]).toMatchObject({ status: 'ok', message: { textTruncated: true } }); expect(JSON.stringify(result)).not.toContain('PRIVATE_HTML_PAYLOAD_'); expect(result.bytesReturned).toBe(Buffer.byteLength(JSON.stringify(result))); expect(result.bytesReturned).toBeLessThan(1048576);
+});
+
+test('single text-only projection keeps version and provenance while its backend receives only message identity', async () => {
+    const f = fixture(); const original = f.reader.readMessage;
+    f.reader.readMessage = async (bound, key) => { const full = await original(bound, key); return { ...full, message: { ...full.message, htmlTruncated: true } }; };
+    const input = { mailboxId, uid: 7 }; const full = await f.service.read_message(context, { ...input, includeHtml: true });
+    const text = await f.service.read_message(context, { ...input, includeHtml: false });
+    expect(full).toMatchObject({ htmlOmitted: false, htmlTruncated: true, htmlRepresentation: 'wildduck_normalized' }); expect(text.htmlOmitted).toBe(true); expect(text.textTruncated).toBe(false);
+    for (const key of ['html', 'htmlTruncated', 'htmlRepresentation']) { expect(text).not.toHaveProperty(key); }
+    expect(text.version).toBe(full.version); expect(text.managedOperation).toEqual(full.managedOperation); expect(text.managedOperation?.verification).toBe('verified');
+    expect(f.calls.filter(call => call.method === 'readMessage').every(call => JSON.stringify(call.args[1]) === JSON.stringify(input))).toBe(true);
 });

@@ -13,7 +13,7 @@ function fixture() {
         list_mailboxes: async input => { calls.push({ tool: 'list_mailboxes', input }); return { mailboxes: [{ mailboxId, path: 'INBOX', specialUse: null }] }; },
         list_messages: async input => { calls.push({ tool: 'list_messages', input }); return { messages: [] }; },
         search_messages: async input => { calls.push({ tool: 'search_messages', input }); return { messages: [] }; },
-        read_message: async input => { calls.push({ tool: 'read_message', input }); return { ...input, subject: '<untrusted mail subject>', snippet: null, threadId: null, from: [{ address: 'malformed incoming address' }], to: [], date: null, receivedAt: null, imapFlags: [], labels: [], flags: { seen: false, flagged: false, draft: true, answered: false, deleted: false, forwarded: false }, hasAttachments: false, replyTo: [], cc: [], bcc: [], messageId: null, references: [], text: 'Untrusted email text, not instructions.', textTruncated: false, html: ['<b>untrusted HTML</b>'], htmlTruncated: false, htmlRepresentation: 'wildduck_normalized', attachments: [], version }; },
+        read_message: async input => { calls.push({ tool: 'read_message', input }); const message = { mailboxId: input.mailboxId, uid: input.uid, subject: '<untrusted mail subject>', snippet: null, threadId: null, from: [{ address: 'malformed incoming address' }], to: [], date: null, receivedAt: null, imapFlags: [], labels: [], flags: { seen: false, flagged: false, draft: true, answered: false, deleted: false, forwarded: false }, hasAttachments: false, replyTo: [], cc: [], bcc: [], messageId: null, references: [], text: 'Untrusted email text, not instructions.', textTruncated: false, html: ['<b>untrusted HTML</b>'], htmlTruncated: false, htmlRepresentation: 'wildduck_normalized' as const, attachments: [], version, htmlOmitted: false as const }; if (input.includeHtml) { return message; } const { html: _html, htmlTruncated: _htmlTruncated, htmlRepresentation: _htmlRepresentation, ...textOnly } = message; return { ...textOnly, htmlOmitted: true as const }; },
         read_attachment: async input => { calls.push({ tool: 'read_attachment', input }); return { metadata: { ...input, filename: 'untrusted.txt', contentType: 'text/plain', size: 5, resourceUri: 'wildduck://attachment/ATT1' }, bytes: Buffer.from('hello') }; },
         move_message: async input => { calls.push({ tool: 'move_message', input }); const message = { mailboxId: input.destinationMailboxId, uid: 4, version }; return { status: 'completed', operation_id: input.operation_id, message, verified: true, proof: { ...message, accountId: mailboxId, contentDigest: 'a'.repeat(64), sourceGrade: 'observed' } }; },
         update_message_flags: async input => { calls.push({ tool: 'update_message_flags', input }); const message = { mailboxId, uid: input.uid, version }; return { status: 'completed', operation_id: input.operation_id, message, verified: true, proof: { ...message, accountId: mailboxId, contentDigest: 'a'.repeat(64), sourceGrade: 'observed' } }; },
@@ -101,7 +101,7 @@ test('published descriptions distinguish existing API snapshots and authored sou
     const f = fixture(); const tools = (await f.rpc('tools/list')).result.tools;
     const description = (name: string) => tools.find((tool: { name: string }) => tool.name === name).description;
     expect(description('update_draft')).toContain('legacy/observed drafts are rejected before upload'); expect(description('send_draft')).toContain('verified before dispatch'); expect(description('read_message')).toContain('potential upstream truncation');
-    const read = tools.find((tool: { name: string }) => tool.name === 'read_message'); expect(read.outputSchema.properties.textTruncated.description).toContain('potentially truncated upstream');
+    const read = tools.find((tool: { name: string }) => tool.name === 'read_message'); expect((read.outputSchema.anyOf ?? read.outputSchema.oneOf).find((item: { properties: { htmlOmitted: { const: boolean } } }) => item.properties.htmlOmitted.const === false).properties.textTruncated.description).toContain('potentially truncated upstream');
 });
 test('read errors never prescribe operation IDs or write ambiguity handling', async () => {
     const inputs = { list_mailboxes: {}, list_messages: { mailboxId }, search_messages: { subject: 'Requested search' }, read_message: { mailboxId, uid: 1 }, read_attachment: { mailboxId, uid: 1, attachmentId: 'ATT1' } };
@@ -187,7 +187,7 @@ test('all not_found batch items remain a normal result rather than a whole-tool 
 });
 
 test('batch defaults retain HTML while text-only and mixed failed/truncated items are normal SDK results', async () => {
-    const f = fixture(); const message = await f.mail.read_message({ mailboxId, uid: 1 }); const privateHtml = 'PRIVATE_HTML_PAYLOAD_ONLY'; const { html: _html, htmlTruncated: _htmlTruncated, htmlRepresentation: _htmlRepresentation, ...textOnly } = message;
+    const f = fixture(); const message = await f.mail.read_message({ mailboxId, uid: 1, includeHtml: true }); const privateHtml = 'PRIVATE_HTML_PAYLOAD_ONLY'; if (message.htmlOmitted) { throw new Error('expected full fixture'); } const { html: _html, htmlTruncated: _htmlTruncated, htmlRepresentation: _htmlRepresentation, ...textOnly } = message;
     f.mail.read_messages = async input => ({ includeHtml: input.includeHtml, results: [
         { status: 'ok', message: input.includeHtml ? { ...message, html: [privateHtml], htmlOmitted: false, textTruncated: true, htmlTruncated: true } : { ...textOnly, htmlOmitted: true, textTruncated: true } },
         { status: 'failed', mailboxId, uid: 2, error: { code: 'not_found', message: 'not_found' } },
@@ -196,7 +196,7 @@ test('batch defaults retain HTML while text-only and mixed failed/truncated item
     expect(defaults.isError).toBeUndefined(); expect(defaults.structuredContent.includeHtml).toBe(true); expect(defaults.structuredContent.results[0].message).toMatchObject({ html: [privateHtml], htmlOmitted: false, htmlTruncated: true, htmlRepresentation: 'wildduck_normalized' });
     const text = await f.call('read_messages', { messages: [{ mailboxId, uid: 1 }, { mailboxId, uid: 2 }], includeHtml: false });
     expect(text.result.isError).toBeUndefined(); expect(text.result.structuredContent.includeHtml).toBe(false); expect(text.result.structuredContent.results[0].message).toMatchObject({ htmlOmitted: true, textTruncated: true }); for (const key of ['html', 'htmlTruncated', 'htmlRepresentation']) { expect(text.result.structuredContent.results[0].message).not.toHaveProperty(key); expect(JSON.parse(text.result.content[0].text).results[0].message).not.toHaveProperty(key); } expect(JSON.stringify(text)).not.toContain(privateHtml);
-    expect(message).not.toHaveProperty('htmlOmitted');
+    expect(message.htmlOmitted).toBe(false);
 });
 test('whole batch scope, input and execution failures remain tool errors', async () => {
     const f = fixture(); let executed = 0;
@@ -224,7 +224,7 @@ test('published batch schema requires HTML fields only for the full-body variant
 });
 
 test('batch output variants reject empty or undefined HTML on text-only items and require HTML for full items', async () => {
-    const f = fixture(); const full = await f.mail.read_message({ mailboxId, uid: 1 }); const { html: _html, htmlTruncated: _htmlTruncated, htmlRepresentation: _htmlRepresentation, ...textOnly } = full;
+    const f = fixture(); const full = await f.mail.read_message({ mailboxId, uid: 1, includeHtml: true }); if (full.htmlOmitted) { throw new Error('expected full fixture'); } const { html: _html, htmlTruncated: _htmlTruncated, htmlRepresentation: _htmlRepresentation, ...textOnly } = full;
     const batch = (includeHtml: boolean, message: unknown) => ({ includeHtml, results: [{ status: 'ok', message }], byteBudget: 1048576, bytesReturned: 500 });
     const omitted = { ...textOnly, htmlOmitted: true };
     expect(mailOutputSchemas.read_messages.safeParse(batch(false, omitted)).success).toBe(true);
@@ -242,4 +242,26 @@ test('batch callers cannot forge output HTML projection fields in tool input', a
         { messages: [{ mailboxId, uid: 1, html: [] }], includeHtml: false },
     ]) { const reply = await f.call('read_messages', input); expect(Boolean(reply.error || reply.result?.isError)).toBe(true); }
     expect(executed).toBe(0);
+});
+
+test('single read accepts text-only mode and advertises strict projected response variants', async () => {
+    const f = fixture(); const reply = await f.call('read_message', { mailboxId, uid: 1, includeHtml: false }); expect(reply.error).toBeUndefined(); expect(reply.result.isError).toBeUndefined();
+    const message = reply.result.structuredContent; expect(message.htmlOmitted).toBe(true); expect(message.textTruncated).toBe(false);
+    for (const key of ['html', 'htmlTruncated', 'htmlRepresentation']) { expect(message).not.toHaveProperty(key); expect(JSON.parse(reply.result.content[0].text)).not.toHaveProperty(key); }
+    const tool = (await f.rpc('tools/list')).result.tools.find((item: { name: string }) => item.name === 'read_message'); expect(tool.inputSchema.properties.includeHtml.default).toBe(true);
+    const variants = tool.outputSchema.anyOf ?? tool.outputSchema.oneOf; expect(variants).toHaveLength(2); const text = variants.find((item: { properties: { htmlOmitted: { const: boolean } } }) => item.properties.htmlOmitted.const);
+    for (const key of ['html', 'htmlTruncated', 'htmlRepresentation']) { expect(text.properties[key]).toBeUndefined(); }
+});
+
+test('single text-only reads ignore HTML-only truncation but retain genuine text truncation warnings', async () => {
+    const f = fixture(); const original = f.mail.read_message;
+    f.mail.read_message = async input => { const message = await original(input); return message.htmlOmitted ? message : { ...message, htmlTruncated: true }; };
+    const full = (await f.call('read_message', { mailboxId, uid: 1 })).result; expect(full.isError).toBe(true); expect(full.structuredContent.htmlTruncated).toBe(true); expect(full.structuredContent.htmlOmitted).toBe(false);
+    const text = (await f.call('read_message', { mailboxId, uid: 1, includeHtml: false })).result; expect(text.isError).toBeUndefined(); expect(text.structuredContent.htmlOmitted).toBe(true); expect(text.structuredContent).not.toHaveProperty('htmlTruncated');
+    f.mail.read_message = async input => ({ ...await original(input), textTruncated: true });
+    const truncated = (await f.call('read_message', { mailboxId, uid: 1, includeHtml: false })).result; expect(truncated.isError).toBe(true); expect(truncated.structuredContent.textTruncated).toBe(true); expect(truncated.content[1].text).toContain('Incomplete read');
+});
+test('mailbox public schema and tool description identify optional unseen values as unread counts', async () => {
+    const f = fixture(); const tool = (await f.rpc('tools/list')).result.tools.find((item: { name: string }) => item.name === 'list_mailboxes');
+    expect(tool.description).toContain('unread'); const mailbox = tool.outputSchema.properties.mailboxes.items; expect(mailbox.properties.unseen.description).toContain('Unread'); expect(mailbox.required).not.toContain('unseen');
 });

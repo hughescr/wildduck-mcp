@@ -1,7 +1,7 @@
 import { remainingRequestTimeMs, withRequestBudget } from '../request-budget';
 import { digest, randomId } from '../auth/crypto';
-import { MailError, type ActivationProof, type AuthoredSourceDescriptor, type SourceGrade, type AttachmentDownloadLink, type AttachmentDownload, type BackendMailSession, type ConfirmedReceipt, type FailedReceipt, type MailBackendReader, type MailBackendWriter, type MailContext, type MailInput, type MailOperationMarker, type MailOperationRecord, type MailOperationStore, type MailOutput, type MailService, type MailToolName, type MailWriteTool, type MessageKey, type MessageRef, type MessageSnapshot, type OperationClaim, type OperationKey, type PreparedDraft, type UnknownReceipt, type WriteIntent } from './contracts';
-import { activationProofSchema, draftContentSchema, failureReasonSchema, mailboxSchema, mailInputSchemas, mailOperationMarkerSchema, mailOutputSchemas, attachmentDownloadLinkSchema, messageKeySchema, messageRefSchema, MAX_BATCH_BYTES, BATCH_CONCURRENCY } from './schemas';
+import { MailError, type CanonicalReadMessage, type ActivationProof, type AuthoredSourceDescriptor, type SourceGrade, type AttachmentDownloadLink, type AttachmentDownload, type BackendMailSession, type ConfirmedReceipt, type FailedReceipt, type MailBackendReader, type MailBackendWriter, type MailContext, type MailInput, type MailOperationMarker, type MailOperationRecord, type MailOperationStore, type MailOutput, type MailService, type MailToolName, type MailWriteTool, type MessageKey, type MessageRef, type MessageSnapshot, type OperationClaim, type OperationKey, type PreparedDraft, type UnknownReceipt, type WriteIntent } from './contracts';
+import { activationProofSchema, draftContentSchema, failureReasonSchema, mailboxSchema, mailInputSchemas, mailOperationMarkerSchema, mailOutputSchemas, canonicalReadMessageOutputSchema, attachmentDownloadLinkSchema, messageKeySchema, messageRefSchema, MAX_BATCH_BYTES, BATCH_CONCURRENCY } from './schemas';
 
 interface Dependencies { reader: MailBackendReader; writer: MailBackendWriter; operations: MailOperationStore }
 type WriteInput = MailInput<MailWriteTool>;
@@ -57,6 +57,11 @@ function proof(accountId: string, message: MessageRef, contentDigest: string, so
     return result.data;
 }
 
+function projectMessage(message: CanonicalReadMessage, includeHtml: boolean): MailOutput<'read_message'> {
+    const { html: _html, htmlTruncated: _htmlTruncated, htmlRepresentation: _htmlRepresentation, ...textOnly } = message;
+    return includeHtml ? { ...message, htmlOmitted: false } : { ...textOnly, htmlOmitted: true };
+}
+
 /** Every mutation has a durable receipt and an account-wide message fence. */
 export function createMailService({ reader, writer, operations }: Dependencies): MailService {
     async function provenance(bound: BackendMailSession, target: MessageKey, rawMarker: MailOperationMarker): Promise<Provenance> {
@@ -96,6 +101,13 @@ export function createMailService({ reader, writer, operations }: Dependencies):
         if (requireDraft && !snapshot.isDraft) { throw new MailError('unsupported_draft'); }
         return { snapshot, ...(trusted?.source ? { source: trusted.source } : {}) };
     }
+    async function readFullMessage(bound: BackendMailSession, target: MessageKey): Promise<CanonicalReadMessage> {
+        const read = await reader.readMessage(bound, target);
+        if (!sameMessage(read.message, target)) { throw temporary(); }
+        const { managedOperation: _managedOperation, ...message } = read.message;
+        const result = read.marker ? { ...message, managedOperation: { operationId: mailOperationMarkerSchema.parse(read.marker).operationId, verification: (await provenance(bound, message, read.marker)).verification } } : message;
+        return canonicalReadMessageOutputSchema.parse(result);
+    }
     async function read<Name extends ReadTool>(tool: Name, context: MailContext, raw: MailInput<Name>): Promise<MailOutput<Name>> {
         const bound = session(context, 'mail:read'); const parsed = input(tool, raw);
         try {
@@ -112,10 +124,8 @@ export function createMailService({ reader, writer, operations }: Dependencies):
                 }
                 case 'search_messages': result = await reader.searchMessages(bound, parsed as MailInput<'search_messages'>); break;
                 case 'read_message': {
-                    const read = await reader.readMessage(bound, parsed as MailInput<'read_message'>);
-                    if (!sameMessage(read.message, parsed as MailInput<'read_message'>)) { throw temporary(); }
-                    const { managedOperation: _managedOperation, ...message } = read.message;
-                    result = read.marker ? { ...message, managedOperation: { operationId: mailOperationMarkerSchema.parse(read.marker).operationId, verification: (await provenance(bound, message, read.marker)).verification } } : message;
+                    const data = parsed as MailInput<'read_message'>;
+                    result = projectMessage(await readFullMessage(bound, { mailboxId: data.mailboxId, uid: data.uid }), data.includeHtml);
                     break;
                 }
             }
@@ -123,7 +133,7 @@ export function createMailService({ reader, writer, operations }: Dependencies):
         } catch (error) { throw sanitized(error); }
     }
     async function batch(context: MailContext, raw: MailInput<'read_messages'>): Promise<MailOutput<'read_messages'>> {
-        session(context, 'mail:read'); const parsed = input('read_messages', raw);
+        const bound = session(context, 'mail:read'); const parsed = input('read_messages', raw);
         type Item = MailOutput<'read_messages'>['results'][number];
         const inherited = remainingRequestTimeMs(); const deadline = performance.now() + Math.min(inherited ?? 32000, 32000);
         return withRequestBudget(() => Math.max(0, deadline - performance.now()), async () => {
@@ -139,9 +149,8 @@ export function createMailService({ reader, writer, operations }: Dependencies):
                 let timer: ReturnType<typeof setTimeout> | undefined;
                 try {
                     const available = deadline - performance.now() - 2000; if (available <= 0) { throw new MailError('upstream_timeout'); }
-                    const message = await Promise.race([read('read_message', context, key), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new MailError('upstream_timeout')), available); })]);
-                    const { html: _html, htmlTruncated: _htmlTruncated, htmlRepresentation: _htmlRepresentation, ...textOnly } = message;
-                    return { status: 'ok' as const, message: parsed.includeHtml ? { ...message, htmlOmitted: false as const } : { ...textOnly, htmlOmitted: true as const } };
+                    const message = await Promise.race([readFullMessage(bound, key), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new MailError('upstream_timeout')), available); })]);
+                    return { status: 'ok' as const, message: projectMessage(message, parsed.includeHtml) };
                 } catch (error) { return failure(key, error); } finally { if (timer !== undefined) { clearTimeout(timer); } }
             }));
             for (const candidate of group) {

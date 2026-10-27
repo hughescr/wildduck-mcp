@@ -71,7 +71,7 @@ test('mailbox listing is bounded, uses explicit user token and resolves unique s
     const boxes = { success: true, results: [{ id: mailboxId, path: '[Gmail]/Drafts', name: 'Drafts', specialUse: '\\Drafts', total: 0, unseen: 0 }] };
     const f = fixture([boxes, boxes]); expect((await f.backend.listMailboxes(session)).mailboxes[0]).toEqual({ mailboxId, path: '[Gmail]/Drafts', name: 'Drafts', specialUse: '\\Drafts', total: 0, unseen: 0 });
     expect((await f.backend.resolveDraftMailbox(session)).mailboxId).toBe(mailboxId);
-    for (const call of f.calls) { expect(call.url).toBe(`${WILDDUCK_ORIGIN}/users/${accountId}/mailboxes?showHidden=true`); expect(call.init.method).toBe('GET'); expect(call.init.redirect).toBe('error'); expect(new Headers(call.init.headers).get('X-Access-Token')).toBe(token); }
+    for (const [index, call] of f.calls.entries()) { expect(call.url).toBe(`${WILDDUCK_ORIGIN}/users/${accountId}/mailboxes?showHidden=true${index === 0 ? '&counters=true' : ''}`); expect(call.init.method).toBe('GET'); expect(call.init.redirect).toBe('error'); expect(new Headers(call.init.headers).get('X-Access-Token')).toBe(token); }
     const none = fixture([{ success: true, results: [] }]); await errorCode(none.backend.resolveDraftMailbox(session), 'not_found');
     const ambiguous = fixture([{ success: true, results: [boxes.results[0], { ...boxes.results[0], id: 'd'.repeat(24) }] }]); await errorCode(ambiguous.backend.resolveDraftMailbox(session), 'temporarily_unavailable');
 });
@@ -523,4 +523,12 @@ test('inline attachment decoded cap does not reject an oversized transfer-encode
     const decoded = Buffer.alloc(1600 * 1024, 13);
     const f = fixture([message({ attachments: [{ id: 'ATT1', contentType: 'application/octet-stream', transferEncoding: 'base64', size: 2242010, sizeKb: 1600 }] }), new Response(decoded, { headers: { 'content-length': String(decoded.byteLength) } })]);
     const result = await f.backend.readAttachment(session, { ...target, attachmentId: 'ATT1' }); expect(result.bytes).toEqual(decoded); expect(result.metadata.size).toBe(decoded.byteLength); expect(f.calls).toHaveLength(2);
+});
+
+test('public mailbox listing requests counters once for 49 folders and preserves zero versus unavailable values', async () => {
+    const rows = Array.from({ length: 49 }, (_, index) => ({ id: index.toString(16).padStart(24, '0'), path: 'Folder ' + index, ...(index === 2 ? {} : { total: index === 0 ? 0 : 1, unseen: index === 0 ? 0 : index }) }));
+    const f = fixture([{ success: true, results: rows }]); const result = await f.backend.listMailboxes(session);
+    expect(new URL(f.calls[0]?.url ?? '').searchParams.get('counters')).toBe('true'); expect(f.calls).toHaveLength(1); expect(result.mailboxes).toHaveLength(49);
+    expect(result.mailboxes[0]).toMatchObject({ total: 0, unseen: 0 }); expect(result.mailboxes[2]).not.toHaveProperty('total'); expect(result.mailboxes[2]).not.toHaveProperty('unseen');
+    expect(result.mailboxes[48]).toMatchObject({ total: 1, unseen: 48 });
 });

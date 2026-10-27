@@ -1,7 +1,7 @@
 import type { ConnectionStatus } from '../auth/contracts';
 import type { PreparedMime } from './mime';
-import type { ConfirmedReceipt, DraftContent, DraftPatch, FailedReceipt, MailFailureCode, Mailbox, MailInput, MailOperationMarker, MailOutput, MailReceipt, MailToolName, MailWriteTool, MessageKey, MessageRef, SourceGrade, UnknownReceipt } from './schemas';
-export type { ActivationProof, AttachmentMetadata, CompletedReceipt, ConfirmedReceipt, DraftAddress, DraftContent, DraftPatch, DraftRef, FailedReceipt, MailAddress, Mailbox, MailFailureCode, MailInput, MailInputRaw, MailOperationMarker, MailOutput, MailReceipt, MailToolName, MailWriteTool, MessageFlags, MessageKey, MessageRef, MessageSummary, NewAttachment, PartialReceipt, SourceGrade, UnknownReceipt } from './schemas';
+import type { CanonicalReadMessage, ConfirmedReceipt, DraftContent, DraftPatch, FailedReceipt, MailFailureCode, Mailbox, MailInput, MailOperationMarker, MailOutput, MailReceipt, MailToolName, MailWriteTool, MessageKey, MessageRef, SourceGrade, UnknownReceipt } from './schemas';
+export type { ActivationProof, AttachmentMetadata, CanonicalReadMessage, CompletedReceipt, ConfirmedReceipt, DraftAddress, DraftContent, DraftPatch, DraftRef, FailedReceipt, MailAddress, Mailbox, MailFailureCode, MailInput, MailInputRaw, MailOperationMarker, MailOutput, MailReceipt, MailToolName, MailWriteTool, MessageFlags, MessageKey, MessageRef, MessageSummary, NewAttachment, PartialReceipt, SourceGrade, UnknownReceipt } from './schemas';
 
 /** Catch/map only code. Never expose raw upstream errors, bodies, causes or tokens. */
 export class MailError extends Error {
@@ -15,7 +15,7 @@ export interface BackendMailSession { readonly accountId: string; readonly acces
 export interface MailContext extends BackendMailSession {
     readonly clientId: string; readonly scopes: readonly string[]; readonly connectionStatus: ConnectionStatus;
 }
-export interface ReadMessageResult { readonly message: MailOutput<'read_message'>; readonly marker?: MailOperationMarker }
+export interface ReadMessageResult { readonly message: CanonicalReadMessage; readonly marker?: MailOperationMarker }
 /** Public metadata contains no duplicate binary. MCP embeds bytes once as resource.blob. */
 export interface AttachmentDownload { readonly metadata: MailOutput<'read_attachment'>; readonly bytes: Uint8Array }
 /** Signed URL travels separately and is serialized only as resource_link.uri. */
@@ -28,7 +28,7 @@ export interface MailBackendReader {
     /** No mark-as-seen mutation. HTML and incoming MIME fields are untrusted data.
      * Include private marker in this same GET so service can check one operation,
      * without a second backend GET or N+1 operation lookups on list pages. */
-    readMessage(session: BackendMailSession, input: MailInput<'read_message'>): Promise<ReadMessageResult>;
+    readMessage(session: BackendMailSession, input: MessageKey): Promise<ReadMessageResult>;
     getAttachmentDownload(session: BackendMailSession, input: MailInput<'get_attachment_download'>): Promise<AttachmentDownloadLink>;
     readAttachment(session: BackendMailSession, input: MailInput<'read_attachment'>): Promise<AttachmentDownload>;
 }
