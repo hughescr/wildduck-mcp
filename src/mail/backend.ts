@@ -2,8 +2,8 @@ import { createHash } from 'node:crypto';
 import { isEmailValid } from '@hapi/address';
 import { WILDDUCK_ORIGIN } from '../wildduck';
 import { remainingRequestTimeMs, withRequestBudget } from '../request-budget';
-import { MailError, MAIL_OPERATION_METADATA_KEY, type BackendMailSession, type MailBackendReader, type MailBackendWriter, type Mailbox, type MailInput, type MailOutput, type MessageKey, type DraftContent, type DraftPatch, type MessageSnapshot, type PreparedDraft, type MailOperationMarker, type MessageRef, type MessageSummary, type MailAddress, type AttachmentMetadata, type AttachmentDownload, type VerifiedMessageMutation, type AuthoredSourceDescriptor } from './contracts';
-import { draftContentSchema, mailboxIdSchema, messageKeySchema, mailInputSchemas, mailOutputSchemas, mailOperationMarkerSchema, addFlagSchema, labelSchema, MAX_READ_TEXT_BYTES, MAX_HTML_BYTES, MAX_ATTACHMENT_BYTES, MAX_SNIPPET_BYTES } from './schemas';
+import { MailError, MAIL_OPERATION_METADATA_KEY, type BackendMailSession, type MailBackendReader, type MailBackendWriter, type Mailbox, type MailInput, type MailOutput, type MessageKey, type DraftContent, type DraftPatch, type MessageSnapshot, type PreparedDraft, type MailOperationMarker, type MessageRef, type MessageSummary, type MailAddress, type AttachmentMetadata, type AttachmentDownload, type AttachmentDownloadLink, type VerifiedMessageMutation, type AuthoredSourceDescriptor } from './contracts';
+import { draftContentSchema, mailboxIdSchema, messageKeySchema, mailInputSchemas, mailOutputSchemas, attachmentDownloadLinkSchema, mailOperationMarkerSchema, addFlagSchema, labelSchema, MAX_READ_TEXT_BYTES, MAX_HTML_BYTES, MAX_ATTACHMENT_BYTES, MAX_SNIPPET_BYTES } from './schemas';
 import { MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS, type AttachmentDownloadStager } from './downloads';
 import { deriveReply } from './reply';
 import { createMime, inspectSource, preparePatch, verifyCandidate, MimeError, MIME_LIMITS, type MimeEnvelope } from './mime';
@@ -314,7 +314,7 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         if (!mailOutputSchemas.read_message.safeParse(message).success) { return fail(); }
         const marker = markerOf(raw); return { message, ...(marker ? { marker } : {}) };
     }
-    async getAttachmentDownload(session: BackendMailSession, input: MailInput<'get_attachment_download'>): Promise<MailOutput<'get_attachment_download'>> {
+    async getAttachmentDownload(session: BackendMailSession, input: MailInput<'get_attachment_download'>): Promise<AttachmentDownloadLink> {
         sessionValid(session); const parsed = mailInputSchemas.get_attachment_download.safeParse(input); if (!parsed.success) { throw new MailError('invalid_input'); }
         const stager = this.downloadStager; if (!stager) { throw new MailError('temporarily_unavailable'); }
         const inherited = remainingRequestTimeMs(); const deadline = performance.now() + Math.min(inherited ?? DOWNLOAD_TIMEOUT_MS + 2000, DOWNLOAD_TIMEOUT_MS + 2000);
@@ -359,8 +359,8 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
                 const staged = await stager.stage({ cacheIdentity, metadata, open }, controller.signal);
                 if (controller.signal.aborted) { throw new MailError('upstream_timeout'); }
                 if (metadata.size !== null && !metadata.sizeIsApproximate && metadata.size !== staged.size) { throw new MailError('verification_failed'); }
-                const result = { ...parsed.data, filename: metadata.filename, contentType: metadata.contentType, ...staged };
-                if (!mailOutputSchemas.get_attachment_download.safeParse(result).success) { throw new MailError('verification_failed'); }
+                const result = { metadata: { ...parsed.data, filename: metadata.filename, contentType: metadata.contentType, size: staged.size, expiresAt: staged.expiresAt }, url: staged.url };
+                if (!attachmentDownloadLinkSchema.safeParse(result).success) { throw new MailError('verification_failed'); }
                 return result;
             };
             try { return await Promise.race([operation(), new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new MailError('upstream_timeout')); }, budget); })]); }

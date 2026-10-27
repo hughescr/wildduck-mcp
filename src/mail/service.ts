@@ -1,11 +1,11 @@
 import { remainingRequestTimeMs, withRequestBudget } from '../request-budget';
 import { digest, randomId } from '../auth/crypto';
-import { MailError, type ActivationProof, type AuthoredSourceDescriptor, type SourceGrade, type AttachmentDownload, type BackendMailSession, type ConfirmedReceipt, type FailedReceipt, type MailBackendReader, type MailBackendWriter, type MailContext, type MailInput, type MailOperationMarker, type MailOperationRecord, type MailOperationStore, type MailOutput, type MailService, type MailToolName, type MailWriteTool, type MessageKey, type MessageRef, type MessageSnapshot, type OperationClaim, type OperationKey, type PreparedDraft, type UnknownReceipt, type WriteIntent } from './contracts';
-import { activationProofSchema, draftContentSchema, failureReasonSchema, mailboxSchema, mailInputSchemas, mailOperationMarkerSchema, mailOutputSchemas, messageKeySchema, messageRefSchema, MAX_BATCH_BYTES, BATCH_CONCURRENCY } from './schemas';
+import { MailError, type ActivationProof, type AuthoredSourceDescriptor, type SourceGrade, type AttachmentDownloadLink, type AttachmentDownload, type BackendMailSession, type ConfirmedReceipt, type FailedReceipt, type MailBackendReader, type MailBackendWriter, type MailContext, type MailInput, type MailOperationMarker, type MailOperationRecord, type MailOperationStore, type MailOutput, type MailService, type MailToolName, type MailWriteTool, type MessageKey, type MessageRef, type MessageSnapshot, type OperationClaim, type OperationKey, type PreparedDraft, type UnknownReceipt, type WriteIntent } from './contracts';
+import { activationProofSchema, draftContentSchema, failureReasonSchema, mailboxSchema, mailInputSchemas, mailOperationMarkerSchema, mailOutputSchemas, attachmentDownloadLinkSchema, messageKeySchema, messageRefSchema, MAX_BATCH_BYTES, BATCH_CONCURRENCY } from './schemas';
 
 interface Dependencies { reader: MailBackendReader; writer: MailBackendWriter; operations: MailOperationStore }
 type WriteInput = MailInput<MailWriteTool>;
-type ReadTool = Exclude<MailToolName, MailWriteTool | 'read_attachment' | 'read_messages'>;
+type ReadTool = Exclude<MailToolName, MailWriteTool | 'read_attachment' | 'get_attachment_download' | 'read_messages'>;
 type Verification = 'verified' | 'pending' | 'outcome_unknown' | 'unverified';
 interface Provenance { verification: Verification; source?: AuthoredSourceDescriptor }
 const temporary = () => new MailError('temporarily_unavailable');
@@ -103,12 +103,11 @@ export function createMailService({ reader, writer, operations }: Dependencies):
             switch (tool) {
                 case 'list_mailboxes': result = await reader.listMailboxes(bound); break;
                 case 'list_messages': result = await reader.listMessages(bound, parsed as MailInput<'list_messages'>); break;
-                case 'get_attachment_download': result = await reader.getAttachmentDownload(bound, parsed as MailInput<'get_attachment_download'>); if (!sameMessage(result as MessageKey, parsed as MessageKey) || (result as MailOutput<'get_attachment_download'>).attachmentId !== (parsed as MailInput<'get_attachment_download'>).attachmentId) { throw temporary(); } break;
                 case 'get_thread': {
                     const data = parsed as MailInput<'get_thread'>; const inherited = remainingRequestTimeMs(); const deadline = performance.now() + Math.min(inherited ?? 47000, 47000);
                     result = await withRequestBudget(() => Math.max(0, deadline - performance.now()), async () => {
                         const page = output('get_thread', await reader.getThread(bound, data));
-                        return data.includeBodies && page.messages.length > 0 ? { ...page, bodies: await batch(context, { messages: page.messages.map(({ mailboxId, uid }) => ({ mailboxId, uid })) }) } : page;
+                        return data.includeBodies && page.messages.length > 0 ? { ...page, bodies: await batch(context, { includeHtml: true, messages: page.messages.map(({ mailboxId, uid }) => ({ mailboxId, uid })) }) } : page;
                     }); break;
                 }
                 case 'search_messages': result = await reader.searchMessages(bound, parsed as MailInput<'search_messages'>); break;
@@ -130,7 +129,7 @@ export function createMailService({ reader, writer, operations }: Dependencies):
         return withRequestBudget(() => Math.max(0, deadline - performance.now()), async () => {
         const results: Item[] = []; let next = 0;
         const failure = (key: MessageKey, error: unknown): Item => { const safe = sanitized(error); return { status: 'failed', ...key, error: { code: safe.code, message: safe.code, ...(safe.retryAfter === undefined ? {} : { retry_after: safe.retryAfter }) } }; };
-        const envelope = (items: Item[]) => ({ results: items, byteBudget: MAX_BATCH_BYTES as typeof MAX_BATCH_BYTES, bytesReturned: MAX_BATCH_BYTES });
+        const envelope = (items: Item[]) => ({ includeHtml: parsed.includeHtml, results: items, byteBudget: MAX_BATCH_BYTES as typeof MAX_BATCH_BYTES, bytesReturned: MAX_BATCH_BYTES });
         // Reserve every failure slot and the envelope before dispatch. Replace slots in
         // input order so asynchronous completion cannot change which message fits.
         const reserved = parsed.messages.map(key => failure(key, new MailError('too_large')));
@@ -141,7 +140,7 @@ export function createMailService({ reader, writer, operations }: Dependencies):
                 try {
                     const available = deadline - performance.now() - 2000; if (available <= 0) { throw new MailError('upstream_timeout'); }
                     const message = await Promise.race([read('read_message', context, key), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new MailError('upstream_timeout')), available); })]);
-                    return { status: 'ok' as const, message };
+                    return { status: 'ok' as const, message: { ...message, html: parsed.includeHtml ? message.html : [], htmlOmitted: !parsed.includeHtml } };
                 } catch (error) { return failure(key, error); } finally { if (timer !== undefined) { clearTimeout(timer); } }
             }));
             for (const candidate of group) {
@@ -150,11 +149,19 @@ export function createMailService({ reader, writer, operations }: Dependencies):
                 results.push(Buffer.byteLength(JSON.stringify(envelope(proposed))) <= MAX_BATCH_BYTES ? candidate : fallback); next++;
             }
         }
-        const result = { results, byteBudget: MAX_BATCH_BYTES as typeof MAX_BATCH_BYTES, bytesReturned: 0 };
+        const result = { includeHtml: parsed.includeHtml, results, byteBudget: MAX_BATCH_BYTES as typeof MAX_BATCH_BYTES, bytesReturned: 0 };
         // Fixed point includes the decimal accounting field itself.
         for (let i = 0; i < 4; i++) { result.bytesReturned = Buffer.byteLength(JSON.stringify(result)); }
         return output('read_messages', result);
         });
+    }
+    async function downloadLink(context: MailContext, raw: MailInput<'get_attachment_download'>): Promise<AttachmentDownloadLink> {
+        const bound = session(context, 'mail:read'); const parsed = input('get_attachment_download', raw);
+        try {
+            const result = attachmentDownloadLinkSchema.parse(await reader.getAttachmentDownload(bound, parsed));
+            if (!sameMessage(result.metadata, parsed) || result.metadata.attachmentId !== parsed.attachmentId) { throw temporary(); }
+            return result;
+        } catch (error) { throw sanitized(error); }
     }
     async function attachment(context: MailContext, raw: MailInput<'read_attachment'>): Promise<AttachmentDownload> {
         const bound = session(context, 'mail:read'); const parsed = input('read_attachment', raw);
@@ -304,7 +311,7 @@ export function createMailService({ reader, writer, operations }: Dependencies):
         search_messages: (context, raw) => read('search_messages', context, raw),
         read_message: (context, raw) => read('read_message', context, raw),
         read_attachment: attachment,
-        get_attachment_download: (context, raw) => read('get_attachment_download', context, raw),
+        get_attachment_download: downloadLink,
         get_thread: (context, raw) => read('get_thread', context, raw),
         read_messages: batch,
         create_reply_draft: (context, raw) => write('create_reply_draft', context, raw) as Promise<MailOutput<'create_reply_draft'>>,

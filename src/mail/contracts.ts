@@ -18,6 +18,8 @@ export interface MailContext extends BackendMailSession {
 export interface ReadMessageResult { readonly message: MailOutput<'read_message'>; readonly marker?: MailOperationMarker }
 /** Public metadata contains no duplicate binary. MCP embeds bytes once as resource.blob. */
 export interface AttachmentDownload { readonly metadata: MailOutput<'read_attachment'>; readonly bytes: Uint8Array }
+/** Signed URL travels separately and is serialized only as resource_link.uri. */
+export interface AttachmentDownloadLink { readonly metadata: MailOutput<'get_attachment_download'>; readonly url: string }
 export interface MailBackendReader {
     listMailboxes(session: BackendMailSession): Promise<MailOutput<'list_mailboxes'>>;
     listMessages(session: BackendMailSession, input: MailInput<'list_messages'>): Promise<MailOutput<'list_messages'>>;
@@ -27,7 +29,7 @@ export interface MailBackendReader {
      * Include private marker in this same GET so service can check one operation,
      * without a second backend GET or N+1 operation lookups on list pages. */
     readMessage(session: BackendMailSession, input: MailInput<'read_message'>): Promise<ReadMessageResult>;
-    getAttachmentDownload(session: BackendMailSession, input: MailInput<'get_attachment_download'>): Promise<MailOutput<'get_attachment_download'>>;
+    getAttachmentDownload(session: BackendMailSession, input: MailInput<'get_attachment_download'>): Promise<AttachmentDownloadLink>;
     readAttachment(session: BackendMailSession, input: MailInput<'read_attachment'>): Promise<AttachmentDownload>;
 }
 export interface MessageSnapshot {
@@ -159,7 +161,7 @@ export interface MailOperationStore {
  * private marker -> durable original operation -> exact target activation proof,
  * except its own staged verification. Unactivated candidates never become sendable.
  * Public writes always pass this coordinator; no raw writer reaches MCP. */
-export type MailResult<Name extends MailToolName> = Name extends 'read_attachment' ? AttachmentDownload : MailOutput<Name>;
+export type MailResult<Name extends MailToolName> = Name extends 'read_attachment' ? AttachmentDownload : Name extends 'get_attachment_download' ? AttachmentDownloadLink : MailOutput<Name>;
 export type MailService = { [Name in MailToolName]: (context: MailContext, input: MailInput<Name>) => Promise<MailResult<Name>> };
 export type BoundMailService = { [Name in MailToolName]: (input: MailInput<Name>) => Promise<MailResult<Name>> };
 export type MailWriteCoordinator = Pick<MailService, MailWriteTool>;

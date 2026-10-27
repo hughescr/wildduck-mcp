@@ -16,9 +16,9 @@ function fixture() {
         read_attachment: async input => { calls.push({ tool: 'read_attachment', input }); return { metadata: { ...input, filename: 'untrusted.txt', contentType: 'text/plain', size: 5, resourceUri: 'wildduck://attachment/ATT1' }, bytes: Buffer.from('hello') }; },
         move_message: async input => { calls.push({ tool: 'move_message', input }); const message = { mailboxId: input.destinationMailboxId, uid: 4, version }; return { status: 'completed', operation_id: input.operation_id, message, verified: true, proof: { ...message, accountId: mailboxId, contentDigest: 'a'.repeat(64), sourceGrade: 'observed' } }; },
         update_message_flags: async input => { calls.push({ tool: 'update_message_flags', input }); const message = { mailboxId, uid: input.uid, version }; return { status: 'completed', operation_id: input.operation_id, message, verified: true, proof: { ...message, accountId: mailboxId, contentDigest: 'a'.repeat(64), sourceGrade: 'observed' } }; },
-        get_attachment_download: async input => ({ ...input, filename: null, contentType: 'text/plain', size: 5, url: 'https://example.s3.amazonaws.com/file', expiresAt: '2026-10-26T10:00:00.000Z' }),
+        get_attachment_download: async input => ({ metadata: { ...input, filename: null, contentType: 'text/plain', size: 5, expiresAt: '2026-10-26T10:00:00.000Z' }, url: 'https://example.s3.amazonaws.com/file?X-Amz-Signature=synthetic-secret' }),
         get_thread: async () => ({ threadId: mailboxId, messages: [] }),
-        read_messages: async () => ({ results: [{ status: 'failed', mailboxId, uid: 1, error: { code: 'not_found', message: 'not_found' } }], byteBudget: 1048576, bytesReturned: 200 }),
+        read_messages: async input => ({ includeHtml: input.includeHtml, results: [{ status: 'failed', mailboxId, uid: 1, error: { code: 'not_found', message: 'not_found' } }], byteBudget: 1048576, bytesReturned: 200 }),
         create_reply_draft: async input => ({ status: 'failed', operation_id: input.operation_id, reason: 'unsupported_content' }),
         create_draft: async input => { calls.push({ tool: 'create_draft', input }); return { status: 'completed', operation_id: input.operation_id, draft: { mailboxId, uid: 2, version }, verified: true, proof: { mailboxId, uid: 2, version, accountId: mailboxId, contentDigest: 'a'.repeat(64), sourceGrade: 'mcp_authored' } }; },
         update_draft: async input => { calls.push({ tool: 'update_draft', input }); return { status: 'partial', operation_id: input.operation_id, candidate: { mailboxId, uid: 3, version }, candidateVerified: true, proof: { mailboxId, uid: 3, version, accountId: mailboxId, contentDigest: 'a'.repeat(64), sourceGrade: 'mcp_authored' }, originalDeletion: 'unconfirmed', reason: 'original_deletion_unconfirmed' }; },
@@ -145,11 +145,69 @@ test('structured errors expose stable sanitized code and only a supplied validat
 
 test('attachment download publishes resource_link and metadata only, without inline binary', async () => {
     const f = fixture(); const result = (await f.call('get_attachment_download', { mailboxId, uid: 1, attachmentId: 'ATT1' })).result;
-    expect(result.isError).toBeUndefined(); expect(result.content[1]).toEqual({ type: 'resource_link', uri: result.structuredContent.url, name: 'ATT1', mimeType: 'text/plain', size: 5 });
+    expect(result.isError).toBeUndefined(); expect(result.content[1]).toEqual({ type: 'resource_link', uri: 'https://example.s3.amazonaws.com/file?X-Amz-Signature=synthetic-secret', name: 'ATT1', mimeType: 'text/plain', size: 5 });
     expect(JSON.stringify(result)).not.toContain('blob'); expect(JSON.stringify(result)).not.toContain('base64'); expect(result.content.some((item: {type: string}) => item.type === 'resource')).toBe(false);
 });
 
 test('forged unknown MailError codes cannot leak through structured tool errors', async () => {
     const f = fixture(); f.mail.list_mailboxes = async () => { throw Reflect.construct(MailError, ['private-upstream-secret', 30]); };
     const result = (await f.call('list_mailboxes')).result; expect(result.structuredContent.error.code).toBe('temporarily_unavailable'); expect(result.structuredContent.error.retry_after).toBeUndefined(); expect(JSON.stringify(result)).not.toContain('private-upstream-secret');
+});
+
+test('download URL occurs exactly once across the entire SDK result, only at resource_link.uri', async () => {
+    const f = fixture(); const url = 'https://example.s3.amazonaws.com/file?X-Amz-Signature=synthetic-secret';
+    const reply = await f.call('get_attachment_download', { mailboxId, uid: 1, attachmentId: 'ATT1' }); const result = reply.result;
+    expect(JSON.stringify(reply).split(url).length - 1).toBe(1);
+    expect(result.content.filter((item: { type: string }) => item.type === 'resource_link')).toEqual([{ type: 'resource_link', uri: url, name: 'ATT1', mimeType: 'text/plain', size: 5 }]);
+    expect(result.structuredContent).not.toHaveProperty('url'); expect(JSON.stringify(result.structuredContent)).not.toContain(url);
+    const text = result.content.filter((item: { type: string }) => item.type === 'text'); expect(text).toHaveLength(1); expect(JSON.parse(text[0].text)).toEqual(result.structuredContent); expect(text[0].text).not.toContain(url);
+});
+test('download public output schema advertises metadata without a URL', async () => {
+    const f = fixture(); const tool = (await f.rpc('tools/list')).result.tools.find((item: { name: string }) => item.name === 'get_attachment_download');
+    expect(tool.outputSchema.properties.url).toBeUndefined(); expect(tool.outputSchema.required).not.toContain('url'); expect(tool.outputSchema.additionalProperties).toBe(false);
+});
+
+test('malformed internal download URLs and carrier metadata fail without leaking their URL', async () => {
+    const f = fixture(); const valid = f.mail.get_attachment_download;
+    for (const url of ['http://example.s3.amazonaws.com/file?secret=private', 'javascript:private-secret', 'private invalid download URL']) {
+        f.mail.get_attachment_download = async input => ({ ...await valid(input), url });
+        const result = (await f.call('get_attachment_download', { mailboxId, uid: 1, attachmentId: 'ATT1' })).result;
+        expect(result.isError).toBe(true); expect(JSON.stringify(result)).not.toContain(url); expect(result.content.some((item: { type: string }) => item.type === 'resource_link')).toBe(false);
+    }
+    const url = 'https://example.s3.amazonaws.com/file?X-Amz-Signature=synthetic-secret';
+    f.mail.get_attachment_download = async input => { const link = await valid(input); return { ...link, metadata: { ...link.metadata, url } }; };
+    const result = (await f.call('get_attachment_download', { mailboxId, uid: 1, attachmentId: 'ATT1' })).result;
+    expect(result.isError).toBe(true); expect(JSON.stringify(result)).not.toContain(url);
+});
+
+test('all not_found batch items remain a normal result rather than a whole-tool error', async () => {
+    const f = fixture(); const result = (await f.call('read_messages', { messages: [{ mailboxId, uid: 1 }] })).result;
+    expect(result.isError).toBeUndefined(); expect(result.structuredContent.results).toEqual([{ status: 'failed', mailboxId, uid: 1, error: { code: 'not_found', message: 'not_found' } }]);
+});
+
+test('batch defaults retain HTML while text-only and mixed failed/truncated items are normal SDK results', async () => {
+    const f = fixture(); const message = await f.mail.read_message({ mailboxId, uid: 1 }); const privateHtml = 'PRIVATE_HTML_PAYLOAD_ONLY';
+    f.mail.read_messages = async input => ({ includeHtml: input.includeHtml, results: [
+        { status: 'ok', message: { ...message, html: input.includeHtml ? [privateHtml] : [], htmlOmitted: !input.includeHtml, textTruncated: true, htmlTruncated: true } },
+        { status: 'failed', mailboxId, uid: 2, error: { code: 'not_found', message: 'not_found' } },
+    ], byteBudget: 1048576, bytesReturned: 500 });
+    const defaults = (await f.call('read_messages', { messages: [{ mailboxId, uid: 1 }, { mailboxId, uid: 2 }] })).result;
+    expect(defaults.isError).toBeUndefined(); expect(defaults.structuredContent.includeHtml).toBe(true); expect(defaults.structuredContent.results[0].message).toMatchObject({ html: [privateHtml], htmlOmitted: false });
+    const text = await f.call('read_messages', { messages: [{ mailboxId, uid: 1 }, { mailboxId, uid: 2 }], includeHtml: false });
+    expect(text.result.isError).toBeUndefined(); expect(text.result.structuredContent.includeHtml).toBe(false); expect(text.result.structuredContent.results[0].message).toMatchObject({ html: [], htmlOmitted: true, textTruncated: true, htmlTruncated: true }); expect(JSON.stringify(text)).not.toContain(privateHtml);
+    expect(message).not.toHaveProperty('htmlOmitted');
+});
+test('whole batch scope, input and execution failures remain tool errors', async () => {
+    const f = fixture(); let executed = 0;
+    f.mail.read_messages = async () => { executed++; throw new MailError('temporarily_unavailable'); };
+    const forbidden = (await f.call('read_messages', { messages: [{ mailboxId, uid: 1 }] }, [])).result; expect(forbidden.isError).toBe(true); expect(forbidden.structuredContent.error.code).toBe('forbidden'); expect(executed).toBe(0);
+    const invalid = await f.call('read_messages', { messages: [], includeHtml: false }); expect(Boolean(invalid.error || invalid.result?.isError)).toBe(true); expect(executed).toBe(0);
+    const unavailable = (await f.call('read_messages', { messages: [{ mailboxId, uid: 1 }] })).result; expect(unavailable.isError).toBe(true); expect(unavailable.structuredContent.error.code).toBe('temporarily_unavailable'); expect(executed).toBe(1);
+});
+test('thread body item failures remain normal navigation while thread lookup failures remain tool errors', async () => {
+    const f = fixture(); const bodies = await f.mail.read_messages({ messages: [{ mailboxId, uid: 1 }], includeHtml: true });
+    f.mail.get_thread = async () => ({ threadId: mailboxId, messages: [], bodies });
+    const page = (await f.call('get_thread', { threadId: mailboxId, limit: 1, includeBodies: true })).result; expect(page.isError).toBeUndefined(); expect(page.structuredContent.bodies.results[0].status).toBe('failed');
+    f.mail.get_thread = async () => { throw new MailError('not_found'); };
+    const missing = (await f.call('get_thread', { threadId: mailboxId })).result; expect(missing.isError).toBe(true); expect(missing.structuredContent.error.code).toBe('not_found');
 });

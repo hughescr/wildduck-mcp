@@ -66,7 +66,7 @@ function fixture(authored = true) {
     const record = (method: string, ...args: unknown[]) => { calls.push({ method, args }); };
     const find = (key: { mailboxId: string; uid: number }): MessageSnapshot => messages.get(JSON.stringify(key)) ?? { ...behavior.snapshot, ...(behavior.marker ? { marker: behavior.marker } : {}) };
     const reader: MailBackendReader = {
-        getAttachmentDownload: async (_bound, input) => ({ ...input, filename: null, contentType: 'text/plain', size: 5, url: 'https://example.s3.amazonaws.com/file', expiresAt: '2026-10-26T10:00:00.000Z' }),
+        getAttachmentDownload: async (_bound, input) => ({ metadata: { ...input, filename: null, contentType: 'text/plain', size: 5, expiresAt: '2026-10-26T10:00:00.000Z' }, url: 'https://example.s3.amazonaws.com/file' }),
         getThread: async (_bound, input) => ({ threadId: input.threadId ?? mailboxId, messages: [message] }),
         listMailboxes: async (...args) => { record('listMailboxes', ...args); return { mailboxes: [mailbox] }; },
         listMessages: async (...args) => { record('listMessages', ...args); return { messages: [message] }; },
@@ -466,14 +466,14 @@ test('read and search upstream_timeout stay read errors without operation record
 test('batch reads preserve order, cap concurrency and return isolated sanitized failures', async () => {
     const f = fixture(false); const original = f.reader.readMessage; let active = 0; let high = 0;
     f.reader.readMessage = async (bound, key) => { active++; high = Math.max(high, active); try { await Bun.sleep(2); if (key.uid === 3) { throw new MailError('not_found'); } const result = await original(bound, key); return { message: { ...result.message, ...key } }; } finally { active--; } };
-    const result = await f.service.read_messages(context, { messages: Array.from({ length: 8 }, (_, index) => ({ mailboxId, uid: index + 1 })) });
+    const result = await f.service.read_messages(context, { includeHtml: true, messages: Array.from({ length: 8 }, (_, index) => ({ mailboxId, uid: index + 1 })) });
     expect(high).toBe(3); expect(result.results.map(item => item.status === 'ok' ? item.message.uid : item.uid)).toEqual([1,2,3,4,5,6,7,8]);
     expect(result.results[2]).toEqual({ status: 'failed', mailboxId, uid: 3, error: { code: 'not_found', message: 'not_found' } }); expect(result.bytesReturned).toBe(Buffer.byteLength(JSON.stringify(result))); expect(f.operations.calls).toHaveLength(0);
 });
 test('batch serialized budget includes metadata, envelope and reserved failure slots', async () => {
     const f = fixture(false); const original = f.reader.readMessage;
     f.reader.readMessage = async (bound, key) => ({ message: { ...(await original(bound, key)).message, ...key, text: 'x'.repeat(128 * 1024), html: ['x'.repeat(256 * 1024)] } });
-    const result = await f.service.read_messages(context, { messages: Array.from({ length: 10 }, (_, index) => ({ mailboxId, uid: index + 1 })) });
+    const result = await f.service.read_messages(context, { includeHtml: true, messages: Array.from({ length: 10 }, (_, index) => ({ mailboxId, uid: index + 1 })) });
     expect(result.results.filter(item => item.status === 'ok')).toHaveLength(2); expect(result.results.filter(item => item.status === 'failed').every(item => item.status === 'failed' && item.error.code === 'too_large')).toBe(true); expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(1048576); expect(result.bytesReturned).toBe(Buffer.byteLength(JSON.stringify(result)));
 });
 
@@ -499,6 +499,30 @@ test('thread body pages reuse bounded batch reader, retaining per-item failures 
 });
 test('batch deadline includes a stalled provenance lookup and returns item timeout', async () => {
     const f = fixture(); f.operations.getOperation = async () => new Promise(() => {}); const deadline = performance.now() + 2020;
-    const started = performance.now(); const result = await withRequestBudget(() => Math.max(0, deadline - performance.now()), () => f.service.read_messages(context, { messages: [{ mailboxId, uid: 7 }] }));
+    const started = performance.now(); const result = await withRequestBudget(() => Math.max(0, deadline - performance.now()), () => f.service.read_messages(context, { includeHtml: true, messages: [{ mailboxId, uid: 7 }] }));
     expect(performance.now() - started).toBeLessThan(500); expect(result.results[0]).toMatchObject({ status: 'failed', error: { code: 'upstream_timeout' } });
+});
+
+test('download link carrier validates public metadata identity and URL before returning the private link', async () => {
+    const f = fixture(false); const request = { mailboxId, uid: 7, attachmentId: 'ATT1' }; const valid = f.reader.getAttachmentDownload;
+    const link = await f.service.get_attachment_download(context, request);
+    expect(link.metadata).toEqual({ ...request, filename: null, contentType: 'text/plain', size: 5, expiresAt: '2026-10-26T10:00:00.000Z' }); expect(link.metadata).not.toHaveProperty('url'); expect(link.url).toBe('https://example.s3.amazonaws.com/file');
+    for (const metadata of [{ mailboxId: 'f'.repeat(24) }, { uid: 8 }, { attachmentId: 'ATT2' }, { size: -1 }, { expiresAt: 'invalid-expiry' }]) {
+        f.reader.getAttachmentDownload = async (bound, input) => { const original = await valid(bound, input); return { ...original, metadata: { ...original.metadata, ...metadata } }; };
+        await expect(f.service.get_attachment_download(context, request)).rejects.toMatchObject({ code: 'temporarily_unavailable' });
+    }
+    f.reader.getAttachmentDownload = async (bound, input) => ({ ...await valid(bound, input), url: 'http://example.s3.amazonaws.com/private-secret' });
+    await expect(f.service.get_attachment_download(context, request)).rejects.toMatchObject({ code: 'temporarily_unavailable' });
+    expect(f.operations.calls).toHaveLength(0);
+});
+
+test('text-only batches omit HTML explicitly before aggregate budgeting and preserve genuine text truncation', async () => {
+    const f = fixture(false); const original = f.reader.readMessage; const html = 'PRIVATE_HTML_PAYLOAD_'.repeat(12000);
+    f.reader.readMessage = async (bound, key) => ({ message: { ...(await original(bound, key)).message, ...key, text: 'x'.repeat(64 * 1024), textTruncated: key.uid === 1, html: [html], htmlTruncated: true } });
+    const messages = Array.from({ length: 10 }, (_, index) => ({ mailboxId, uid: index + 1 }));
+    const full = await f.service.read_messages(context, { messages, includeHtml: true }); expect(full.includeHtml).toBe(true); expect(full.results.filter(item => item.status === 'ok').length).toBeLessThan(messages.length);
+    const result = await f.service.read_messages(context, { messages, includeHtml: false });
+    expect(result.results.every((item: { status: string }) => item.status === 'ok')).toBe(true); expect(result.includeHtml).toBe(false);
+    for (const item of result.results) { if (item.status !== 'ok') { throw new Error('expected successful text-only projection'); } expect(item.message.html).toEqual([]); expect(item.message.htmlOmitted).toBe(true); expect(item.message.htmlTruncated).toBe(true); }
+    expect(result.results[0]).toMatchObject({ status: 'ok', message: { textTruncated: true } }); expect(JSON.stringify(result)).not.toContain('PRIVATE_HTML_PAYLOAD_'); expect(result.bytesReturned).toBe(Buffer.byteLength(JSON.stringify(result))); expect(result.bytesReturned).toBeLessThan(1048576);
 });

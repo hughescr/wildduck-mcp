@@ -245,10 +245,10 @@ test('backend and real stager accept encoded attachment metadata but measure dec
         for (const withContentLength of [true, false]) {
             const f = fixture(); const upstream = decodedAttachmentBackend(f.stager, attachment, withContentLength ? attachment.decodedSize : undefined);
             const first = await upstream.backend.getAttachmentDownload(upstream.session, upstream.target);
-            expect(first.size).toBe(attachment.decodedSize); expect(Buffer.concat(f.uploaded)).toEqual(upstream.decoded);
+            expect(first.metadata.size).toBe(attachment.decodedSize); expect(Buffer.concat(f.uploaded)).toEqual(upstream.decoded);
             const calls = f.calls.length;
             const second = await upstream.backend.getAttachmentDownload(upstream.session, upstream.target);
-            expect(second.size).toBe(attachment.decodedSize); expect(second.url).not.toBe(first.url);
+            expect(second.metadata.size).toBe(attachment.decodedSize); expect(second.url).not.toBe(first.url);
             expect(upstream.reads()).toEqual({ metadata: 2, attachment: 1 });
             expect(f.objects.size).toBe(1); expect(f.signed[1]?.key).toBe(f.signed[0]?.key); expect(names(f.calls.slice(calls))).toEqual(['HeadObjectCommand']);
         }
