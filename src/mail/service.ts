@@ -11,7 +11,7 @@ interface Provenance { verification: Verification; source?: AuthoredSourceDescri
 const temporary = () => new MailError('temporarily_unavailable');
 function sanitized(error: unknown): MailError {
     const code = error instanceof MailError ? failureReasonSchema.safeParse(error.code) : undefined;
-    return code?.success ? new MailError(code.data, error instanceof MailError ? error.retryAfter : undefined) : temporary();
+    return code?.success ? new MailError(code.data, error instanceof MailError ? error.retryAfter : undefined, error instanceof MailError ? { cause: error.searchCause, status: error.upstreamStatus } : undefined) : temporary();
 }
 function stable(value: unknown): string {
     if (Array.isArray(value)) { return `[${value.map(stable).join(',')}]`; }

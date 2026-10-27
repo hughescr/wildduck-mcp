@@ -1,8 +1,13 @@
-import { expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
 import type { AuthInfo } from '@modelcontextprotocol/server';
 import { handleMcp } from '../src/mcp';
 import { MailError, type BoundMailService } from '../src/mail/contracts';
+import { createMailBackend, type SearchDiagnostic } from '../src/mail/backend';
+import { createMailService } from '../src/mail/service';
+import type { MailOperationStore } from '../src/mail/contracts';
 import { mailOutputSchemas } from '../src/mail/schemas';
+import { withRequestBudget } from '../src/request-budget';
+import { currentRequestId } from '../src/request-id';
 const mailboxId = 'b'.repeat(24);
 const version = 'v'.repeat(43);
 const operation_id = '9ea75b7b-64fa-455e-b83b-37081fc1ec2a';
@@ -129,7 +134,7 @@ test('write temporary and verification failures retain conservative same-operati
 test('actual upstream timeout reports read budget exhaustion without guessing generic failures are timeouts', async () => {
     const f = fixture(); f.mail.search_messages = async () => { throw new MailError('upstream_timeout'); };
     const result = (await f.call('search_messages', { subject: 'Requested search' })).result;
-    expect(result.isError).toBe(true); expect(result.content[0].text).toContain('exceeded the available request time budget'); expect(result.content[0].text).toContain('explicitly narrow'); expect(result.content[0].text).not.toContain('operation_id');
+    expect(result.isError).toBe(true); expect(result.content[0].text).toContain('exceeded the available request time budget'); expect(result.content[0].text).not.toContain('narrow'); expect(result.content[0].text).not.toContain('operation_id');
 });
 
 test('durable preflight timeout receipts retain explicit same-operation guidance', async () => {
@@ -140,7 +145,7 @@ test('durable preflight timeout receipts retain explicit same-operation guidance
 
 test('structured errors expose stable sanitized code and only a supplied validated retry hint', async () => {
     const f = fixture(); f.mail.list_mailboxes = async () => { throw new MailError('temporarily_unavailable', 42); };
-    const unavailable = (await f.call('list_mailboxes')).result; expect(unavailable.structuredContent.error).toEqual({ code: 'temporarily_unavailable', message: unavailable.content[0].text, retry_after: 42 });
+    const unavailable = (await f.call('list_mailboxes')).result; expect(unavailable.structuredContent.error).toMatchObject({ code: 'temporarily_unavailable', message: unavailable.content[0].text, retry_after: 42 }); expect(unavailable.structuredContent.error.request_id).toMatch(/^[a-f0-9-]{36}$/);
     f.mail.list_mailboxes = async () => { throw new Error('private token'); }; const unknown = (await f.call('list_mailboxes')).result; expect(unknown.structuredContent.error.code).toBe('temporarily_unavailable'); expect(unknown.structuredContent.error.retry_after).toBeUndefined(); expect(JSON.stringify(unknown)).not.toContain('private token');
 });
 
@@ -264,4 +269,75 @@ test('single text-only reads ignore HTML-only truncation but retain genuine text
 test('mailbox public schema and tool description identify optional unseen values as unread counts', async () => {
     const f = fixture(); const tool = (await f.rpc('tools/list')).result.tools.find((item: { name: string }) => item.name === 'list_mailboxes');
     expect(tool.description).toContain('unread'); const mailbox = tool.outputSchema.properties.mailboxes.items; expect(mailbox.properties.unseen.description).toContain('Unread'); expect(mailbox.required).not.toContain('unseen');
+});
+
+test('search errors correlate safe diagnostics through service and MCP without exposing input or response', async () => {
+    const logs: SearchDiagnostic[] = []; const f = fixture(); const accountId = 'a'.repeat(24); const token = 'c'.repeat(40);
+    let response = Response.json({ success: true, results: [{ mailbox: 'd'.repeat(24), secret: 'private-body' }] });
+    const backend = createMailBackend({ fetch: (async () => response) as unknown as typeof fetch, onSearchDiagnostic: entry => { logs.push(entry); } });
+    const service = createMailService({ reader: backend, writer: backend, operations: {} as MailOperationStore });
+    f.mail.search_messages = input => service.search_messages({ accountId, accessToken: token, clientId: 'client', scopes: ['mail:read'], connectionStatus: 'active' }, input);
+    const args = { mailboxId, text: 'private-query', receivedSince: '2026-10-01T00:00:00Z' };
+    const mismatch = (await f.call('search_messages', args)).result;
+    expect(mismatch.structuredContent.error).toMatchObject({ code: 'temporarily_unavailable', cause: 'mailbox_scope_mismatch', upstream_status: 200 });
+    expect(mismatch.content[0].text).toContain('mailbox_scope_mismatch (HTTP 200)'); expect(mismatch.content[0].text).not.toContain('narrow');
+    expect(logs[0]?.requestId).toBe(mismatch.structuredContent.error.request_id); expect(logs[0]?.category).toBe('mailbox_scope_mismatch');
+    expect(JSON.stringify({ mismatch, logs })).not.toMatch(/private-query|private-body|cccccccc/);
+    response = new Response('private-body', { status: 502 });
+    const http = (await f.call('search_messages', args)).result;
+    expect(http.structuredContent.error).toMatchObject({ cause: 'http_status', upstream_status: 502 });
+    expect(http.content[0].text).toContain('HTTP 502'); expect(logs[1]?.requestId).toBe(http.structuredContent.error.request_id);
+    expect(http.structuredContent.error.request_id).not.toBe(mismatch.structuredContent.error.request_id);
+    expect(JSON.stringify(http)).not.toContain('private-body');
+});
+
+test('search timeout and invalid diagnostic fields remain bounded', async () => {
+    const f = fixture(); const logs: SearchDiagnostic[] = [];
+    const backend = createMailBackend({ timeoutMs: 5, fetch: (async () => await new Promise<Response>(() => {})) as unknown as typeof fetch, onSearchDiagnostic: entry => { logs.push(entry); } });
+    f.mail.search_messages = input => backend.searchMessages({ accountId: 'a'.repeat(24), accessToken: 'c'.repeat(40) }, input);
+    const timeout = (await f.call('search_messages', { subject: 'private-query' })).result;
+    expect(timeout.structuredContent.error).toMatchObject({ code: 'upstream_timeout', cause: 'deadline' });
+    expect(timeout.structuredContent.error.upstream_status).toBeUndefined(); expect(logs[0]?.requestId).toBe(timeout.structuredContent.error.request_id);
+    f.mail.search_messages = async () => { throw Reflect.construct(MailError, ['temporarily_unavailable', undefined, { cause: 'private-secret', status: 999 }]); };
+    const forged = (await f.call('search_messages', { subject: 'private-query' })).result;
+    expect(forged.structuredContent.error.cause).toBeUndefined(); expect(forged.structuredContent.error.upstream_status).toBeUndefined(); expect(JSON.stringify(forged)).not.toContain('private-secret');
+    f.mail.search_messages = async () => { throw Reflect.construct(MailError, ['temporarily_unavailable', undefined, { cause: 'network', status: 999 }]); };
+    const invalidStatus = (await f.call('search_messages', { subject: 'private-query' })).result;
+    expect(invalidStatus.structuredContent.error.cause).toBe('network'); expect(invalidStatus.structuredContent.error.upstream_status).toBeUndefined();
+    f.mail.list_mailboxes = async () => { throw new MailError('temporarily_unavailable', undefined, { cause: 'http_status', status: 502 }); };
+    const otherTool = (await f.call('list_mailboxes')).result;
+    expect(otherTool.structuredContent.error.cause).toBeUndefined(); expect(otherTool.structuredContent.error.upstream_status).toBeUndefined();
+});
+
+test('overlapping searches isolate request IDs and Lambda budgets through asynchronous service failures', async () => {
+    const f = fixture(); const diagnostics: SearchDiagnostic[] = []; const warnings: string[] = [];
+    const responses = new Map<string, (response: Response) => void>();
+    let ready!: () => void; const bothStarted = new Promise<void>(resolve => { ready = resolve; });
+    const backend = createMailBackend({ fetch: (async url => {
+        const subject = new URL(String(url)).searchParams.get('subject'); if (!subject) { throw new Error('Missing test subject'); }
+        return await new Promise<Response>(resolve => { responses.set(subject, resolve); if (responses.size === 2) { ready(); } });
+    }) as typeof fetch, onSearchDiagnostic: entry => { diagnostics.push(entry); } });
+    const service = createMailService({ reader: backend, writer: backend, operations: {} as MailOperationStore });
+    f.mail.search_messages = input => service.search_messages({ accountId: 'a'.repeat(24), accessToken: 'c'.repeat(40), clientId: 'private-client', scopes: ['mail:read'], connectionStatus: 'active' }, input);
+    const warning = spyOn(console, 'warn').mockImplementation(value => { warnings.push(String(value)); });
+    try {
+        const first = withRequestBudget(() => 9000, () => f.call('search_messages', { subject: 'private-first' }));
+        const second = withRequestBudget(() => 11000, () => f.call('search_messages', { subject: 'private-second' }));
+        await bothStarted;
+        const respondSecond = responses.get('private-second'); const respondFirst = responses.get('private-first');
+        if (!respondSecond || !respondFirst) { throw new Error('Missing overlapping test searches'); }
+        respondSecond(new Response('private-second-body', { status: 502 }));
+        const secondResult = (await second).result;
+        respondFirst(new Response('private-first-body', { status: 503 }));
+        const firstResult = (await first).result;
+        const firstId = firstResult.structuredContent.error.request_id; const secondId = secondResult.structuredContent.error.request_id;
+        expect(firstId).toMatch(/^[a-f0-9-]{36}$/); expect(firstId).not.toBe(secondId);
+        expect(diagnostics).toMatchObject([{ requestId: secondId, status: 502, timeoutMs: 9000 }, { requestId: firstId, status: 503, timeoutMs: 7000 }]);
+        expect(warnings.map(value => JSON.parse(value))).toEqual([
+            { event: 'mail_tool_error', tool: 'search_messages', requestId: secondId, code: 'temporarily_unavailable', cause: 'http_status', status: 502 },
+            { event: 'mail_tool_error', tool: 'search_messages', requestId: firstId, code: 'temporarily_unavailable', cause: 'http_status', status: 503 },
+        ]);
+        expect(JSON.stringify({ firstResult, secondResult, diagnostics, warnings })).not.toMatch(/private-|cccccccc|aaaaaaaa/);
+        expect(currentRequestId()).toBeUndefined();
+    } finally { warning.mockRestore(); }
 });

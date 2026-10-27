@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { isEmailValid } from '@hapi/address';
 import { WILDDUCK_ORIGIN } from '../wildduck';
 import { remainingRequestTimeMs, withRequestBudget } from '../request-budget';
+import { currentRequestId } from '../request-id';
 import { MailError, MAIL_OPERATION_METADATA_KEY, type BackendMailSession, type MailBackendReader, type MailBackendWriter, type Mailbox, type MailInput, type MailOutput, type MessageKey, type DraftContent, type DraftPatch, type MessageSnapshot, type PreparedDraft, type MailOperationMarker, type MessageRef, type MessageSummary, type MailAddress, type AttachmentMetadata, type AttachmentDownload, type AttachmentDownloadLink, type VerifiedMessageMutation, type AuthoredSourceDescriptor } from './contracts';
 import { draftContentSchema, mailboxIdSchema, messageKeySchema, mailInputSchemas, mailOutputSchemas, canonicalReadMessageOutputSchema, attachmentDownloadLinkSchema, mailOperationMarkerSchema, addFlagSchema, labelSchema, MAX_READ_TEXT_BYTES, MAX_HTML_BYTES, MAX_ATTACHMENT_BYTES, MAX_SNIPPET_BYTES } from './schemas';
 import { MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS, type AttachmentDownloadStager } from './downloads';
@@ -29,8 +30,8 @@ class MultipartUpload {
         this.bytes = Buffer.concat([...parts.flatMap(part => [Buffer.from(`--${boundary}\r\n`), part]), Buffer.from(`--${boundary}--\r\n`)]);
     }
 }
-type SearchCategory = 'deadline' | 'network' | 'http_status' | 'invalid_json' | 'invalid_shape' | 'too_large';
-export interface SearchDiagnostic { event: 'wildduck_search'; outcome: 'success' | 'failure'; scope: 'global' | 'mailbox'; category?: SearchCategory; durationMs: number; headersMs?: number; bodyMs?: number; validationMs?: number; status?: number; timeoutMs?: number }
+type SearchCategory = import('./contracts').SearchFailureCause;
+export interface SearchDiagnostic { requestId?: string; event: 'wildduck_search'; outcome: 'success' | 'failure'; scope: 'global' | 'mailbox'; category?: SearchCategory; durationMs: number; headersMs?: number; bodyMs?: number; validationMs?: number; status?: number; timeoutMs?: number }
 interface SearchTiming { category: SearchCategory; headersMs?: number; bodyMs?: number; status?: number; timeoutMs?: number }
 export interface MailBackendOptions { fetch?: typeof globalThis.fetch; timeoutMs?: number; searchTimeoutMs?: number; downloadStager?: AttachmentDownloadStager; onSearchDiagnostic?: (diagnostic: SearchDiagnostic) => void }
 const fail = (): never => { throw new MailError('temporarily_unavailable'); };
@@ -286,14 +287,19 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
             validationStarted = performance.now(); timing.category = 'invalid_json'; const raw = json(response.bytes);
             timing.category = 'invalid_shape';
             if (raw['success'] !== true || raw['error'] !== undefined || raw['code'] !== undefined) { return fail(); }
-            // Reject mismatched rows: WildDuck's timeout fallback can drop its mailbox filter.
+            // A mismatch proves the response violates the requested mailbox, not why.
+            if (data.mailboxId !== undefined && Array.isArray(raw['results']) && raw['results'].some(row => object(row) && typeof row['mailbox'] === 'string' && ACCOUNT.test(row['mailbox']) && row['mailbox'] !== data.mailboxId)) { timing.category = 'mailbox_scope_mismatch'; return fail(); }
             const result = this.page(raw, data.limit, session.accountId, data.mailboxId);
             if (!mailOutputSchemas.search_messages.safeParse(result).success) { return fail(); }
             outcome = 'success'; return result;
+        } catch (error) {
+            if (error instanceof MailError && (error.code === 'temporarily_unavailable' || error.code === 'upstream_timeout' || error.code === 'too_large')) { throw new MailError(error.code, error.retryAfter, { cause: timing.category, status: timing.status }); }
+            throw error;
         } finally {
             // Construct only allowlisted primitives. Never log queries, identity, URLs,
             // response values, caller headers or thrown errors. Late fetches cannot emit.
-            const diagnostic: SearchDiagnostic = { event: 'wildduck_search', outcome, scope: data.mailboxId === undefined ? 'global' : 'mailbox', durationMs: Math.round(performance.now() - started),
+            const requestId = currentRequestId();
+            const diagnostic: SearchDiagnostic = { ...(requestId === undefined ? {} : { requestId }), event: 'wildduck_search', outcome, scope: data.mailboxId === undefined ? 'global' : 'mailbox', durationMs: Math.round(performance.now() - started),
                 ...(outcome === 'failure' ? { category: timing.category } : {}),
                 ...(timing.headersMs === undefined ? {} : { headersMs: timing.headersMs }), ...(timing.bodyMs === undefined ? {} : { bodyMs: timing.bodyMs }),
                 ...(validationStarted === undefined ? {} : { validationMs: Math.round(performance.now() - validationStarted) }),

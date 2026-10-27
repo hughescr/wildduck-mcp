@@ -3,10 +3,14 @@ import type { PreparedMime } from './mime';
 import type { CanonicalReadMessage, ConfirmedReceipt, DraftContent, DraftPatch, FailedReceipt, MailFailureCode, Mailbox, MailInput, MailOperationMarker, MailOutput, MailReceipt, MailToolName, MailWriteTool, MessageKey, MessageRef, SourceGrade, UnknownReceipt } from './schemas';
 export type { ActivationProof, AttachmentMetadata, CanonicalReadMessage, CompletedReceipt, ConfirmedReceipt, DraftAddress, DraftContent, DraftPatch, DraftRef, FailedReceipt, MailAddress, Mailbox, MailFailureCode, MailInput, MailInputRaw, MailOperationMarker, MailOutput, MailReceipt, MailToolName, MailWriteTool, MessageFlags, MessageKey, MessageRef, MessageSummary, NewAttachment, PartialReceipt, SourceGrade, UnknownReceipt } from './schemas';
 
-/** Catch/map only code. Never expose raw upstream errors, bodies, causes or tokens. */
+export const searchFailureCauses = ['deadline', 'network', 'http_status', 'invalid_json', 'invalid_shape', 'mailbox_scope_mismatch', 'too_large'] as const;
+export type SearchFailureCause = typeof searchFailureCauses[number];
+/** Retain only allowlisted diagnostics. Never expose raw upstream errors, bodies or tokens. */
 export class MailError extends Error {
     declare readonly retryAfter?: number;
-    constructor(public readonly code: MailFailureCode, retryAfter: number | undefined = undefined) { super(code); this.name = 'MailError'; if (typeof retryAfter === 'number' && Number.isSafeInteger(retryAfter) && retryAfter >= 0 && retryAfter <= 86400) { this.retryAfter = retryAfter; } }
+    declare readonly searchCause?: SearchFailureCause;
+    declare readonly upstreamStatus?: number;
+    constructor(public readonly code: MailFailureCode, retryAfter: number | undefined = undefined, diagnostic: { cause?: SearchFailureCause | undefined; status?: number | undefined } | undefined = undefined) { super(code); this.name = 'MailError'; if (typeof retryAfter === 'number' && Number.isSafeInteger(retryAfter) && retryAfter >= 0 && retryAfter <= 86400) { this.retryAfter = retryAfter; } if (diagnostic && diagnostic.cause !== undefined && searchFailureCauses.includes(diagnostic.cause)) { this.searchCause = diagnostic.cause; if (typeof diagnostic.status === 'number' && Number.isInteger(diagnostic.status) && diagnostic.status >= 100 && diagnostic.status <= 599) { this.upstreamStatus = diagnostic.status; } } }
 }
 /** Reserved upstream metaData field. Raw marker contents are never public output. */
 export const MAIL_OPERATION_METADATA_KEY = 'wildduckMcpOperationV1';
