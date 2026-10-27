@@ -9,6 +9,7 @@
         "@aws-sdk/client-ssm": "^3.1156.0",
         "@aws-sdk/lib-dynamodb": "^3.1157.0",
         "@better-auth/cimd": "^1.7.13",
+        "@hapi/address": "5.1.1",
         "@hono/aws-lambda": "^1.0.1",
         "@modelcontextprotocol/server": "^2.4.0",
         "@zone-eu/mailsplit": "5.4.20",
@@ -92,6 +93,10 @@
     "@better-auth/utils": ["@better-auth/utils@0.5.1", "", { "dependencies": { "@noble/hashes": "^2.0.1" } }, "sha512-WETqw5vQ52uQ/xwWR4E8rTgT6fDEr/wnS+otDNkBCa/69281FCF32OKDdQUcahMCnjsvqXBNiEvAQHFB0EVRRg=="],
 
     "@better-fetch/fetch": ["@better-fetch/fetch@1.3.3", "", {}, "sha512-U6SlDt/GUWtK2JAxS/NhdoYTEim+EL1G5byz2TUj83KjLZBUpYzb5SmX0aXaCnbGkAjFKnV/o/0+cyXMbEcqqg=="],
+
+    "@hapi/address": ["@hapi/address@5.1.1", "", { "dependencies": { "@hapi/hoek": "^11.0.2" } }, "sha512-A+po2d/dVoY7cYajycYI43ZbYMXukuopIsqCjh5QzsBCipDtdofHntljDlpccMjIfTy6UOkg+5KPriwYch2bXA=="],
+
+    "@hapi/hoek": ["@hapi/hoek@11.0.7", "", {}, "sha512-HV5undWkKzcB4RZUusqOpcgxOaq6VOAH7zhhIr2g3G8NF/MlFO75SjOr2NfuSx0Mh40+1FqCkagKLJRykUWoFQ=="],
 
     "@hono/aws-lambda": ["@hono/aws-lambda@1.0.1", "", { "peerDependencies": { "hono": ">=4.13.9 || ^5.0.0-0" } }, "sha512-JfP6JccWwUIvhMhUkPdVcheYK8YU81qEkEcjuHkeIju08sANJBg5sFyx3vhIlZP+n6qPh9QpF3TDen0hXy4/dw=="],
 

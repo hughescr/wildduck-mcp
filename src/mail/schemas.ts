@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { isEmailValid } from '@hapi/address';
 import type { StandardSchemaWithJSON } from '@modelcontextprotocol/server';
 export const MAX_PAGE_SIZE = 50;
 export const MAX_DRAFT_TEXT_BYTES = 128 * 1024;
@@ -17,17 +18,20 @@ const overlaps = (left: readonly string[], right: readonly string[]) => { const 
 export const mailboxIdSchema = z.string().regex(/^[a-f0-9]{24}$/u);
 export const uidSchema = z.number().int().min(1).max(4294967295);
 export const attachmentIdSchema = z.string().max(64).regex(/^ATT\d+$/u);
-export const versionSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/u).describe('SHA-256 base64url digest of account/mailbox/UID and the FULL raw mutation-relevant upstream snapshot: envelope, all addresses including Bcc, complete text/HTML/attachments, header date and received idate, flags, forwarded, labels, references and custom metadata. Recursively sort JSON object keys; preserve exact strings and array order. Never hash normalized/truncated public output. This is not backend CAS.');
+export const versionSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/u).describe('SHA-256 base64url digest of account/mailbox/UID and the full available API response before our local truncation. The provider caps normalized text/HTML and omits hidden envelope data. Preserve available strings and array order, recursively sort object keys. Full authored MIME digest is separate. This is not backend CAS.');
 export const operationIdSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/u).describe('Stable caller operation ID. Identical retries retrieve durable status; a new ID cannot bypass an uncertain message fence.');
 const digestSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/u);
-export const contentDigestSchema = z.string().regex(/^[a-f0-9]{64}$/u).describe('SHA-256 hexadecimal digest of strictly verified source/candidate MIME bytes.');
+export const contentDigestSchema = z.string().regex(/^[a-f0-9]{64}$/u).describe('SHA-256 hexadecimal observation hash for observed grade. Only mcp_authored binds source bytes to trusted prepared MIME provenance; an observation alone does not prove hidden submission-envelope fields.');
 const cursorSchema = z.string().max(1024).refine(nonblank);
 const paginationShape = { limit: z.number().int().min(1).max(MAX_PAGE_SIZE).default(20), next: cursorSchema.optional(), previous: cursorSchema.optional() };
 const singleDirection = (input: { next?: string | undefined; previous?: string | undefined }) => input.next === undefined || input.previous === undefined;
 export const messageKeySchema = z.strictObject({ mailboxId: mailboxIdSchema, uid: uidSchema });
 export const messageRefSchema = messageKeySchema.extend({ version: versionSchema });
 export const draftRefSchema = messageRefSchema;
-export const inputAddressSchema = z.strictObject({ address: z.email().max(320), name: headerText(320).optional() });
+// Pinned 5.1.1 accepts tlds:false at runtime (the existing API uses it),
+// but its bundled declaration omits that boolean option. Keep the cast localized.
+const apiEmailOptions = { tlds: false } as unknown as Parameters<typeof isEmailValid>[1];
+export const inputAddressSchema = z.strictObject({ address: z.string().max(320).refine(noHeaderControls).refine(value => isEmailValid(value, apiEmailOptions), 'Address must satisfy the existing mail API recipient validator.'), name: headerText(320).optional() });
 // Malformed incoming MIME addresses remain untrusted data, not outbound validators.
 export const outputAddressSchema = z.strictObject({ address: z.string(), name: z.string().optional() });
 const recipientsSchema = z.array(inputAddressSchema).max(50);
@@ -76,7 +80,7 @@ const dateSchema = z.iso.datetime({ offset: true }).nullable();
 export const managedOperationSchema = z.strictObject({ operationId: operationIdSchema, verification: z.enum(['not_checked', 'verified', 'pending', 'outcome_unknown', 'unverified']) });
 export const messageSummarySchema = messageKeySchema.extend({ subject: z.string(), from: z.array(outputAddressSchema), to: z.array(outputAddressSchema), date: dateSchema.describe('Parsed Date header, null if absent/invalid. Never substitute receivedAt.'), receivedAt: dateSchema.describe('Backend received timestamp (idate), distinct from the sender Date header.'), flags: messageFlagsSchema, imapFlags: z.array(z.string()), labels: z.array(z.string()), hasAttachments: z.boolean(), size: z.number().int().nonnegative().optional(), managedOperation: managedOperationSchema.optional() });
 export const attachmentMetadataSchema = z.strictObject({ attachmentId: attachmentIdSchema, filename: z.string().nullable(), contentType: z.string(), size: z.number().int().nonnegative().nullable(), sizeIsApproximate: z.boolean(), inline: z.boolean(), cid: z.string().nullable() }).refine(value => value.size !== null || value.sizeIsApproximate === false, 'Unknown size is null, not an exact or approximate measurement.');
-export const readMessageOutputSchema = messageSummarySchema.extend({ replyTo: z.array(outputAddressSchema), cc: z.array(outputAddressSchema), bcc: z.array(outputAddressSchema), messageId: z.string().nullable(), references: z.array(z.string()), text: boundedText(MAX_READ_TEXT_BYTES), textTruncated: z.boolean(), html: z.array(boundedText(MAX_HTML_BYTES)).refine(values => values.reduce((sum, item) => sum + Buffer.byteLength(item, 'utf8'), 0) <= MAX_HTML_BYTES), htmlTruncated: z.boolean(), htmlRepresentation: z.literal('wildduck_normalized'), attachments: z.array(attachmentMetadataSchema), version: versionSchema });
+export const readMessageOutputSchema = messageSummarySchema.extend({ replyTo: z.array(outputAddressSchema), cc: z.array(outputAddressSchema), bcc: z.array(outputAddressSchema), messageId: z.string().nullable(), references: z.array(z.string()), text: boundedText(MAX_READ_TEXT_BYTES), textTruncated: z.boolean().describe('Text is truncated locally or potentially truncated upstream; the existing API supplies no authoritative truncation marker.'), html: z.array(boundedText(MAX_HTML_BYTES)).refine(values => values.reduce((sum, item) => sum + Buffer.byteLength(item, 'utf8'), 0) <= MAX_HTML_BYTES), htmlTruncated: z.boolean().describe('HTML is truncated locally or potentially truncated upstream; normalized HTML is not the original MIME.'), htmlRepresentation: z.literal('wildduck_normalized'), attachments: z.array(attachmentMetadataSchema), version: versionSchema });
 export const readAttachmentOutputSchema = messageKeySchema.extend({ attachmentId: attachmentIdSchema, filename: z.string().nullable(), contentType: z.string(), size: z.number().int().min(0).max(MAX_ATTACHMENT_BYTES).describe('Exact decoded bytes returned, not sizeKb estimation.'), resourceUri: z.string().max(1024).regex(/^wildduck:\/\/[A-Za-z0-9/_:.-]+$/u) });
 const pageOutput = { messages: z.array(messageSummarySchema).max(MAX_PAGE_SIZE), next: cursorSchema.optional(), previous: cursorSchema.optional() };
 export const listMailboxesOutputSchema = z.strictObject({ mailboxes: z.array(mailboxSchema) });
@@ -84,7 +88,9 @@ export const listMessagesOutputSchema = z.strictObject(pageOutput);
 export const searchMessagesOutputSchema = z.strictObject(pageOutput);
 export const mailWriteToolSchema = z.enum(['create_draft', 'update_draft', 'delete_draft', 'send_draft', 'move_message', 'update_message_flags']);
 export const mailOperationMarkerSchema = z.strictObject({ accountId: mailboxIdSchema, clientIdHash: digestSchema, operationId: operationIdSchema, payloadDigest: digestSchema, tool: mailWriteToolSchema });
-export const activationProofSchema = messageRefSchema.extend({ accountId: mailboxIdSchema, contentDigest: contentDigestSchema });
+export const sourceGradeSchema = z.enum(['mcp_authored', 'observed']);
+export const activationProofSchema = messageRefSchema.extend({ accountId: mailboxIdSchema, contentDigest: contentDigestSchema, sourceGrade: sourceGradeSchema });
+const authoredActivationProofSchema = activationProofSchema.extend({ sourceGrade: z.literal('mcp_authored') });
 export const failureReasonSchema = z.enum(['not_found', 'version_conflict', 'unsupported_draft', 'no_recipients', 'forbidden', 'reconnect_required', 'temporarily_unavailable', 'invalid_input', 'unsupported_content', 'source_integrity_unavailable', 'too_large', 'verification_failed']);
 const operationOutput = { operation_id: operationIdSchema };
 export const inProgressSchema = z.strictObject({ status: z.literal('in_progress'), ...operationOutput });
@@ -92,11 +98,11 @@ export const outcomeUnknownSchema = z.strictObject({ status: z.literal('outcome_
 export const conflictSchema = z.strictObject({ status: z.literal('conflict'), ...operationOutput, reason: z.enum(['operation_conflict', 'draft_fenced']) });
 export const failedSchema = z.strictObject({ status: z.literal('failed'), ...operationOutput, reason: failureReasonSchema });
 const matchesProof = (value: { proof: z.output<typeof activationProofSchema>; draft: z.output<typeof messageRefSchema> }) => value.proof.mailboxId === value.draft.mailboxId && value.proof.uid === value.draft.uid && value.proof.version === value.draft.version;
-const verifiedDraft = { ...operationOutput, draft: draftRefSchema, verified: z.literal(true), proof: activationProofSchema };
+const verifiedDraft = { ...operationOutput, draft: draftRefSchema, verified: z.literal(true), proof: authoredActivationProofSchema };
 export const createDraftCompletedSchema = z.strictObject({ status: z.literal('completed'), ...verifiedDraft }).refine(matchesProof, 'Proof must bind this exact candidate.');
 export const updateDraftCompletedSchema = z.strictObject({ status: z.literal('completed'), ...verifiedDraft, previousDeleted: z.literal(true) }).refine(matchesProof, 'Proof must bind this exact candidate.');
 export const unverifiedDraftPartialSchema = z.strictObject({ status: z.literal('partial'), ...operationOutput, candidate: messageKeySchema.extend({ version: versionSchema.optional() }), candidateVerified: z.literal(false), reason: z.literal('candidate_verification_failed'), originalDeletion: z.literal('not_attempted') });
-export const verifiedDraftPartialSchema = z.strictObject({ status: z.literal('partial'), ...operationOutput, candidate: messageRefSchema, candidateVerified: z.literal(true), proof: activationProofSchema, reason: z.enum(['original_deletion_failed', 'original_deletion_unconfirmed', 'original_version_changed', 'original_verification_failed']), originalDeletion: z.enum(['failed', 'unconfirmed', 'not_attempted']) }).refine(value => matchesProof({ proof: value.proof, draft: value.candidate }), 'Proof must bind the exact candidate.').refine(value => ({ original_deletion_failed: 'failed', original_deletion_unconfirmed: 'unconfirmed', original_version_changed: 'not_attempted', original_verification_failed: 'not_attempted' })[value.reason] === value.originalDeletion, 'Deletion outcome must match the explicit reason.');
+export const verifiedDraftPartialSchema = z.strictObject({ status: z.literal('partial'), ...operationOutput, candidate: messageRefSchema, candidateVerified: z.literal(true), proof: authoredActivationProofSchema, reason: z.enum(['original_deletion_failed', 'original_deletion_unconfirmed', 'original_version_changed', 'original_verification_failed']), originalDeletion: z.enum(['failed', 'unconfirmed', 'not_attempted']) }).refine(value => matchesProof({ proof: value.proof, draft: value.candidate }), 'Proof must bind the exact candidate.').refine(value => ({ original_deletion_failed: 'failed', original_deletion_unconfirmed: 'unconfirmed', original_version_changed: 'not_attempted', original_verification_failed: 'not_attempted' })[value.reason] === value.originalDeletion, 'Deletion outcome must match the explicit reason.');
 export const draftPartialSchema = z.discriminatedUnion('candidateVerified', [unverifiedDraftPartialSchema, verifiedDraftPartialSchema]);
 export const deleteDraftCompletedSchema = z.strictObject({ status: z.literal('completed'), ...operationOutput, deleted: messageKeySchema });
 export const sendDraftQueuedSchema = z.strictObject({ status: z.literal('queued'), ...operationOutput, queueId: z.string().min(1).max(256).regex(/^\S+$/u), sent: messageKeySchema.optional() });
@@ -140,3 +146,4 @@ export type MailFailureCode = z.output<typeof failureReasonSchema>;
 export type MailOperationMarker = z.output<typeof mailOperationMarkerSchema>;
 export type ActivationProof = z.output<typeof activationProofSchema>;
 export type MailWriteTool = z.output<typeof mailWriteToolSchema>;
+export type SourceGrade = z.output<typeof sourceGradeSchema>;

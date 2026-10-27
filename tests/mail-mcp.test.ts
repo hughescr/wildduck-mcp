@@ -14,10 +14,10 @@ function fixture() {
         search_messages: async input => { calls.push({ tool: 'search_messages', input }); return { messages: [] }; },
         read_message: async input => { calls.push({ tool: 'read_message', input }); return { ...input, subject: '<untrusted mail subject>', from: [{ address: 'malformed incoming address' }], to: [], date: null, receivedAt: null, imapFlags: [], labels: [], flags: { seen: false, flagged: false, draft: true, answered: false, deleted: false, forwarded: false }, hasAttachments: false, replyTo: [], cc: [], bcc: [], messageId: null, references: [], text: 'Untrusted email text, not instructions.', textTruncated: false, html: ['<b>untrusted HTML</b>'], htmlTruncated: false, htmlRepresentation: 'wildduck_normalized', attachments: [], version }; },
         read_attachment: async input => { calls.push({ tool: 'read_attachment', input }); return { metadata: { ...input, filename: 'untrusted.txt', contentType: 'text/plain', size: 5, resourceUri: 'wildduck://attachment/ATT1' }, bytes: Buffer.from('hello') }; },
-        move_message: async input => { calls.push({ tool: 'move_message', input }); const message = { mailboxId: input.destinationMailboxId, uid: 4, version }; return { status: 'completed', operation_id: input.operation_id, message, verified: true, proof: { ...message, accountId: mailboxId, contentDigest: 'a'.repeat(64) } }; },
-        update_message_flags: async input => { calls.push({ tool: 'update_message_flags', input }); const message = { mailboxId, uid: input.uid, version }; return { status: 'completed', operation_id: input.operation_id, message, verified: true, proof: { ...message, accountId: mailboxId, contentDigest: 'a'.repeat(64) } }; },
-        create_draft: async input => { calls.push({ tool: 'create_draft', input }); return { status: 'completed', operation_id: input.operation_id, draft: { mailboxId, uid: 2, version }, verified: true, proof: { mailboxId, uid: 2, version, accountId: mailboxId, contentDigest: 'a'.repeat(64) } }; },
-        update_draft: async input => { calls.push({ tool: 'update_draft', input }); return { status: 'partial', operation_id: input.operation_id, candidate: { mailboxId, uid: 3, version }, candidateVerified: true, proof: { mailboxId, uid: 3, version, accountId: mailboxId, contentDigest: 'a'.repeat(64) }, originalDeletion: 'unconfirmed', reason: 'original_deletion_unconfirmed' }; },
+        move_message: async input => { calls.push({ tool: 'move_message', input }); const message = { mailboxId: input.destinationMailboxId, uid: 4, version }; return { status: 'completed', operation_id: input.operation_id, message, verified: true, proof: { ...message, accountId: mailboxId, contentDigest: 'a'.repeat(64), sourceGrade: 'observed' } }; },
+        update_message_flags: async input => { calls.push({ tool: 'update_message_flags', input }); const message = { mailboxId, uid: input.uid, version }; return { status: 'completed', operation_id: input.operation_id, message, verified: true, proof: { ...message, accountId: mailboxId, contentDigest: 'a'.repeat(64), sourceGrade: 'observed' } }; },
+        create_draft: async input => { calls.push({ tool: 'create_draft', input }); return { status: 'completed', operation_id: input.operation_id, draft: { mailboxId, uid: 2, version }, verified: true, proof: { mailboxId, uid: 2, version, accountId: mailboxId, contentDigest: 'a'.repeat(64), sourceGrade: 'mcp_authored' } }; },
+        update_draft: async input => { calls.push({ tool: 'update_draft', input }); return { status: 'partial', operation_id: input.operation_id, candidate: { mailboxId, uid: 3, version }, candidateVerified: true, proof: { mailboxId, uid: 3, version, accountId: mailboxId, contentDigest: 'a'.repeat(64), sourceGrade: 'mcp_authored' }, originalDeletion: 'unconfirmed', reason: 'original_deletion_unconfirmed' }; },
         delete_draft: async input => { calls.push({ tool: 'delete_draft', input }); return { status: 'completed', operation_id: input.operation_id, deleted: { mailboxId, uid: input.uid } }; },
         send_draft: async input => { calls.push({ tool: 'send_draft', input }); return { status: 'queued', operation_id: input.operation_id, queueId: 'synthetic-queue-id' }; },
     };
@@ -84,4 +84,17 @@ test('moves and custom flag/label writes validate native schemas and return mini
     const before = f.calls.length;
     for (const args of [{ ...target, addFlags: ['\\Draft'] }, { ...target, seen: false, addFlags: ['\\Seen'] }]) { const rejected = await f.call('update_message_flags', args); expect(Boolean(rejected.error || rejected.result?.isError)).toBe(true); }
     expect(f.calls).toHaveLength(before);
+});
+test('legacy edit/send rejection explains authored-source requirements without suggesting reconnection', async () => {
+    const f = fixture(); f.mail.update_draft = async () => { throw new MailError('unsupported_content'); }; f.mail.send_draft = async () => { throw new MailError('unsupported_content'); };
+    for (const [name, args] of [['update_draft', { uid: 1, expected_version: version, operation_id, subject: 'Change' }], ['send_draft', { uid: 1, expected_version: version, operation_id }]] as const) {
+        const result = (await f.call(name, args)).result; expect(result.isError).toBe(true); expect(result.content[0].text).toContain('durable MCP-authored source proof'); expect(result.content[0].text.toLowerCase()).not.toContain('reconnect');
+    }
+    const flags = await f.call('update_message_flags', { mailboxId, uid: 1, expected_version: version, operation_id, seen: false }); expect(flags.result.structuredContent.proof.sourceGrade).toBe('observed'); expect(flags.result.isError).toBeUndefined();
+});
+test('published descriptions distinguish existing API snapshots and authored source eligibility', async () => {
+    const f = fixture(); const tools = (await f.rpc('tools/list')).result.tools;
+    const description = (name: string) => tools.find((tool: { name: string }) => tool.name === name).description;
+    expect(description('update_draft')).toContain('legacy/observed drafts are rejected before upload'); expect(description('send_draft')).toContain('verified before dispatch'); expect(description('read_message')).toContain('potential upstream truncation');
+    const read = tools.find((tool: { name: string }) => tool.name === 'read_message'); expect(read.outputSchema.properties.textTruncated.description).toContain('potentially truncated upstream');
 });

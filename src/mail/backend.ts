@@ -1,13 +1,15 @@
 import { createHash } from 'node:crypto';
+import { isEmailValid } from '@hapi/address';
 import { WILDDUCK_ORIGIN } from '../wildduck';
-import { MailError, MAIL_OPERATION_METADATA_KEY, type BackendMailSession, type MailBackendReader, type MailBackendWriter, type Mailbox, type MailInput, type MailOutput, type MessageKey, type DraftContent, type DraftPatch, type MessageSnapshot, type PreparedDraft, type MailOperationMarker, type MessageRef, type MessageSummary, type MailAddress, type AttachmentMetadata, type AttachmentDownload, type VerifiedMessageMutation } from './contracts';
+import { MailError, MAIL_OPERATION_METADATA_KEY, type BackendMailSession, type MailBackendReader, type MailBackendWriter, type Mailbox, type MailInput, type MailOutput, type MessageKey, type DraftContent, type DraftPatch, type MessageSnapshot, type PreparedDraft, type MailOperationMarker, type MessageRef, type MessageSummary, type MailAddress, type AttachmentMetadata, type AttachmentDownload, type VerifiedMessageMutation, type AuthoredSourceDescriptor } from './contracts';
 import { draftContentSchema, mailboxIdSchema, messageKeySchema, mailInputSchemas, mailOutputSchemas, mailOperationMarkerSchema, addFlagSchema, labelSchema, MAX_READ_TEXT_BYTES, MAX_HTML_BYTES, MAX_ATTACHMENT_BYTES } from './schemas';
-import { createMime, inspectSource, preparePatch, verifyCandidate, MimeError, MIME_LIMITS } from './mime';
+import { createMime, inspectSource, preparePatch, verifyCandidate, MimeError, MIME_LIMITS, type MimeEnvelope } from './mime';
 
 const META_BYTES = 512 * 1024;
 const MESSAGE_BYTES = 4 * 1024 * 1024;
 const ACCOUNT = /^[a-f0-9]{24}$/u;
 const TOKEN = /^[a-fA-F0-9]{40}$/u;
+const API_EMAIL_OPTIONS = { tlds: false } as unknown as Parameters<typeof isEmailValid>[1];
 type Json = Record<string, unknown>;
 export interface MailBackendOptions { fetch?: typeof globalThis.fetch; timeoutMs?: number }
 const fail = (): never => { throw new MailError('temporarily_unavailable'); };
@@ -50,13 +52,12 @@ function same(left: unknown, right: unknown): boolean { return stable(left ?? nu
 function assertSame(left: unknown, right: unknown): void { if (!same(left, right)) { throw new MailError('verification_failed'); } }
 function setSame(left: readonly string[], right: readonly string[]): void { assertSame([...left].sort(), [...right].sort()); }
 interface OutboundEnvelope { from: string; to: string[] }
-function outbound(raw: Json): OutboundEnvelope | null {
-    if (!Object.hasOwn(raw, 'submissionEnvelope')) { throw new MailError('source_integrity_unavailable'); }
-    const value = raw['submissionEnvelope']; if (value === null) { return null; }
-    if (!object(value) || typeof value['from'] !== 'string') { throw new MailError('unsupported_content'); }
-    return { from: value['from'], to: strings(value['to']) };
+function outbound(envelope: MimeEnvelope): OutboundEnvelope {
+    const senders = envelope.from; const recipients = [...new Set([...envelope.to, ...envelope.cc, ...envelope.bcc].map(item => item.address))];
+    if (senders.length !== 1 || !senders[0] || !isEmailValid(senders[0].address, API_EMAIL_OPTIONS) || recipients.length > 100 || recipients.some(address => !isEmailValid(address, API_EMAIL_OPTIONS))) { throw new MailError('unsupported_content'); }
+    return { from: senders[0].address, to: recipients };
 }
-interface SnapshotState { accountId: string; raw: Json }
+interface SnapshotState { accountId: string; raw: Json; authored?: { digest: string; bytes: Buffer } }
 interface PreparationState { accountId: string; envelope: OutboundEnvelope; flags: string[]; labels: string[]; metadata: Json; receivedAt: string; reference?: Json; files: Json[] }
 function addresses(value: unknown, depth = 0): MailAddress[] {
     if (depth > 8) { return fail(); }
@@ -97,7 +98,7 @@ function stable(value: unknown): string {
     if (object(value)) { return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stable(value[key])}`).join(',')}}`; }
     return JSON.stringify(value);
 }
-const VERSION_FIELDS = ['envelope', 'submissionEnvelope', 'forwarded', 'labels', 'from', 'replyTo', 'to', 'cc', 'bcc', 'subject', 'messageId', 'references', 'date', 'idate', 'text', 'html', 'attachments', 'files', 'draft', 'flags', 'seen', 'flagged', 'answered', 'deleted', 'contentType', 'reference', 'metaData', 'expires', 'verificationResults', 'outbound', 'forwardTargets'] as const;
+const VERSION_FIELDS = ['envelope', 'forwarded', 'labels', 'from', 'replyTo', 'to', 'cc', 'bcc', 'subject', 'messageId', 'references', 'date', 'idate', 'text', 'html', 'attachments', 'files', 'draft', 'flags', 'seen', 'flagged', 'answered', 'deleted', 'contentType', 'reference', 'metaData', 'expires', 'verificationResults', 'outbound', 'forwardTargets'] as const;
 function supportedDraftState(raw: Json): boolean {
     return same(raw['envelope'], { from: '', rcpt: [] }) && raw['expires'] === undefined && raw['verificationResults'] === undefined && raw['outbound'] === undefined &&
         (raw['forwardTargets'] === undefined || same(raw['forwardTargets'], []));
@@ -142,7 +143,6 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
                 ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
             const discard = () => { void response.body?.cancel().catch(() => {}); };
             if (response.redirected || response.status >= 300 && response.status < 400) { discard(); return fail(); }
-            if (kind === 'source' && response.status === 200 && response.headers.get('X-Wildduck-Source-Integrity') !== 'strict') { discard(); throw new MailError('source_integrity_unavailable'); }
             const encoded = response.headers.has('content-encoding') && response.headers.get('content-encoding') !== 'identity';
             if (kind === 'source' && encoded) { discard(); throw new MailError('source_integrity_unavailable'); }
             const contentType = response.headers.get('content-type') ?? '';
@@ -177,7 +177,7 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
     }
     private async source(session: BackendMailSession, target: MessageKey): Promise<Buffer> {
         sessionValid(session); targetValid(target);
-        return (await this.transport(session, `/mailboxes/${target.mailboxId}/messages/${target.uid}/message.eml?strict=true`, 'GET', undefined, MIME_LIMITS.sourceBytes, 'source')).bytes;
+        return (await this.transport(session, `/mailboxes/${target.mailboxId}/messages/${target.uid}/message.eml`, 'GET', undefined, MIME_LIMITS.sourceBytes, 'source')).bytes;
     }
     async listMailboxes(session: BackendMailSession): Promise<MailOutput<'list_mailboxes'>> {
         const raw = await this.request(session, '/mailboxes?showHidden=true', 'GET');
@@ -232,11 +232,14 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
     }
     async readMessage(session: BackendMailSession, input: MailInput<'read_message'>) {
         const snapshot = await this.rawMessage(session, input); const raw = snapshot.raw;
-        const html: string[] = []; let remaining = MAX_HTML_BYTES; let htmlTruncated = false;
+        // The API caps stored text in UTF-16 characters and HTML in UTF-8 bytes.
+        // Reaching its ceiling is conservatively incomplete, even below our own cap.
+        const html: string[] = []; let remaining = MAX_HTML_BYTES; let htmlTruncated = ((raw['html'] ?? []) as string[]).reduce((total, item) => total + Buffer.byteLength(item), 0) >= 640 * 1024;
         for (const item of (raw['html'] ?? []) as string[]) { const part = truncate(item, remaining); html.push(part.text); remaining -= Buffer.byteLength(part.text); htmlTruncated ||= part.textTruncated; }
+        const text = truncate(typeof raw['text'] === 'string' ? raw['text'] : '');
         const message = { ...summary(raw, input.mailboxId), replyTo: addresses(raw['replyTo']), cc: addresses(raw['cc']), bcc: addresses(raw['bcc']),
             messageId: typeof raw['messageId'] === 'string' ? raw['messageId'] : null, references: (raw['references'] ?? []) as string[],
-            ...truncate(typeof raw['text'] === 'string' ? raw['text'] : ''), html, htmlTruncated, htmlRepresentation: 'wildduck_normalized' as const,
+            ...text, textTruncated: text.textTruncated || typeof raw['text'] === 'string' && raw['text'].length >= 100 * 1024, html, htmlTruncated, htmlRepresentation: 'wildduck_normalized' as const,
             attachments: (raw['attachments'] as unknown[]).map(attachment), version: snapshot.version };
         if (!mailOutputSchemas.read_message.safeParse(message).success) { return fail(); }
         const marker = markerOf(raw); return { message, ...(marker ? { marker } : {}) };
@@ -258,8 +261,7 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
     async inspectMessage(session: BackendMailSession, target: MessageKey): Promise<MessageSnapshot> {
         const { raw, version: digest } = await this.rawMessage(session, target);
         const mime = object(raw['contentType']) ? string(raw['contentType']['value']).toLowerCase() : 'text/plain';
-        const envelope = outbound(raw);
-        const hasRecipients = envelope === null ? [...addresses(raw['to']), ...addresses(raw['cc']), ...addresses(raw['bcc'])].some(address => address.address.trim().length > 0) : envelope.to.some(address => address.trim().length > 0);
+        const hasRecipients = [...addresses(raw['to']), ...addresses(raw['cc']), ...addresses(raw['bcc'])].some(address => address.address.trim().length > 0);
         const marker = markerOf(raw);
         const snapshot: MessageSnapshot = { message: { ...target, version: digest }, isDraft: bool(raw['draft']), hasHtml: mime !== 'text/plain' && (mime === 'text/html' || (raw['html'] as unknown[] | undefined)?.length !== 0 && raw['html'] !== undefined), hasAttachments: (raw['attachments'] as unknown[]).length > 0 || Array.isArray(raw['files']) && raw['files'].length > 0, hasRecipients, ...(marker ? { marker } : {}) };
         this.snapshots.set(snapshot, { accountId: session.accountId, raw }); return snapshot;
@@ -269,21 +271,33 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         if (!state || state.accountId !== session.accountId || version(session, snapshot.message, state.raw) !== snapshot.message.version) { throw new MailError('invalid_input'); }
         return state;
     }
+    async verifyAuthoredSource(session: BackendMailSession, snapshot: MessageSnapshot, source: AuthoredSourceDescriptor): Promise<void> {
+        const state = this.state(session, snapshot);
+        if (!source) { throw new MailError('unsupported_content'); }
+        if (source.grade !== 'mcp_authored' || source.accountId !== session.accountId || source.mailboxId !== snapshot.message.mailboxId || source.uid !== snapshot.message.uid || !/^[a-f0-9]{64}$/u.test(source.contentDigest)) { throw new MailError('verification_failed'); }
+        if (state.authored?.digest === source.contentDigest) { return; }
+        // Legacy source rebuilds may pad missing external parts. Only a digest from
+        // a previously verified MCP upload establishes authority; observing bytes cannot.
+        const bytes = await this.source(session, snapshot.message);
+        if (createHash('sha256').update(bytes).digest('hex') !== source.contentDigest) { throw new MailError('verification_failed'); }
+        state.authored = { digest: source.contentDigest, bytes };
+    }
+    private async authoredBytes(session: BackendMailSession, snapshot: MessageSnapshot, source: AuthoredSourceDescriptor): Promise<Buffer> {
+        await this.verifyAuthoredSource(session, snapshot, source);
+        return this.state(session, snapshot).authored?.bytes ?? fail();
+    }
     private checkMarker(session: BackendMailSession, marker: MailOperationMarker): void {
         if (!mailOperationMarkerSchema.safeParse(marker).success || marker.accountId !== session.accountId) { throw new MailError('invalid_input'); }
     }
     private marked(raw: Json, marker: MailOperationMarker): Json { return { ...metadata(raw), [MAIL_OPERATION_METADATA_KEY]: marker }; }
     private async ownedFrom(session: BackendMailSession, desired?: { address: string; name?: string | undefined }): Promise<{ address: string; name?: string | undefined }> {
+        if (desired && !isEmailValid(desired.address, API_EMAIL_OPTIONS)) { throw new MailError('invalid_input'); }
         const user = await this.request(session, '', 'GET');
-        if (id(user['id']) !== session.accountId || typeof user['address'] !== 'string' || !user['address']) { return fail(); }
+        if (id(user['id']) !== session.accountId || typeof user['address'] !== 'string' || !isEmailValid(user['address'], API_EMAIL_OPTIONS)) { return fail(); }
         const address = desired?.address ?? user['address'];
         if (address !== user['address']) {
-            const whitelist = strings(user['fromWhitelist'] ?? []);
-            const allowed = whitelist.some(item => item === address || item.startsWith('*') && address.endsWith(item.slice(1)) || item.endsWith('*') && address.startsWith(item.slice(0, -1)));
-            if (!allowed) {
-                const aliases = await this.request(session, '/addresses', 'GET');
-                if (!Array.isArray(aliases['results']) || aliases['results'].length > 1000 || !aliases['results'].some(item => object(item) && item['address'] === address)) { throw new MailError('forbidden'); }
-            }
+            const aliases = await this.request(session, '/addresses', 'GET');
+            if (address.includes('*') || !Array.isArray(aliases['results']) || aliases['results'].length > 1000 || !aliases['results'].some(item => object(item) && item['address'] === address && !String(item['address']).includes('*'))) { throw new MailError('forbidden'); }
         }
         return desired ?? { address, ...(typeof user['name'] === 'string' && user['name'] ? { name: user['name'] } : {}) };
     }
@@ -293,41 +307,28 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         try {
             const [mailbox, from] = await Promise.all([this.resolveDraftMailbox(session), this.ownedFrom(session, parsed.data.from)]);
             const mime = await createMime({ ...parsed.data, from });
+            const envelope = outbound(mime.envelope); if (envelope.from !== from.address) { throw new MailError('unsupported_content'); }
             const prepared: PreparedDraft = { mailboxId: mailbox.mailboxId, mime, marker };
-            this.preparations.set(prepared, { accountId: session.accountId, envelope: { from: from.address, to: [...new Set([...mime.envelope.to, ...mime.envelope.cc, ...mime.envelope.bcc].map(item => item.address))] },
+            this.preparations.set(prepared, { accountId: session.accountId, envelope,
                 flags: ['\\Seen', '\\Draft'], labels: [], metadata: { [MAIL_OPERATION_METADATA_KEY]: marker }, receivedAt: new Date().toISOString(), files: [] });
             return prepared;
         } catch (error) { return mimeError(error); }
     }
-    async prepareUpdate(session: BackendMailSession, snapshot: MessageSnapshot, patch: DraftPatch, marker: MailOperationMarker): Promise<PreparedDraft> {
+    async prepareUpdate(session: BackendMailSession, snapshot: MessageSnapshot, patch: DraftPatch, marker: MailOperationMarker, trusted: AuthoredSourceDescriptor): Promise<PreparedDraft> {
         const state = this.state(session, snapshot); this.checkMarker(session, marker);
         if (!snapshot.isDraft) { throw new MailError('unsupported_draft'); }
         const parsed = mailInputSchemas.update_draft.safeParse({ ...patch, uid: snapshot.message.uid, expected_version: snapshot.message.version, operation_id: marker.operationId });
         if (!parsed.success) { throw new MailError('invalid_input'); }
         try {
+            const bytes = await this.authoredBytes(session, snapshot, trusted);
             const mailbox = await this.resolveDraftMailbox(session); if (mailbox.mailboxId !== snapshot.message.mailboxId) { throw new MailError('unsupported_draft'); }
             // Raw upload cannot copy received SMTP provenance, expiration or queue/authentication state.
             // Refuse these legacy cases instead of silently replacing them with upload defaults.
             if (!supportedDraftState(state.raw)) { throw new MailError('unsupported_content'); }
-            const envelope = outbound(state.raw);
-            // Upload always materializes an envelope; absence cannot be preserved faithfully.
-            if (!envelope || !envelope.from || !same(Object.keys(state.raw['submissionEnvelope'] as Json).sort(), ['from', 'to'])) { throw new MailError('unsupported_content'); }
-            if (['to', 'cc', 'bcc'].some(key => patch[key as 'to' | 'cc' | 'bcc'] !== undefined)) {
-                const represented = new Set(['to', 'cc', 'bcc'].flatMap(key => addresses(state.raw[key]).map(item => item.address)));
-                if (envelope.to.some(address => !represented.has(address))) { throw new MailError('unsupported_content'); }
-            }
             if (patch.deleteAttachmentIds?.length && Array.isArray(state.raw['files']) && state.raw['files'].length > 0) { throw new MailError('unsupported_content'); }
-            const from = await this.ownedFrom(session, { address: patch.from?.address ?? envelope.from, ...(patch.from?.name === undefined ? {} : { name: patch.from.name }) });
-            const source = await inspectSource(await this.source(session, snapshot.message), (state.raw['attachments'] as Json[]).map(item => ({ attachmentId: string(item['id']), hash: string(item['hash']) })));
+            const source = await inspectSource(bytes, (state.raw['attachments'] as Json[]).map(item => ({ attachmentId: string(item['id']), hash: string(item['hash']) })));
             const mime = await preparePatch(source, patch);
-            const recipients = new Set(envelope.to);
-            const untouched = new Set((['to', 'cc', 'bcc'] as const).filter(key => patch[key] === undefined).flatMap(key => source.envelope[key].map(item => item.address)));
-            for (const key of ['to', 'cc', 'bcc'] as const) {
-                if (patch[key] === undefined) { continue; }
-                for (const old of source.envelope[key]) { if (!untouched.has(old.address)) { recipients.delete(old.address); } }
-                for (const added of patch[key]) { recipients.add(added.address); }
-            }
-            if (recipients.size > 100) { throw new MailError('unsupported_content'); }
+            const envelope = outbound(mime.envelope); await this.ownedFrom(session, { address: envelope.from });
             const flags = strings(state.raw['flags']); const labels = strings(state.raw['labels']);
             if (flags.some(flag => !/^\\(?:draft|deleted)$/iu.test(flag) && !addFlagSchema.safeParse(flag).success) || labels.some(label => !labelSchema.safeParse(label).success)) { throw new MailError('unsupported_content'); }
             const receivedAt = date(state.raw['idate']); if (!receivedAt) { throw new MailError('unsupported_content'); }
@@ -341,7 +342,7 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
             const files = state.raw['files'] === undefined ? [] : state.raw['files'];
             if (!Array.isArray(files) || files.some(file => !object(file) || !ACCOUNT.test(String(file['id'])))) { throw new MailError('unsupported_content'); }
             const prepared: PreparedDraft = { mailboxId: mailbox.mailboxId, mime, marker };
-            this.preparations.set(prepared, { accountId: session.accountId, envelope: { from: from.address, to: [...recipients] }, flags, labels, metadata: this.marked(state.raw, marker), receivedAt, ...(reference ? { reference } : {}), files: files as Json[] });
+            this.preparations.set(prepared, { accountId: session.accountId, envelope, flags, labels, metadata: this.marked(state.raw, marker), receivedAt, ...(reference ? { reference } : {}), files: files as Json[] });
             return prepared;
         } catch (error) { return mimeError(error); }
     }
@@ -368,7 +369,9 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         try { verifyCandidate(prepared.mime, await this.source(session, target)); } catch (error) { return mimeError(error); }
         if (!bool(raw['draft']) || !supportedDraftState(raw)) { throw new MailError('verification_failed'); }
         assertSame(raw['envelope'], { from: '', rcpt: [] });
-        assertSame(outbound(raw), state.envelope); assertSame(metadata(raw), state.metadata); assertSame(date(raw['idate']), state.receivedAt);
+        // The existing API does not expose its private submission envelope. The upload
+        // uses exactly the validated final-MIME envelope; do not claim a read-back proof.
+        assertSame(metadata(raw), state.metadata); assertSame(date(raw['idate']), state.receivedAt);
         assertSame(raw['reference'], state.reference); assertSame(raw['files'] ?? [], state.files);
         setSame(strings(raw['flags']), state.flags); setSame(strings(raw['labels']), state.labels);
         return { ...target, version: digest };
@@ -387,7 +390,7 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         if (sent !== undefined && (!object(sent) || !ACCOUNT.test(String(sent['mailbox'])) || typeof sent['id'] !== 'number' || !Number.isSafeInteger(sent['id']) || sent['id'] < 1 || sent['id'] > 4294967295)) { throw new MailError('verification_failed'); }
         return { queueId, ...(object(sent) ? { sent: { mailboxId: id(sent['mailbox']), uid: uid(sent['id']) } } : {}) };
     }
-    private async verifyMutation(session: BackendMailSession, snapshot: MessageSnapshot, target: MessageKey, before: Buffer, expectedMetadata: Json, expectedFlags?: string[], expectedLabels?: string[]): Promise<VerifiedMessageMutation> {
+    private async verifyMutation(session: BackendMailSession, snapshot: MessageSnapshot, target: MessageKey, before: Buffer, expectedMetadata: Json, expectedFlags?: string[], expectedLabels?: string[], source?: AuthoredSourceDescriptor): Promise<VerifiedMessageMutation> {
         const state = this.state(session, snapshot);
         const { raw, version: digest } = await this.rawMessage(session, target);
         const after = await this.source(session, target);
@@ -402,27 +405,29 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
             assertSame(raw['answered'], flags.has('\\Answered') && !flags.has('$Forwarded')); assertSame(raw['forwarded'], flags.has('$Forwarded'));
         }
         if (expectedLabels) { setSame(strings(raw['labels']), expectedLabels); }
-        return { message: { ...target, version: digest }, contentDigest: createHash('sha256').update(after).digest('hex') };
+        const contentDigest = createHash('sha256').update(after).digest('hex');
+        if (source && contentDigest !== source.contentDigest) { throw new MailError('verification_failed'); }
+        return { message: { ...target, version: digest }, contentDigest, sourceGrade: source ? 'mcp_authored' : 'observed' };
     }
-    async stampSendMarker(session: BackendMailSession, snapshot: MessageSnapshot, marker: MailOperationMarker): Promise<MessageRef> {
+    async stampSendMarker(session: BackendMailSession, snapshot: MessageSnapshot, marker: MailOperationMarker, source: AuthoredSourceDescriptor): Promise<MessageRef> {
         const state = this.state(session, snapshot); this.checkMarker(session, marker);
-        const bytes = await this.source(session, snapshot.message); const metaData = this.marked(state.raw, marker);
+        const bytes = await this.authoredBytes(session, snapshot, source); const metaData = this.marked(state.raw, marker);
         const result = await this.request(session, `/mailboxes/${snapshot.message.mailboxId}/messages/${snapshot.message.uid}`, 'PUT', { metaData });
         if (result['updated'] !== 1) { throw new MailError('verification_failed'); }
-        return (await this.verifyMutation(session, snapshot, snapshot.message, bytes, metaData)).message;
+        return (await this.verifyMutation(session, snapshot, snapshot.message, bytes, metaData, undefined, undefined, source)).message;
     }
-    async moveMessage(session: BackendMailSession, snapshot: MessageSnapshot, destinationMailboxId: string, marker: MailOperationMarker): Promise<VerifiedMessageMutation> {
+    async moveMessage(session: BackendMailSession, snapshot: MessageSnapshot, destinationMailboxId: string, marker: MailOperationMarker, source?: AuthoredSourceDescriptor): Promise<VerifiedMessageMutation> {
         const state = this.state(session, snapshot); this.checkMarker(session, marker);
         if (!mailboxIdSchema.safeParse(destinationMailboxId).success || destinationMailboxId === snapshot.message.mailboxId) { throw new MailError('invalid_input'); }
         const destination = await this.request(session, `/mailboxes/${destinationMailboxId}`, 'GET');
         if (id(destination['id']) !== destinationMailboxId) { throw new MailError('verification_failed'); }
-        const bytes = await this.source(session, snapshot.message); const metaData = this.marked(state.raw, marker);
+        const bytes = source ? await this.authoredBytes(session, snapshot, source) : await this.source(session, snapshot.message); const metaData = this.marked(state.raw, marker);
         const result = await this.request(session, `/mailboxes/${snapshot.message.mailboxId}/messages/${snapshot.message.uid}`, 'PUT', { moveTo: destinationMailboxId, metaData });
         if (result['mailbox'] !== destinationMailboxId || !Array.isArray(result['id']) || result['id'].length !== 1 || !Array.isArray(result['id'][0]) || result['id'][0].length !== 2 || result['id'][0][0] !== snapshot.message.uid) { throw new MailError('verification_failed'); }
         const target = { mailboxId: destinationMailboxId, uid: uid(result['id'][0][1]) };
-        return this.verifyMutation(session, snapshot, target, bytes, metaData);
+        return this.verifyMutation(session, snapshot, target, bytes, metaData, undefined, undefined, source);
     }
-    async updateMessageFlags(session: BackendMailSession, snapshot: MessageSnapshot, patch: MailInput<'update_message_flags'>, marker: MailOperationMarker): Promise<VerifiedMessageMutation> {
+    async updateMessageFlags(session: BackendMailSession, snapshot: MessageSnapshot, patch: MailInput<'update_message_flags'>, marker: MailOperationMarker, source?: AuthoredSourceDescriptor): Promise<VerifiedMessageMutation> {
         const state = this.state(session, snapshot); this.checkMarker(session, marker);
         const parsed = mailInputSchemas.update_message_flags.safeParse(patch);
         if (!parsed.success || patch.mailboxId !== snapshot.message.mailboxId || patch.uid !== snapshot.message.uid || patch.expected_version !== snapshot.message.version) { throw new MailError('invalid_input'); }
@@ -431,11 +436,11 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         for (const [key, flag] of [['seen', '\\Seen'], ['flagged', '\\Flagged']] as const) { if (patch[key] === true) { flags.add(flag); } else if (patch[key] === false) { flags.delete(flag); } }
         const labels = new Set(patch.labels ?? strings(state.raw['labels']));
         for (const value of patch.removeLabels ?? []) { labels.delete(value); } for (const value of patch.addLabels ?? []) { labels.add(value); }
-        const bytes = await this.source(session, snapshot.message); const metaData = this.marked(state.raw, marker); const body: Json = { metaData };
+        const bytes = source ? await this.authoredBytes(session, snapshot, source) : await this.source(session, snapshot.message); const metaData = this.marked(state.raw, marker); const body: Json = { metaData };
         for (const key of ['seen', 'flagged', 'addFlags', 'removeFlags', 'labels', 'addLabels', 'removeLabels'] as const) { if (patch[key] !== undefined) { body[key] = patch[key]; } }
         const result = await this.request(session, `/mailboxes/${snapshot.message.mailboxId}/messages/${snapshot.message.uid}`, 'PUT', body);
         if (result['updated'] !== 1) { throw new MailError('verification_failed'); }
-        const verified = await this.verifyMutation(session, snapshot, snapshot.message, bytes, metaData, [...flags], [...labels]);
+        const verified = await this.verifyMutation(session, snapshot, snapshot.message, bytes, metaData, [...flags], [...labels], source);
         return verified;
     }
 }

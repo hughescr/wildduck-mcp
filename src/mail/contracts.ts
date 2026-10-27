@@ -1,7 +1,7 @@
 import type { ConnectionStatus } from '../auth/contracts';
 import type { PreparedMime } from './mime';
-import type { ConfirmedReceipt, DraftContent, DraftPatch, FailedReceipt, MailFailureCode, Mailbox, MailInput, MailOperationMarker, MailOutput, MailReceipt, MailToolName, MailWriteTool, MessageKey, MessageRef, UnknownReceipt } from './schemas';
-export type { ActivationProof, AttachmentMetadata, CompletedReceipt, ConfirmedReceipt, DraftAddress, DraftContent, DraftPatch, DraftRef, FailedReceipt, MailAddress, Mailbox, MailFailureCode, MailInput, MailInputRaw, MailOperationMarker, MailOutput, MailReceipt, MailToolName, MailWriteTool, MessageFlags, MessageKey, MessageRef, MessageSummary, NewAttachment, PartialReceipt, UnknownReceipt } from './schemas';
+import type { ConfirmedReceipt, DraftContent, DraftPatch, FailedReceipt, MailFailureCode, Mailbox, MailInput, MailOperationMarker, MailOutput, MailReceipt, MailToolName, MailWriteTool, MessageKey, MessageRef, SourceGrade, UnknownReceipt } from './schemas';
+export type { ActivationProof, AttachmentMetadata, CompletedReceipt, ConfirmedReceipt, DraftAddress, DraftContent, DraftPatch, DraftRef, FailedReceipt, MailAddress, Mailbox, MailFailureCode, MailInput, MailInputRaw, MailOperationMarker, MailOutput, MailReceipt, MailToolName, MailWriteTool, MessageFlags, MessageKey, MessageRef, MessageSummary, NewAttachment, PartialReceipt, SourceGrade, UnknownReceipt } from './schemas';
 
 /** Catch/map only code. Never expose raw upstream errors, bodies, causes or tokens. */
 export class MailError extends Error {
@@ -37,41 +37,61 @@ export interface MessageSnapshot {
 export interface PreparedDraft {
     readonly mailboxId: string; readonly mime: PreparedMime; readonly marker: MailOperationMarker;
 }
-/** Backend-verified exact raw-source SHA-256 (64 lowercase hexadecimal characters),
- * distinct from the mutation-relevant snapshot version. Never fabricate this proof. */
-export interface VerifiedMessageMutation { readonly message: MessageRef; readonly contentDigest: string }
+/** SHA-256 hex64 observation hash, separate from snapshot version. Authored grade
+ * additionally requires trusted prepared-byte provenance plus matching source hashes;
+ * observed hashes do not establish hidden submission-envelope equivalence. */
+export interface VerifiedMessageMutation { readonly message: MessageRef; readonly contentDigest: string; readonly sourceGrade: SourceGrade }
+/** Trusted descriptor derived only from a durable validated receipt for this exact
+ * account/mailbox/UID. Never construct from tool arguments, raw upstream markers
+ * or an observed source. Digest is exact MCP-authored source SHA-256, hex64. */
+export interface AuthoredSourceDescriptor {
+    readonly grade: 'mcp_authored'; readonly accountId: string; readonly mailboxId: string; readonly uid: number; readonly contentDigest: string;
+}
 export interface MailBackendWriter {
     /** Resolve unique specialUse=\\Drafts, never assume a path or caller mailbox. */
     resolveDraftMailbox(session: BackendMailSession): Promise<Mailbox>;
-    /** Same digest helper as readMessage: SHA-256 base64url of account/mailbox/UID
-     * and FULL UNTRUNCATED raw snapshot: envelope including all Bcc, from/replyTo/
-     * to/cc/bcc, subject/messageId/references/date/idate, complete TEXT and HTML,
-     * attachment identities/metadata, draft state, raw flags, forwarded, labels,
-     * references and custom metadata. Recursively sort JSON keys, preserve array
-     * order/exact strings and consistently represent optional missing/null fields.
-     * Never hash normalized/truncated public output. No upstream modseq/CAS exists;
-     * external webmail/IMAP can still race the inspection and subsequent dispatch. */
+    /** Same snapshot digest helper as readMessage: SHA-256 base64url binds account,
+     * mailbox/UID and the full AVAILABLE existing-API response before our local
+     * truncation/normalization: addresses, normalized body fields, attachment/file
+     * metadata, flags, labels, references and custom metadata. The provider itself
+     * caps normalized text/HTML and does not expose a full hidden submission
+     * envelope; this snapshot version cannot prove those omitted bytes or fields.
+     * Recursively sort JSON keys, preserve exact available strings/array order.
+     * Full authored MIME SHA-256 is a separate durable contentDigest, checked against
+     * source bytes before edit/send. No upstream modseq/CAS exists; external
+     * webmail/IMAP can still race inspection and subsequent dispatch. */
     inspectMessage(session: BackendMailSession, target: MessageKey): Promise<MessageSnapshot>;
+    /** Read the existing API source and require exact identity + SHA-256 match to
+     * trusted authored bytes BEFORE markDispatched. A failure is preflight, never
+     * a reason to reconstruct hidden recipient data. Cache validated bytes only
+     * within the request; send stamping must consume this verified source. */
+    verifyAuthoredSource(session: BackendMailSession, snapshot: MessageSnapshot, source: AuthoredSourceDescriptor): Promise<void>;
     /** Read/validate/compose completely BEFORE markDispatched. Pick owned default
      * From when omitted. Patch omissions preserve exact existing MIME and files. */
     prepareCreate(session: BackendMailSession, input: DraftContent, marker: MailOperationMarker): Promise<PreparedDraft>;
-    prepareUpdate(session: BackendMailSession, snapshot: MessageSnapshot, patch: DraftPatch, marker: MailOperationMarker): Promise<PreparedDraft>;
+    prepareUpdate(session: BackendMailSession, snapshot: MessageSnapshot, patch: DraftPatch, marker: MailOperationMarker, source: AuthoredSourceDescriptor): Promise<PreparedDraft>;
     /** Single raw upload WITH marker before visibility; NEVER replacePrevious. */
     uploadPreparedDraft(session: BackendMailSession, prepared: PreparedDraft): Promise<MessageKey>;
-    /** Strict source bytes + envelope/flags/labels/references/custom metadata proof. */
+    /** Compare source bytes exactly against trusted prepared MIME and verify API-
+     * visible flags/labels/references/custom metadata. Recipient preservation relies
+     * on the existing raw upload contract using header-derived structured fields,
+     * not an independent GET proof of a hidden private submission envelope. */
     verifyPreparedDraft(session: BackendMailSession, target: MessageKey, prepared: PreparedDraft): Promise<MessageRef>;
     /** Coordinator first checks canonical draft, marker activation, candidate proof
      * where relevant, and fresh original version. No silent delete-after-timeout. */
     deleteDraft(session: BackendMailSession, target: MessageKey): Promise<void>;
     /** After markDispatched: metadata-only PUT, then verify content unchanged.
      * Automatic Sent move inherits this SEND marker. */
-    stampSendMarker(session: BackendMailSession, snapshot: MessageSnapshot, marker: MailOperationMarker): Promise<MessageRef>;
+    stampSendMarker(session: BackendMailSession, snapshot: MessageSnapshot, marker: MailOperationMarker, source: AuthoredSourceDescriptor): Promise<MessageRef>;
     /** Queue acceptance, never delivery. Return Sent key only from actual response. */
     submitDraft(session: BackendMailSession, target: MessageKey): Promise<{ queueId: string; sent?: MessageKey }>;
-    /** Move+marker and verify new mapping/content/flags. Never silently relax target. */
-    moveMessage(session: BackendMailSession, snapshot: MessageSnapshot, destinationMailboxId: string, marker: MailOperationMarker): Promise<VerifiedMessageMutation>;
-    /** PUT requested flags/labels+marker, GET and verify actual requested state. */
-    updateMessageFlags(session: BackendMailSession, snapshot: MessageSnapshot, patch: MailInput<'update_message_flags'>, marker: MailOperationMarker): Promise<VerifiedMessageMutation>;
+    /** Move+marker and verify new mapping/content/flags. Carry authored grade only
+     * when trusted descriptor matches both pre/post source SHA; otherwise observed. */
+    moveMessage(session: BackendMailSession, snapshot: MessageSnapshot, destinationMailboxId: string, marker: MailOperationMarker, source?: AuthoredSourceDescriptor): Promise<VerifiedMessageMutation>;
+    /** PUT requested flags/labels+marker, GET and verify requested state. Authored
+     * grade requires trusted descriptor and equal pre/post source SHA; never infer
+     * it from a marker or newly observed raw source alone. */
+    updateMessageFlags(session: BackendMailSession, snapshot: MessageSnapshot, patch: MailInput<'update_message_flags'>, marker: MailOperationMarker, source?: AuthoredSourceDescriptor): Promise<VerifiedMessageMutation>;
 }
 export interface OperationKey { readonly accountId: string; readonly clientIdHash: string; readonly operationId: string }
 export type WriteIntent = OperationKey & { readonly payloadDigest: string } & (
@@ -121,7 +141,9 @@ export interface MailOperationStore {
      * original_verification_failed NEVER activate.
      * Unverified/unknown/stale candidates remain fenced. Exact activation proof binds
      * account/mailbox/UID; later flag changes do not invalidate historical identity.
-     * Send's actual receipt.sent key can activate the inherited SEND marker.
+     * SourceGrade authored starts only at create/update exact candidate byte proof;
+     * move/flags carry it only with trusted prior proof + unchanged raw SHA.
+     * Send's actual receipt.sent key activates only as observed, never authored.
      * Flags receipt stays minimal; replay neither refetches nor echoes current sets. */
     complete(claim: OperationClaim<'dispatched'>, receipt: ConfirmedReceipt): Promise<void>;
     /** Any unproved post-dispatch outcome permanently fences the target. */

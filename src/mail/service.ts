@@ -1,11 +1,12 @@
 import { digest, randomId } from '../auth/crypto';
-import { MailError, type ActivationProof, type AttachmentDownload, type BackendMailSession, type ConfirmedReceipt, type FailedReceipt, type MailBackendReader, type MailBackendWriter, type MailContext, type MailInput, type MailOperationMarker, type MailOperationRecord, type MailOperationStore, type MailOutput, type MailService, type MailToolName, type MailWriteTool, type MessageKey, type MessageRef, type MessageSnapshot, type OperationClaim, type OperationKey, type PreparedDraft, type UnknownReceipt, type WriteIntent } from './contracts';
+import { MailError, type ActivationProof, type AuthoredSourceDescriptor, type SourceGrade, type AttachmentDownload, type BackendMailSession, type ConfirmedReceipt, type FailedReceipt, type MailBackendReader, type MailBackendWriter, type MailContext, type MailInput, type MailOperationMarker, type MailOperationRecord, type MailOperationStore, type MailOutput, type MailService, type MailToolName, type MailWriteTool, type MessageKey, type MessageRef, type MessageSnapshot, type OperationClaim, type OperationKey, type PreparedDraft, type UnknownReceipt, type WriteIntent } from './contracts';
 import { activationProofSchema, draftContentSchema, failureReasonSchema, mailboxSchema, mailInputSchemas, mailOperationMarkerSchema, mailOutputSchemas, messageKeySchema, messageRefSchema } from './schemas';
 
 interface Dependencies { reader: MailBackendReader; writer: MailBackendWriter; operations: MailOperationStore }
 type WriteInput = MailInput<MailWriteTool>;
 type ReadTool = Exclude<MailToolName, MailWriteTool | 'read_attachment'>;
 type Verification = 'verified' | 'pending' | 'outcome_unknown' | 'unverified';
+interface Provenance { verification: Verification; source?: AuthoredSourceDescriptor }
 const temporary = () => new MailError('temporarily_unavailable');
 function sanitized(error: unknown): MailError {
     const code = error instanceof MailError ? failureReasonSchema.safeParse(error.code) : undefined;
@@ -49,44 +50,50 @@ function receipt(tool: MailWriteTool, record: MailOperationRecord): MailOutput<M
     if (!['completed', 'queued', 'partial', 'failed', 'outcome_unknown'].includes(record.receipt.status)) { throw temporary(); }
     return output(tool, record.receipt);
 }
-function proof(accountId: string, message: MessageRef, contentDigest: string): ActivationProof {
-    const result = activationProofSchema.safeParse({ accountId, ...message, contentDigest });
+function proof(accountId: string, message: MessageRef, contentDigest: string, sourceGrade: SourceGrade): ActivationProof {
+    const result = activationProofSchema.safeParse({ accountId, ...message, contentDigest, sourceGrade });
     if (!result.success) { throw temporary(); }
     return result.data;
 }
 
 /** Every mutation has a durable receipt and an account-wide message fence. */
 export function createMailService({ reader, writer, operations }: Dependencies): MailService {
-    async function verification(bound: BackendMailSession, target: MessageKey, rawMarker: MailOperationMarker): Promise<Verification> {
+    async function provenance(bound: BackendMailSession, target: MessageKey, rawMarker: MailOperationMarker): Promise<Provenance> {
         const parsed = mailOperationMarkerSchema.safeParse(rawMarker);
-        if (!parsed.success || parsed.data.accountId !== bound.accountId) { return 'unverified'; }
+        if (!parsed.success || parsed.data.accountId !== bound.accountId) { return { verification: 'unverified' }; }
         const marker = parsed.data;
         const record = await operations.getOperation({ accountId: marker.accountId, clientIdHash: marker.clientIdHash, operationId: marker.operationId });
-        if (!record || !sameKey(record.key, marker) || !sameKey(record.intent, marker) || record.intent.tool !== marker.tool || record.intent.payloadDigest !== marker.payloadDigest) { return 'unverified'; }
-        if (record.state === 'reserved') { return 'pending'; }
-        if (record.state === 'dispatched') { return 'outcome_unknown'; }
+        if (!record || !sameKey(record.key, marker) || !sameKey(record.intent, marker) || record.intent.tool !== marker.tool || record.intent.payloadDigest !== marker.payloadDigest) { return { verification: 'unverified' }; }
+        if (record.state === 'reserved') { return { verification: 'pending' }; }
+        if (record.state === 'dispatched') { return { verification: 'outcome_unknown' }; }
         const result = receipt(marker.tool, record);
-        if (result.status === 'outcome_unknown') { return 'outcome_unknown'; }
-        if (result.status === 'queued') { return result.sent && sameMessage(result.sent, target) ? 'verified' : 'unverified'; }
-        // Identity is historical. Later flag/version changes do not invalidate an
-        // activated account/mailbox/UID, nor can fresh expected_version activate it.
+        if (result.status === 'outcome_unknown') { return { verification: 'outcome_unknown' }; }
+        // Submission changes MIME. A real Sent identity activates the marker but
+        // never inherits authored-byte provenance from the submitted draft.
+        if (result.status === 'queued') { return { verification: result.sent && sameMessage(result.sent, target) ? 'verified' : 'unverified' }; }
         if ('proof' in result && result.proof.accountId === bound.accountId && sameMessage(result.proof, target)) {
-            if (result.status === 'completed') { return 'verified'; }
-            if (result.status === 'partial' && result.candidateVerified && ['original_deletion_failed', 'original_deletion_unconfirmed'].includes(result.reason)) { return 'verified'; }
+            const active = result.status === 'completed' || (result.status === 'partial' && result.candidateVerified && ['original_deletion_failed', 'original_deletion_unconfirmed'].includes(result.reason));
+            if (active) {
+                // Only the parsed durable receipt grants this descriptor. Fresh
+                // snapshot versions and upstream markers cannot author legacy mail.
+                const source = result.proof.sourceGrade === 'mcp_authored' ? {
+                    grade: 'mcp_authored' as const, accountId: bound.accountId,
+                    mailboxId: target.mailboxId, uid: target.uid, contentDigest: result.proof.contentDigest,
+                } : undefined;
+                return { verification: 'verified', ...(source ? { source } : {}) };
+            }
         }
-        return 'unverified';
+        return { verification: 'unverified' };
     }
-    async function activated(bound: BackendMailSession, snapshot: MessageSnapshot): Promise<void> {
-        if (snapshot.marker && await verification(bound, snapshot.message, snapshot.marker) !== 'verified') { throw new MailError('verification_failed'); }
-    }
-    async function inspect(bound: BackendMailSession, target: MessageKey, expectedVersion: string, requireDraft: boolean): Promise<MessageSnapshot> {
+    async function inspect(bound: BackendMailSession, target: MessageKey, expectedVersion: string, requireDraft: boolean): Promise<{ snapshot: MessageSnapshot; source?: AuthoredSourceDescriptor }> {
         const snapshot = await writer.inspectMessage(bound, target);
         const message = messageRefSchema.parse(snapshot.message);
         if (!sameMessage(message, target) || typeof snapshot.isDraft !== 'boolean' || typeof snapshot.hasHtml !== 'boolean' || typeof snapshot.hasAttachments !== 'boolean' || typeof snapshot.hasRecipients !== 'boolean') { throw temporary(); }
-        await activated(bound, snapshot);
+        const trusted = snapshot.marker ? await provenance(bound, target, snapshot.marker) : undefined;
+        if (trusted && trusted.verification !== 'verified') { throw new MailError('verification_failed'); }
         if (message.version !== expectedVersion) { throw new MailError('version_conflict'); }
         if (requireDraft && !snapshot.isDraft) { throw new MailError('unsupported_draft'); }
-        return snapshot;
+        return { snapshot, ...(trusted?.source ? { source: trusted.source } : {}) };
     }
     async function read<Name extends ReadTool>(tool: Name, context: MailContext, raw: MailInput<Name>): Promise<MailOutput<Name>> {
         const bound = session(context, 'mail:read'); const parsed = input(tool, raw);
@@ -100,7 +107,7 @@ export function createMailService({ reader, writer, operations }: Dependencies):
                     const read = await reader.readMessage(bound, parsed as MailInput<'read_message'>);
                     if (!sameMessage(read.message, parsed as MailInput<'read_message'>)) { throw temporary(); }
                     const { managedOperation: _managedOperation, ...message } = read.message;
-                    result = read.marker ? { ...message, managedOperation: { operationId: mailOperationMarkerSchema.parse(read.marker).operationId, verification: await verification(bound, message, read.marker) } } : message;
+                    result = read.marker ? { ...message, managedOperation: { operationId: mailOperationMarkerSchema.parse(read.marker).operationId, verification: (await provenance(bound, message, read.marker)).verification } } : message;
                     break;
                 }
             }
@@ -148,18 +155,21 @@ export function createMailService({ reader, writer, operations }: Dependencies):
             claim = reservation.claim;
             if (claim.state !== 'reserved' || !sameKey(claim.key, key) || claim.ownerToken !== ownerToken || !Number.isSafeInteger(claim.revision) || claim.revision < 0) { throw temporary(); }
         } catch (error) { throw sanitized(error); }
-        let snapshot: MessageSnapshot | undefined; let prepared: PreparedDraft | undefined;
+        let source: AuthoredSourceDescriptor | undefined; let snapshot: MessageSnapshot | undefined; let prepared: PreparedDraft | undefined;
         try {
             if (intent.tool !== 'create_draft') {
-                snapshot = await inspect(bound, intent.target, intent.expectedVersion, tool !== 'move_message' && tool !== 'update_message_flags');
+                const inspected = await inspect(bound, intent.target, intent.expectedVersion, tool !== 'move_message' && tool !== 'update_message_flags');
+                snapshot = inspected.snapshot; source = inspected.source;
+                if ((tool === 'update_draft' || tool === 'send_draft') && !source) { throw new MailError('unsupported_content'); }
+                if (source && ['send_draft', 'move_message', 'update_message_flags'].includes(tool)) { await writer.verifyAuthoredSource(bound, snapshot, source); }
                 if (tool === 'send_draft' && !snapshot.hasRecipients) { throw new MailError('no_recipients'); }
             }
             if (tool === 'create_draft') {
                 const { operation_id: _id, ...content } = parsed as MailInput<'create_draft'>;
                 prepared = await writer.prepareCreate(bound, draftContentSchema.parse(content), marker);
-            } else if (tool === 'update_draft' && snapshot) {
+            } else if (tool === 'update_draft' && snapshot && source) {
                 const { operation_id: _id, uid: _uid, expected_version: _version, ...patch } = parsed as MailInput<'update_draft'>;
-                prepared = await writer.prepareUpdate(bound, snapshot, patch, marker);
+                prepared = await writer.prepareUpdate(bound, snapshot, patch, marker, source);
             }
             if ((tool === 'create_draft' || tool === 'update_draft') && !prepared) { throw temporary(); }
             if (prepared && (prepared.mailboxId !== mailboxId || stable(mailOperationMarkerSchema.parse(prepared.marker)) !== stable(marker) || !/^[a-f0-9]{64}$/u.test(prepared.mime.sha256))) { throw temporary(); }
@@ -211,7 +221,7 @@ export function createMailService({ reader, writer, operations }: Dependencies):
                 } catch {
                     return await finish({ status: 'partial', operation_id: key.operationId, candidate, candidateVerified: false, reason: 'candidate_verification_failed', originalDeletion: 'not_attempted' });
                 }
-                const activation = proof(bound.accountId, verified, prepared.mime.sha256);
+                const activation = proof(bound.accountId, verified, prepared.mime.sha256, 'mcp_authored');
                 if (intent.tool === 'create_draft') { return await finish({ status: 'completed', operation_id: key.operationId, draft: verified, verified: true, proof: activation }); }
                 try { await inspect(bound, intent.target, intent.expectedVersion, true); } catch (error) {
                     return await finish({ status: 'partial', operation_id: key.operationId, candidate: verified, candidateVerified: true, proof: activation, reason: error instanceof MailError && error.code === 'version_conflict' ? 'original_version_changed' : 'original_verification_failed', originalDeletion: 'not_attempted' });
@@ -228,17 +238,19 @@ export function createMailService({ reader, writer, operations }: Dependencies):
                 return await finish({ status: 'completed', operation_id: key.operationId, deleted: intent.target });
             }
             if (tool === 'send_draft') {
-                const stamped = messageRefSchema.parse(await writer.stampSendMarker(bound, snapshot, marker));
+                if (!source) { throw temporary(); }
+                const stamped = messageRefSchema.parse(await writer.stampSendMarker(bound, snapshot, marker, source));
                 if (!sameMessage(stamped, intent.target)) { throw temporary(); }
                 const result = await writer.submitDraft(bound, intent.target);
                 return await finish({ status: 'queued', operation_id: key.operationId, queueId: result.queueId, ...(result.sent === undefined ? {} : { sent: messageKeySchema.parse(result.sent) }) });
             }
             const mutation = tool === 'move_message'
-                ? await writer.moveMessage(bound, snapshot, (parsed as MailInput<'move_message'>).destinationMailboxId, marker)
-                : await writer.updateMessageFlags(bound, snapshot, parsed as MailInput<'update_message_flags'>, marker);
+                ? await writer.moveMessage(bound, snapshot, (parsed as MailInput<'move_message'>).destinationMailboxId, marker, source)
+                : await writer.updateMessageFlags(bound, snapshot, parsed as MailInput<'update_message_flags'>, marker, source);
             const message = messageRefSchema.parse(mutation.message);
             if (tool === 'move_message' ? message.mailboxId !== (parsed as MailInput<'move_message'>).destinationMailboxId : !sameMessage(message, intent.target)) { throw temporary(); }
-            return await finish({ status: 'completed', operation_id: key.operationId, message, verified: true, proof: proof(bound.accountId, message, mutation.contentDigest) });
+            if (source ? mutation.sourceGrade !== 'mcp_authored' || mutation.contentDigest !== source.contentDigest : mutation.sourceGrade !== 'observed') { throw temporary(); }
+            return await finish({ status: 'completed', operation_id: key.operationId, message, verified: true, proof: proof(bound.accountId, message, mutation.contentDigest, mutation.sourceGrade) });
         } catch { return uncertain(dispatched); }
     }
     return {

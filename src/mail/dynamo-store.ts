@@ -36,6 +36,7 @@ function parse<Schema extends z.ZodType>(schema: Schema, value: unknown): z.outp
     return result.data;
 }
 function receiptFor(intent: WriteIntent, value: unknown): MailReceipt {
+    // Schema validation preserves the supplied grade; absent/invalid grades are never inferred.
     const receipt = parse(mailOutputSchemas[intent.tool], value);
     if (!['completed', 'partial', 'queued', 'failed', 'outcome_unknown'].includes(receipt.status) || receipt.operation_id !== intent.operationId) { throw unavailable(); }
     if (intent.tool === 'delete_draft' && receipt.status === 'completed' && 'deleted' in receipt && !equal(receipt.deleted, intent.target)) { throw unavailable(); }

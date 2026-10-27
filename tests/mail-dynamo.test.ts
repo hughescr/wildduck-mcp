@@ -3,12 +3,12 @@ import { isDeepStrictEqual } from 'node:util';
 import { GetCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import type { DynamoSender } from '../src/auth/dynamo-store';
 import { DynamoMailOperationStore } from '../src/mail/dynamo-store';
-import type { ConfirmedReceipt, MailOperationStore, OperationClaim, OperationKey, WriteIntent } from '../src/mail/contracts';
+import type { ConfirmedReceipt, MailOperationStore, OperationClaim, OperationKey, SourceGrade, WriteIntent } from '../src/mail/contracts';
 const mailboxId = 'a'.repeat(24); const digest = 'd'.repeat(43); const owner = 'owner-token-'.padEnd(43, 'a');
 const key = (operationId = 'operation-00000001', clientIdHash = 'c'.repeat(43), accountId = '1'.repeat(24)): OperationKey => ({ accountId, clientIdHash, operationId });
 const intent = (operationId = 'operation-00000001', tool: Exclude<WriteIntent['tool'], 'create_draft'> = 'send_draft'): Exclude<WriteIntent, { tool: 'create_draft' }> => ({ ...key(operationId), tool, payloadDigest: digest, target: { mailboxId, uid: 1 }, expectedVersion: digest });
-const verifiedDraft = (uid: number, targetMailbox = mailboxId) => ({ draft: { mailboxId: targetMailbox, uid, version: digest }, verified: true as const, proof: { accountId: key().accountId, mailboxId: targetMailbox, uid, version: digest, contentDigest: 'a'.repeat(64) } });
-const verifiedMessage = (uid: number, targetMailbox = mailboxId) => { const { draft, ...proof } = verifiedDraft(uid, targetMailbox); return { message: draft, ...proof }; };
+const verifiedDraft = (uid: number, targetMailbox = mailboxId) => ({ draft: { mailboxId: targetMailbox, uid, version: digest }, verified: true as const, proof: { accountId: key().accountId, mailboxId: targetMailbox, uid, version: digest, contentDigest: 'a'.repeat(64), sourceGrade: 'mcp_authored' as const } });
+const verifiedMessage = (uid: number, targetMailbox = mailboxId, sourceGrade: SourceGrade = 'observed') => { const { draft, verified, proof } = verifiedDraft(uid, targetMailbox); return { message: draft, verified, proof: { ...proof, sourceGrade } }; };
 const claim = async (store: MailOperationStore, value: WriteIntent): Promise<OperationClaim<'reserved'>> => { const result = await store.reserve(value, owner); expect(result.kind).toBe('acquired'); if (result.kind !== 'acquired') { throw new Error('expected acquisition'); } return result.claim; };
 class ModelSender implements DynamoSender {
     readonly records = new Map<string, Record<string, unknown>>();
@@ -107,9 +107,28 @@ async function expandedMatrix(store: MailOperationStore): Promise<void> {
     const sentRecord = await store.getOperation(key(sending.operationId));
     if (sentRecord?.state === 'settled') { expect(sentRecord.receipt).toEqual({ status: 'queued', operation_id: sending.operationId, queueId: 'actual-queue', sent }); } else { throw new Error('missing send receipt'); }
 }
+async function provenanceMatrix(store: MailOperationStore): Promise<void> {
+    let uid = 300;
+    for (const tool of ['move_message', 'update_message_flags'] as const) {
+        for (const grade of ['observed', 'mcp_authored'] as const) {
+            const operationId = `operation-provenance${uid}`;
+            const value = { ...intent(operationId, tool), target: { mailboxId, uid } };
+            const message = verifiedMessage(uid, tool === 'move_message' ? 'b'.repeat(24) : mailboxId, grade);
+            const receipt = { status: 'completed' as const, operation_id: operationId, ...message };
+            await store.complete(await store.markDispatched(await claim(store, value)), receipt);
+            const stored = await store.getOperation(key(operationId));
+            expect(stored?.state).toBe('settled');
+            if (stored?.state === 'settled') { expect(stored.receipt).toEqual(receipt); }
+            const replay = await store.reserve(value, owner);
+            expect(replay.kind).toBe('replay');
+            if (replay.kind === 'replay' && replay.record.state === 'settled') { expect(replay.record.receipt).toEqual(receipt); }
+            uid++;
+        }
+    }
+}
 describe('Dynamo mail operation adapter', () => {
     test('atomic lifecycle matrix preserves receipts, shared fences, preflight release and permanent retirement', async () => {
-        const { client, store } = fixture(); await lifecycleMatrix(store); await expandedMatrix(store);
+        const { client, store } = fixture(); await lifecycleMatrix(store); await expandedMatrix(store); await provenanceMatrix(store);
         expect(client.calls.filter(command => command instanceof GetCommand).every(command => command.input.ConsistentRead === true)).toBe(true);
         for (const [pk, record] of client.records) {
             expect(pk.startsWith('wildduck-mcp#mail-')).toBe(true); expect(record.sk).toBe('STATE');
@@ -222,7 +241,38 @@ describe('Dynamo mail operation adapter', () => {
             expect(client.calls.filter(command => command instanceof TransactWriteCommand)).toHaveLength(count);
         }
     });
+    test('draft receipts require authored proof, never upgrade observed or absent provenance', async () => {
+        for (const tool of ['create_draft', 'update_draft'] as const) {
+            const { client, store } = fixture();
+            const value: WriteIntent = tool === 'create_draft' ? { ...key(), tool, payloadDigest: digest } : intent(key().operationId, tool);
+            const dispatched = await store.markDispatched(await claim(store, value));
+            const valid = { status: 'completed' as const, operation_id: value.operationId, ...verifiedDraft(2), ...(tool === 'update_draft' ? { previousDeleted: true as const } : {}) };
+            const writes = client.calls.filter(command => command instanceof TransactWriteCommand).length;
+            const { sourceGrade: _grade, ...missingGrade } = valid.proof;
+            for (const proof of [missingGrade, { ...valid.proof, sourceGrade: 'observed' }, { ...valid.proof, sourceGrade: 'invented_grade' }]) {
+                await expect(store.complete(dispatched, { ...valid, proof } as unknown as ConfirmedReceipt)).rejects.toThrow('temporarily_unavailable');
+            }
+            if (tool === 'update_draft') {
+                await expect(store.complete(dispatched, { status: 'partial', operation_id: value.operationId, candidate: verifiedDraft(2).draft, candidateVerified: true, proof: { ...valid.proof, sourceGrade: 'observed' }, reason: 'original_deletion_failed', originalDeletion: 'failed' } as unknown as ConfirmedReceipt)).rejects.toThrow('temporarily_unavailable');
+            }
+            expect(client.calls.filter(command => command instanceof TransactWriteCommand)).toHaveLength(writes);
+            await store.complete(dispatched, valid as ConfirmedReceipt);
+            const stored = await store.getOperation(key());
+            if (stored?.state !== 'settled') { throw new Error('missing authored receipt'); }
+            expect(stored.receipt).toEqual(valid);
+        }
+    });
+    test('persisted proof without a provenance grade fails closed rather than migrating to authored', async () => {
+        const { client, store } = fixture(); const value = intent('operation-provenance1', 'update_message_flags');
+        await store.complete(await store.markDispatched(await claim(store, value)), { status: 'completed', operation_id: value.operationId, ...verifiedMessage(1) });
+        const row = [...client.records.values()].find(record => String(record.pk).includes('#mail-operation#'));
+        if (!row) { throw new Error('missing operation'); }
+        const record = row.record as { receipt: { proof: Record<string, unknown> } };
+        delete record.receipt.proof.sourceGrade;
+        await expect(store.getOperation(key(value.operationId))).rejects.toThrow('temporarily_unavailable');
+    });
     test('whole request deadline bounds stalled SDK transport and aborts it', async () => {
+
 
         let signal: AbortSignal | undefined;
         const store = new DynamoMailOperationStore({ tableName: 'MailTable', timeoutMs: 5, client: { send(_command, options) { signal = options?.abortSignal; return new Promise(() => {}); } } });
@@ -238,7 +288,7 @@ test.skipIf(process.env.DYNAMO_LOCAL_MAIL_TEST !== '1')('actual DynamoDB Local m
     try {
         await client.send(new CreateTableCommand({ TableName: tableName, AttributeDefinitions: [{ AttributeName: 'pk', AttributeType: 'S' }, { AttributeName: 'sk', AttributeType: 'S' }], KeySchema: [{ AttributeName: 'pk', KeyType: 'HASH' }, { AttributeName: 'sk', KeyType: 'RANGE' }], ProvisionedThroughput: { ReadCapacityUnits: 1, WriteCapacityUnits: 1 } }));
         const store = new DynamoMailOperationStore({ tableName, client: DynamoDBDocumentClient.from(client) });
-        await lifecycleMatrix(store); await expandedMatrix(store);
+        await lifecycleMatrix(store); await expandedMatrix(store); await provenanceMatrix(store);
         const fresh = { ...intent('operation-concurrency01'), target: { mailboxId, uid: 100 } };
         const racing = await Promise.all([store.reserve(fresh, owner), store.reserve({ ...fresh, operationId: 'operation-concurrency02', clientIdHash: 'q'.repeat(43) }, owner)]);
         expect(racing.map(result => result.kind).sort()).toEqual(['acquired', 'conflict']);

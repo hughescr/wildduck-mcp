@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test';
+import { isEmailValid } from '@hapi/address';
 import { MailError } from '../src/mail/contracts';
 import { McpServer, WebStandardStreamableHTTPServerTransport, type StandardSchemaWithJSON } from '@modelcontextprotocol/server';
 import { mailInputSchemas, mailOutputSchemas, draftContentSchema, inputAddressSchema, outputAddressSchema, operationIdSchema, versionSchema, MAX_DRAFT_TEXT_BYTES, MAX_SUBJECT_BYTES, MAX_ATTACHMENT_BYTES, MAX_HTML_BYTES } from '../src/mail/schemas';
@@ -9,7 +10,7 @@ const body = { text: 'First line\nSecond line\r\nThird line', html: null };
 const draft = { to: [{ address: 'recipient@example.invalid', name: 'Recipient' }], subject: 'Hello', body };
 const attachment = { filename: 'hello.txt', contentType: 'text/plain', contentBase64: Buffer.from('hello').toString('base64') };
 const ref = { mailboxId, uid: 2, version: expected_version };
-const proof = { ...ref, accountId: mailboxId, contentDigest: 'a'.repeat(64) };
+const proof = { ...ref, accountId: mailboxId, contentDigest: 'a'.repeat(64), sourceGrade: 'mcp_authored' as const };
 
 test('eleven strict tools expose bounded pagination without hidden filters', () => {
     expect(Object.keys(mailInputSchemas)).toEqual(['list_mailboxes', 'list_messages', 'search_messages', 'read_message', 'read_attachment', 'create_draft', 'update_draft', 'delete_draft', 'send_draft', 'move_message', 'update_message_flags']);
@@ -131,4 +132,28 @@ test('MailError accepts only sanitized codes without retaining raw causes or det
     const error = Reflect.construct(MailError, ['source_integrity_unavailable', { cause: 'private-upstream-response', token: 'private-upstream-token' }]) as MailError;
     expect(MailError.length).toBe(1); expect(error).toBeInstanceOf(Error); expect(error.code).toBe('source_integrity_unavailable'); expect(error.message).toBe(error.code);
     expect(Object.keys(error).sort()).toEqual(['code', 'name']); expect(error.cause).toBeUndefined(); expect(JSON.stringify(error)).not.toContain('private');
+});
+
+test('recipient validation exactly matches pinned existing API predicate and never drops invalid entries', () => {
+    const addresses = ['a@example.invalid', 'a@example.c', 'é@example.invalid', 'a@éxample.invalid', 'a..b@example.invalid', 'a@b', 'x'.repeat(65) + '@example.invalid', 'a@' + 'x'.repeat(64) + '.invalid', 'a@example.invalid\r\nBcc: injected@example.invalid'];
+    for (const address of addresses) { expect(inputAddressSchema.safeParse({ address }).success).toBe(isEmailValid(address, { tlds: false } as unknown as Parameters<typeof isEmailValid>[1])); }
+    const invalid = 'x'.repeat(65) + '@example.invalid';
+    for (const field of ['to', 'cc', 'bcc', 'replyTo'] as const) {
+        const recipients = [{ address: 'valid@example.invalid' }, { address: invalid }];
+        expect(mailInputSchemas.create_draft.safeParse({ ...draft, operation_id, [field]: recipients }).success).toBe(false);
+        expect(mailInputSchemas.update_draft.safeParse({ ...target, [field]: recipients }).success).toBe(false);
+    }
+    expect(mailInputSchemas.create_draft.parse({ ...draft, operation_id }).to).toEqual(draft.to);
+});
+test('activation proof requires an explicit source grade; observed source cannot create authored drafts', () => {
+    const complete = { status: 'completed', operation_id, draft: ref, verified: true, proof };
+    const { sourceGrade: _grade, ...missingGrade } = proof;
+    expect(mailOutputSchemas.create_draft.safeParse({ ...complete, proof: missingGrade }).success).toBe(false);
+    expect(mailOutputSchemas.create_draft.safeParse({ ...complete, proof: { ...proof, sourceGrade: 'observed' } }).success).toBe(false);
+    expect(mailOutputSchemas.update_draft.safeParse({ ...complete, previousDeleted: true, proof: { ...proof, sourceGrade: 'observed' } }).success).toBe(false);
+    expect(mailOutputSchemas.update_draft.safeParse({ status: 'partial', operation_id, candidate: ref, candidateVerified: true, proof: { ...proof, sourceGrade: 'observed' }, reason: 'original_deletion_failed', originalDeletion: 'failed' }).success).toBe(false);
+    for (const name of ['move_message', 'update_message_flags'] as const) {
+        expect(mailOutputSchemas[name].safeParse({ status: 'completed', operation_id, message: ref, verified: true, proof: { ...proof, sourceGrade: 'observed' } }).success).toBe(true);
+    }
+    expect(mailInputSchemas.update_draft.safeParse({ ...target, subject: 'Change', source: { grade: 'mcp_authored', accountId: mailboxId, mailboxId, uid: 1, contentDigest: proof.contentDigest } }).success).toBe(false);
 });

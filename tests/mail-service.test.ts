@@ -1,4 +1,5 @@
 import { expect, test } from 'bun:test';
+import { digest } from '../src/auth/crypto';
 import { createMailService } from '../src/mail/service';
 import { MailError, type ConfirmedReceipt, type MailOperationMarker, type FailedReceipt, type MailBackendReader, type MailBackendWriter, type MailContext, type MailOperationRecord, type MailOperationStore, type OperationClaim, type OperationKey, type ReservationResult, type UnknownReceipt, type WriteIntent, type MessageSnapshot, type PreparedDraft } from '../src/mail/contracts';
 
@@ -49,13 +50,18 @@ class Store implements MailOperationStore {
         const record = this.checked(claim); this.records.set(keyOf(claim.key), { ...record, revision: record.revision + 1, state: 'settled', receipt });
     }
 }
-function fixture() {
+function fixture(authored = true) {
     const operations = new Store(); const calls: { method: string; args: unknown[] }[] = [];
     const mailbox = { mailboxId, path: 'Drafts', specialUse: '\\Drafts' };
     const message = { mailboxId, uid: 7, subject: 'subject', from: [], to: [], date: null, receivedAt: null, flags: { seen: false, flagged: false, draft: true, answered: false, deleted: false, forwarded: false }, imapFlags: [], labels: [], hasAttachments: false };
     const snapshot = { message: { mailboxId, uid: 7, version }, isDraft: true, hasHtml: true, hasAttachments: true, hasRecipients: true };
     const messages = new Map<string, MessageSnapshot>();
-    const behavior = { snapshot, queueId: 'queue-1', postError: false, wrongMailbox: false, verificationError: false, preparationError: false, originalChanged: false, originalReadError: false, deletionError: undefined as Error | undefined, marker: undefined as MailOperationMarker | undefined, beforeInspect: async () => {} };
+    const seedKey = { accountId, clientIdHash: digest('seed-client'), operationId: 'seed_authored_001' };
+    const seedMarker: MailOperationMarker & { tool: 'create_draft' } = { ...seedKey, tool: 'create_draft', payloadDigest: digest('seed-input') };
+    if (authored) {
+        operations.records.set(keyOf(seedKey), structuredClone({ key: seedKey, intent: seedMarker, ownerToken: 'seed-owner', revision: 1, state: 'settled', receipt: { status: 'completed', operation_id: seedKey.operationId, draft: snapshot.message, verified: true, proof: { accountId, ...snapshot.message, contentDigest: 'd'.repeat(64), sourceGrade: 'mcp_authored' } } }));
+    }
+    const behavior = { snapshot, sourceMismatch: false, unexpectedGrade: false, mutationDigestMismatch: false, nextUid: 8, queueId: 'queue-1', postError: false, wrongMailbox: false, verificationError: false, preparationError: false, originalChanged: false, originalReadError: false, deletionError: undefined as Error | undefined, marker: (authored ? seedMarker : undefined) as MailOperationMarker | undefined, beforeInspect: async () => {} };
     const record = (method: string, ...args: unknown[]) => { calls.push({ method, args }); };
     const find = (key: { mailboxId: string; uid: number }): MessageSnapshot => messages.get(JSON.stringify(key)) ?? { ...behavior.snapshot, ...(behavior.marker ? { marker: behavior.marker } : {}) };
     const reader: MailBackendReader = {
@@ -72,11 +78,12 @@ function fixture() {
     const writer: MailBackendWriter = {
         resolveDraftMailbox: async (...args) => { record('resolve', ...args); return mailbox; },
         inspectMessage: async (...args) => { record('inspect', ...args); await behavior.beforeInspect(); if (behavior.originalReadError) { throw new MailError('temporarily_unavailable'); } return find(args[1]); },
+        verifyAuthoredSource: async (...args) => { record('sourcecheck', ...args); if (behavior.sourceMismatch) { throw new MailError('verification_failed'); } },
         prepareCreate: async (...args) => { record('prepareCreate', ...args); if (behavior.preparationError) { throw new MailError('unsupported_content'); } return prepare(args[2]); },
-        prepareUpdate: async (...args) => { record('prepareUpdate', ...args); if (behavior.preparationError) { throw new MailError('source_integrity_unavailable'); } return prepare(args[3]); },
+        prepareUpdate: async (...args) => { record('prepareUpdate', ...args); if (behavior.sourceMismatch) { throw new MailError('verification_failed'); } if (behavior.preparationError) { throw new MailError('source_integrity_unavailable'); } return prepare(args[3]); },
         uploadPreparedDraft: async (...args) => {
             record('upload', ...args); if (behavior.postError) { throw new Error('secret token or backend body'); }
-            const key = { mailboxId: behavior.wrongMailbox ? 'd'.repeat(24) : mailboxId, uid: 8 };
+            const key = { mailboxId: behavior.wrongMailbox ? 'd'.repeat(24) : mailboxId, uid: behavior.nextUid++ };
             messages.set(JSON.stringify(key), { ...snapshot, message: { ...key, version }, marker: args[1].marker }); return key;
         },
         verifyPreparedDraft: async (...args) => {
@@ -87,15 +94,15 @@ function fixture() {
         deleteDraft: async (...args) => { record('delete', ...args); if (behavior.deletionError) { throw behavior.deletionError; } if (behavior.postError) { throw new Error('secret token or backend body'); } },
         stampSendMarker: async (...args) => { record('stamp', ...args); behavior.marker = args[2]; return args[1].message; },
         submitDraft: async (...args) => { record('submit', ...args); if (behavior.postError) { throw new Error('secret token or backend body'); } return { queueId: behavior.queueId }; },
-        moveMessage: async (...args) => { record('move', ...args); const moved = { mailboxId: args[2], uid: 9, version }; messages.set(JSON.stringify({ mailboxId: moved.mailboxId, uid: moved.uid }), { ...snapshot, message: moved, marker: args[3] }); return { message: moved, contentDigest: 'd'.repeat(64) }; },
-        updateMessageFlags: async (...args) => { record('flags', ...args); const changed = { ...args[1].message, version: 'f'.repeat(43) }; messages.set(JSON.stringify({ mailboxId: changed.mailboxId, uid: changed.uid }), { ...snapshot, message: changed, marker: args[3] }); return { message: changed, contentDigest: 'd'.repeat(64) }; },
+        moveMessage: async (...args) => { record('move', ...args); const moved = { mailboxId: args[2], uid: 9, version }; messages.set(JSON.stringify({ mailboxId: moved.mailboxId, uid: moved.uid }), { ...snapshot, message: moved, marker: args[3] }); return { message: moved, contentDigest: (behavior.mutationDigestMismatch ? 'e' : 'd').repeat(64), sourceGrade: args[4] || behavior.unexpectedGrade ? 'mcp_authored' : 'observed' }; },
+        updateMessageFlags: async (...args) => { record('flags', ...args); const changed = { ...args[1].message, version: 'f'.repeat(43) }; messages.set(JSON.stringify({ mailboxId: changed.mailboxId, uid: changed.uid }), { ...snapshot, message: changed, marker: args[3] }); return { message: changed, contentDigest: (behavior.mutationDigestMismatch ? 'e' : 'd').repeat(64), sourceGrade: args[4] || behavior.unexpectedGrade ? 'mcp_authored' : 'observed' }; },
     };
     return { service: createMailService({ reader, writer, operations }), operations, calls, behavior, reader, writer, mailbox, messages };
 }
 const posts = (f: ReturnType<typeof fixture>) => f.calls.filter(call => ['upload', 'delete', 'submit', 'move', 'flags'].includes(call.method));
 
 test('read methods return sanitized DTOs and bind only server credentials to readers', async () => {
-    const f = fixture();
+    const f = fixture(false);
     expect((await f.service.list_mailboxes(context, {})).mailboxes).toHaveLength(1);
     expect((await f.service.list_messages(context, { mailboxId, limit: 20 })).messages).toHaveLength(1);
     expect((await f.service.search_messages(context, { text: 'needle', limit: 20 })).messages).toHaveLength(1);
@@ -312,4 +319,90 @@ test('invalid backend error codes and extra output fields never expose secrets',
     await expect(f.service.list_mailboxes(context, {})).rejects.toThrow('temporarily_unavailable');
     const g = fixture(); g.reader.listMailboxes = async () => ({ mailboxes: [], rawToken: context.accessToken } as never);
     await expect(g.service.list_mailboxes(context, {})).rejects.toThrow('temporarily_unavailable');
+});
+test('unmanaged drafts cannot update or send and fail before every irreversible effect', async () => {
+    for (const tool of ['update_draft', 'send_draft'] as const) {
+        const f = fixture(false);
+        const result = tool === 'update_draft' ? await f.service.update_draft(context, { ...target, subject: 'change' }) : await f.service.send_draft(context, target);
+        expect(result).toEqual({ status: 'failed', operation_id, reason: 'unsupported_content' });
+        expect(f.operations.calls).not.toContain('dispatch'); expect(posts(f)).toHaveLength(0);
+        expect(f.calls.some(call => ['stamp', 'prepareUpdate', 'sourcecheck'].includes(call.method))).toBe(false); expect(f.operations.guards.size).toBe(0);
+    }
+});
+test('legacy read and deletion remain available without authored provenance', async () => {
+    const f = fixture(false); expect((await f.service.read_message(context, { mailboxId, uid: 7 })).text).toBe('text');
+    expect((await f.service.delete_draft(context, target)).status).toBe('completed');
+    expect(f.calls.some(call => call.method === 'sourcecheck')).toBe(false);
+});
+test('legacy flag and move receipts stay observed and cannot promote later edit or send', async () => {
+    const f = fixture(false);
+    const flagged = await f.service.update_message_flags(context, { ...target, mailboxId, seen: true });
+    expect(flagged.status).toBe('completed'); if (flagged.status === 'completed') { expect(flagged.proof.sourceGrade).toBe('observed'); }
+    const changed = { ...target, expected_version: 'f'.repeat(43), operation_id: 'legacy_send_operation_01' };
+    expect((await f.service.send_draft(context, changed)).status).toBe('failed');
+    expect(await f.service.update_draft(context, { ...changed, operation_id: 'legacy_edit_operation_01', subject: 'change' })).toEqual({ status: 'failed', operation_id: 'legacy_edit_operation_01', reason: 'unsupported_content' });
+    const moved = await f.service.move_message(context, { ...changed, operation_id: 'legacy_move_operation_01', mailboxId, destinationMailboxId: 'e'.repeat(24) });
+    expect(moved.status).toBe('completed'); if (moved.status === 'completed') { expect(moved.proof.sourceGrade).toBe('observed'); }
+    const back = await f.service.move_message(context, { uid: 9, expected_version: version, operation_id: 'legacy_move_operation_02', mailboxId: 'e'.repeat(24), destinationMailboxId: mailboxId });
+    expect(back.status).toBe('completed'); if (back.status === 'completed') { expect(back.proof.sourceGrade).toBe('observed'); }
+    expect(await f.service.send_draft(context, { ...target, uid: 9, operation_id: 'legacy_send_operation_02' })).toEqual({ status: 'failed', operation_id: 'legacy_send_operation_02', reason: 'unsupported_content' });
+    expect(f.calls.some(call => call.method === 'sourcecheck')).toBe(false);
+});
+test('MCP create through flags and moves preserves trusted grade for later edit and send', async () => {
+    const f = fixture(false);
+    const created = await f.service.create_draft(context, { ...content, operation_id });
+    expect(created.status).toBe('completed'); if (created.status === 'completed') { expect(created.proof.sourceGrade).toBe('mcp_authored'); }
+    const flagged = await f.service.update_message_flags(context, { ...target, uid: 8, mailboxId, seen: true, operation_id: 'authored_flags_operation_01' });
+    expect(flagged.status).toBe('completed'); if (flagged.status === 'completed') { expect(flagged.proof.sourceGrade).toBe('mcp_authored'); }
+    const moved = await f.service.move_message(context, { uid: 8, expected_version: 'f'.repeat(43), operation_id: 'authored_move_operation_01', mailboxId, destinationMailboxId: 'e'.repeat(24) });
+    expect(moved.status).toBe('completed'); if (moved.status === 'completed') { expect(moved.proof.sourceGrade).toBe('mcp_authored'); }
+    await f.service.move_message(context, { uid: 9, expected_version: version, operation_id: 'authored_move_operation_02', mailboxId: 'e'.repeat(24), destinationMailboxId: mailboxId });
+    f.behavior.nextUid = 10;
+    const edited = await f.service.update_draft(context, { ...target, uid: 9, subject: 'change', operation_id: 'authored_edit_operation_01' });
+    expect(edited.status).toBe('completed'); if (edited.status === 'completed') { expect(edited.proof.sourceGrade).toBe('mcp_authored'); }
+    expect((await f.service.send_draft(context, { ...target, uid: 10, operation_id: 'authored_send_operation_01' })).status).toBe('queued');
+    const checked = f.calls.filter(call => call.method === 'sourcecheck'); expect(checked).toHaveLength(4);
+    for (const call of checked) { expect(call.args[2]).toMatchObject({ grade: 'mcp_authored', accountId, contentDigest: 'd'.repeat(64) }); }
+});
+test('authored hash mismatch rejects update, send, move and flags before dispatch without demotion', async () => {
+    for (const tool of ['update_draft', 'send_draft', 'move_message', 'update_message_flags'] as const) {
+        const f = fixture(); f.behavior.sourceMismatch = true;
+        const args = tool === 'move_message' ? { ...target, mailboxId, destinationMailboxId: 'e'.repeat(24) } : tool === 'update_message_flags' ? { ...target, mailboxId, seen: true } : tool === 'update_draft' ? { ...target, subject: 'change' } : target;
+        expect(await f.service[tool](context, args as never)).toEqual({ status: 'failed', operation_id, reason: 'verification_failed' });
+        expect(f.operations.calls).not.toContain('dispatch'); expect(posts(f)).toHaveLength(0); expect(f.calls.some(call => call.method === 'stamp')).toBe(false); expect(f.operations.guards.size).toBe(0);
+    }
+});
+test('writer cannot unexpectedly promote legacy observations or change an authored digest', async () => {
+    const f = fixture(false); f.behavior.unexpectedGrade = true;
+    expect((await f.service.update_message_flags(context, { ...target, mailboxId, seen: true })).status).toBe('outcome_unknown');
+    expect(f.operations.guards.size).toBe(1);
+    const g = fixture(); g.behavior.mutationDigestMismatch = true;
+    expect((await g.service.move_message(context, { ...target, mailboxId, destinationMailboxId: 'e'.repeat(24) })).status).toBe('outcome_unknown'); expect(g.operations.guards.size).toBe(1);
+});
+test('raw markers, matching client IDs, foreign accounts and wrong UID receipts cannot author mail', async () => {
+    for (const variant of ['no-record', 'foreign-account', 'wrong-uid', 'observed'] as const) {
+        const f = fixture(false);
+        const key = { accountId, clientIdHash: digest(context.clientId), operationId: 'spoofed_operation_001' };
+        const marker: MailOperationMarker = { ...key, tool: 'update_message_flags', payloadDigest: digest('spoof') };
+        f.behavior.marker = variant === 'foreign-account' ? { ...marker, accountId: 'e'.repeat(24) } : marker;
+        if (variant !== 'no-record') {
+            const reference = { mailboxId, uid: variant === 'wrong-uid' ? 99 : 7, version };
+            f.operations.records.set(keyOf(key), { key, intent: { ...marker, tool: 'update_message_flags', target: { mailboxId, uid: 7 }, expectedVersion: version }, ownerToken: 'spoof-owner', revision: 2, state: 'settled', receipt: { status: 'completed', operation_id: key.operationId, message: reference, verified: true, proof: { ...reference, accountId, contentDigest: 'd'.repeat(64), sourceGrade: variant === 'observed' ? 'observed' : 'mcp_authored' } } });
+        }
+        const result = await f.service.send_draft(context, target); expect(result.status).toBe('failed');
+        expect(f.operations.calls).not.toContain('dispatch'); expect(posts(f)).toHaveLength(0);
+    }
+});
+test('queued Sent activation never carries authored bytes into later flags or preserving edits', async () => {
+    const f = fixture(); const sent = { mailboxId: 'e'.repeat(24), uid: 91 };
+    f.writer.submitDraft = async () => {
+        if (!f.behavior.marker) { throw new Error('Missing test send marker'); }
+        f.messages.set(JSON.stringify(sent), { ...f.behavior.snapshot, message: { ...sent, version }, isDraft: false, marker: f.behavior.marker });
+        return { queueId: 'sent-queue', sent };
+    };
+    expect((await f.service.send_draft(context, target)).status).toBe('queued');
+    expect((await f.service.read_message(context, sent)).managedOperation?.verification).toBe('verified');
+    const flagged = await f.service.update_message_flags(context, { ...sent, expected_version: version, operation_id: 'sent_flags_operation_01', seen: true });
+    expect(flagged.status).toBe('completed'); if (flagged.status === 'completed') { expect(flagged.proof.sourceGrade).toBe('observed'); }
+    expect(f.calls.filter(call => call.method === 'sourcecheck')).toHaveLength(1);
 });
