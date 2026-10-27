@@ -3,7 +3,7 @@ import { bodyLimit } from 'hono/body-limit';
 import { secureHeaders } from 'hono/secure-headers';
 import { version } from '../package.json';
 import { handleMcp } from './mcp';
-import { WildduckError } from './wildduck';
+import type { BoundMailService, MailContext } from './mail/contracts';
 import { loadConfig, type Config } from './config';
 import { createRuntimeProvider, type RuntimeProvider } from './auth/runtime';
 import { authenticate, authorization, boundedText, challenge, form, metadata, required, scopes, unique, SCOPES } from './auth/http';
@@ -17,7 +17,7 @@ export function createApp(options: AppOptions = {}) {
     const app = new Hono();
     app.use('*', secureHeaders({ referrerPolicy: false }));
     app.use('*', async (context, next) => { context.header('Cache-Control', 'no-store'); context.header('Referrer-Policy', 'no-referrer'); await next(); });
-    app.use('/mcp', bodyLimit({ maxSize: 1024 * 1024, onError: context => context.json({ error: 'payload_too_large' }, 413) }));
+    app.use('/mcp', bodyLimit({ maxSize: 5 * 1024 * 1024, onError: context => context.json({ error: 'payload_too_large' }, 413) }));
     app.use('*', async (context, next) => {
         if (context.req.method === 'OPTIONS') { context.header('Access-Control-Allow-Origin', '*'); context.header('Access-Control-Allow-Headers', 'Authorization, Content-Type, MCP-Protocol-Version'); context.header('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS'); return context.body(null, 204); }
         if (['/register', '/token', '/revoke', '/mcp'].includes(context.req.path) || context.req.path.startsWith('/.well-known/')) { context.header('Access-Control-Allow-Origin', '*'); context.header('Access-Control-Expose-Headers', 'WWW-Authenticate'); }
@@ -62,16 +62,28 @@ export function createApp(options: AppOptions = {}) {
             const [grant, record] = await Promise.all([auth.store.get('grant', identity.grantId), auth.store.get('connection', identity.connectionId)]);
             if (grant?.kind !== 'grant' || record?.kind !== 'connection') { return unauthorized(); }
             const credentials = auth.crypto.open<UpstreamCredentials>('upstream-credentials', connectionAAD(record), record.credentials);
+            if (record.accountId !== identity.accountId || record.id !== identity.connectionId || credentials.profile?.id !== identity.accountId) { return unauthorized(); }
             if (identity.connectionStatus === 'active') {
                 const state = await auth.wildduck.validateCredentials(credentials);
                 if (state === 'temporary') { return context.json({ error: 'temporarily_unavailable' }, 503); }
                 if (state === 'expired') { return unauthorized(); }
             }
-            if (record.accountId !== identity.accountId || record.id !== identity.connectionId || credentials.profile?.id !== identity.accountId) { return unauthorized(); }
-            return handleMcp(context.req.raw, { token, clientId: grant.clientId, scopes: identity.scopes, resource: new URL(auth.engine.resource), extra: { ...identity } }, identity, credentials.profile, limit => {
-                if (record.status !== 'active' || record.expiresAt <= Math.floor(Date.now() / 1000)) { throw new WildduckError('authentication_failed'); }
-                return auth.wildduck.listInboxSubjects(identity.accountId, credentials, limit);
-            });
+            const mailContext: MailContext = Object.freeze({ accountId: identity.accountId, accessToken: credentials.accessToken, clientId: grant.clientId, scopes: Object.freeze([...identity.scopes]), connectionStatus: record.expiresAt <= Math.floor(Date.now() / 1000) ? 'reconnect_required' : record.status });
+            const mail: BoundMailService = {
+                list_mailboxes: input => auth.mail.list_mailboxes(mailContext, input),
+                list_messages: input => auth.mail.list_messages(mailContext, input),
+                search_messages: input => auth.mail.search_messages(mailContext, input),
+                read_message: input => auth.mail.read_message(mailContext, input),
+                read_attachment: input => auth.mail.read_attachment(mailContext, input),
+                move_message: input => auth.mail.move_message(mailContext, input),
+                update_message_flags: input => auth.mail.update_message_flags(mailContext, input),
+                create_draft: input => auth.mail.create_draft(mailContext, input),
+                update_draft: input => auth.mail.update_draft(mailContext, input),
+                delete_draft: input => auth.mail.delete_draft(mailContext, input),
+                send_draft: input => auth.mail.send_draft(mailContext, input),
+            };
+            return handleMcp(context.req.raw, { token, clientId: grant.clientId, scopes: identity.scopes, resource: new URL(auth.engine.resource) }, mail);
+
         } catch (error) { if (error instanceof OAuthError && error.error !== 'temporarily_unavailable') { return unauthorized(); } throw error; }
     });
     app.notFound(context => context.json({ error: 'not_found' }, 404));

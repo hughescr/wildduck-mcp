@@ -1,10 +1,12 @@
 import { expect, test } from 'bun:test';
-import { handle, type LambdaContext } from '@hono/aws-lambda';
+import type { LambdaContext } from '@hono/aws-lambda';
+import { createLambdaHandler } from '../src/handler';
 import { createApp } from '../src/app';
 import { AuthCrypto, connectionAAD, digest } from '../src/auth/crypto';
 import { AuthEngine } from '../src/auth/engine';
 import { MemoryStore } from '../src/auth/memory-store';
 import { ClientRegistry } from '../src/auth/clients';
+import { MailError, type MailService } from '../src/mail/contracts';
 import type { AuthRuntime } from '../src/auth/runtime';
 import type { UpstreamCredentials } from '../src/auth/contracts';
 import { lambdaEvent } from './app.test';
@@ -17,7 +19,16 @@ function setup(totp = false, authMethod: 'none' | 'client_secret_basic' = 'none'
     const engine = new AuthEngine(store, crypto, { validate: async () => state }, { issuer, refreshRetrySeconds: 10 });
     const clients = new ClientRegistry({ crypto });
     let loginCalls = 0;
-    const runtime: AuthRuntime = { issuer, crypto, store, engine, clients, wildduck: { beginLogin: async (username, password) => { expect(username).toBe('user'); expect(password).toBe('password'); loginCalls++; return totp ? { kind: 'pendingTotp', accountId: credentials.profile.id, profile: credentials.profile, nonce: 'b'.repeat(40), provisionalToken: credentials.accessToken, issuedAt: credentials.issuedAt } : { kind: 'authenticated', credentials }; }, completeTotp: async (pending, code) => { expect(pending.accountId).toBe(credentials.profile.id); expect(code).toBe('123456'); return credentials; }, validateCredentials: async () => state, logout: async () => true, listInboxSubjects: async () => [] } };
+    const unavailable = async () => { throw new MailError('forbidden'); };
+    const mail: MailService = {
+        list_mailboxes: async context => { expect(context.accountId).toBe(credentials.profile.id); expect(context.accessToken).toBe(credentials.accessToken); expect(context.clientId).toBeString(); return { mailboxes: [] }; },
+        list_messages: unavailable, search_messages: unavailable, read_message: unavailable,
+        read_attachment: async (context, input) => { expect(context.accountId).toBe(credentials.profile.id); expect(context.accessToken).toBe(credentials.accessToken); expect(context.clientId).toBeString(); return { metadata: { ...input, filename: null, contentType: 'text/plain', size: 5, resourceUri: 'wildduck://attachment/ATT1' }, bytes: Buffer.from('hello') }; },
+        move_message: unavailable, update_message_flags: unavailable,
+        create_draft: unavailable, update_draft: unavailable, delete_draft: unavailable, send_draft: unavailable,
+    };
+
+    const runtime: AuthRuntime = { issuer, crypto, store, engine, clients, mail, wildduck: { beginLogin: async (username, password) => { expect(username).toBe('user'); expect(password).toBe('password'); loginCalls++; return totp ? { kind: 'pendingTotp', accountId: credentials.profile.id, profile: credentials.profile, nonce: 'b'.repeat(40), provisionalToken: credentials.accessToken, issuedAt: credentials.issuedAt } : { kind: 'authenticated', credentials }; }, completeTotp: async (pending, code) => { expect(pending.accountId).toBe(credentials.profile.id); expect(code).toBe('123456'); return credentials; }, validateCredentials: async () => state, logout: async () => true } };
     const app = createApp({ config: { publicBaseUrl: issuer }, runtime: async () => runtime });
     const registration = clients.register({ client_name: '<Client>', redirect_uris: ['http://127.0.0.1/callback'], token_endpoint_auth_method: authMethod, application_type: 'native', grant_types: ['authorization_code', 'refresh_token'] });
     const verifier = 'v'.repeat(43);
@@ -49,8 +60,8 @@ async function connect(env: ReturnType<typeof setup>, duplicate = false) {
 test.each([false, true])('browser consent, PKCE, native callback and authenticated MCP (TOTP=%s)', async totp => {
     const env = setup(totp); const { tokens, fields } = await connect(env);
     expect((await post(env.app, '/token', fields)).status).toBe(400);
-    const rpc = await env.app.request('/mcp', { method: 'POST', headers: { authorization: `Bearer ${tokens.access_token}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'mcp-protocol-version': '2025-11-25' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'get_profile', arguments: {} } }) });
-    expect(rpc.status).toBe(200); const result = await rpc.json(); expect(result.result.structuredContent.id).toBe(credentials.profile.id); expect(result.result._meta['openai/profile'].id).toBe(credentials.profile.id);
+    const rpc = await env.app.request('/mcp', { method: 'POST', headers: { authorization: `Bearer ${tokens.access_token}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'mcp-protocol-version': '2025-11-25' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_mailboxes', arguments: {} } }) });
+    expect(rpc.status).toBe(200); const result = await rpc.json(); expect(result.result.structuredContent).toEqual({ mailboxes: [] }); expect(result.result._meta).toBeUndefined();
     const refresh = new URLSearchParams({ grant_type: 'refresh_token', client_id: env.params.get('client_id') ?? '', resource: `${issuer}/mcp`, refresh_token: tokens.refresh_token });
     const rotated = await post(env.app, '/token', refresh); expect(rotated.status).toBe(200); const next = await rotated.json(); expect(next.refresh_token).not.toBe(tokens.refresh_token); expect(await (await post(env.app, '/token', refresh)).json()).toEqual(next);
     env.setState('temporary'); const latest = new URLSearchParams(refresh); latest.set('refresh_token', next.refresh_token); expect((await post(env.app, '/token', latest)).status).toBe(503);
@@ -69,7 +80,7 @@ test('token endpoint rejects duplicate fields, mixed authentication and wrong re
     fields.set('resource', 'https://attacker.example/mcp'); expect((await post(env.app, '/token', fields)).status).toBe(400);
 });
 test('Lambda adapter carries browser cookies, redirects, metadata and token errors', async () => {
-    const env = setup(); const handler = handle(env.app);
+    const env = setup(); const handler = createLambdaHandler(env.app);
     const response = await handler(lambdaEvent(`/authorize?${env.params}`), {} as LambdaContext); expect(response.statusCode).toBe(200); expect(response.cookies?.[0]).toContain('__Host-wildduck-flow='); expect(response.body).toContain('Connect your mail account');
     expect((await handler(lambdaEvent('/mcp'), {} as LambdaContext)).statusCode).toBe(401);
     const token = lambdaEvent('/token', 'POST', 'client_id=one&client_id=two'); token.headers['content-type'] = 'application/x-www-form-urlencoded'; expect((await handler(token, {} as LambdaContext)).statusCode).toBe(400);
@@ -182,4 +193,22 @@ test('published Claude CIMD reaches login while extra JWT grant capabilities rem
     expect(discovery.grant_types_supported).toEqual(['authorization_code', 'refresh_token']);
     expect(discovery.token_endpoint_auth_methods_supported).not.toContain('private_key_jwt');
     expect(env.loginCalls()).toBe(0);
+});
+test('authenticated HTTP binds attachment identity and permits supported multi-megabyte requests without exposing credentials', async () => {
+    const env = setup(); const { tokens } = await connect(env);
+    const invoke = (name: string, args: object) => env.app.request('/mcp', { method: 'POST', headers: { authorization: `Bearer ${tokens.access_token}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'mcp-protocol-version': '2025-11-25' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }) });
+    const downloaded = await invoke('read_attachment', { mailboxId: 'b'.repeat(24), uid: 1, attachmentId: 'ATT1' });
+    expect(downloaded.status).toBe(200); const output = await downloaded.json(); expect(output.result.content[1].resource.blob).toBe('aGVsbG8='); expect(JSON.stringify(output)).not.toContain(credentials.accessToken); expect(JSON.stringify(output)).not.toContain(tokens.access_token);
+    const larger = await invoke('create_draft', { operation_id: 'synthetic-attachment-operation', subject: '', body: { text: '', html: null }, attachments: [{ filename: 'large.bin', contentType: 'application/octet-stream', contentBase64: Buffer.alloc(2 * 1024 * 1024).toString('base64') }] });
+    expect(larger.status).toBe(200); const denied = await larger.json(); expect(denied.result.isError).toBe(true); expect(denied.result.content[0].text).toContain('mail:draft');
+});
+test('send permission needs its own explicit consent checkbox without granting extra scopes', async () => {
+    const env = setup(); env.params.set('scope', 'mail:read mail:send');
+    const start = await env.app.request(`/authorize?${env.params}`); const login = page(start, await start.text()); login.fields.set('username', 'user'); login.fields.set('password', 'password');
+    const consent = await post(env.app, '/auth/login', login.fields, login.cookie); const html = await consent.text(); expect(html).toContain('Allow sending mail'); expect(html).toContain('name="allow_send" value="yes" required');
+    const approval = page(consent, html); approval.fields.set('decision', 'allow');
+    expect((await post(env.app, '/auth/consent', approval.fields, approval.cookie)).status).toBe(400);
+    approval.fields.set('allow_send', 'yes'); const approved = await post(env.app, '/auth/consent', approval.fields, approval.cookie); expect(approved.status).toBe(302);
+    const callback = new URL(approved.headers.get('location') ?? ''); const response = await post(env.app, '/token', new URLSearchParams({ grant_type: 'authorization_code', client_id: env.registration.client_id, redirect_uri: env.params.get('redirect_uri') ?? '', resource: `${issuer}/mcp`, code: callback.searchParams.get('code') ?? '', code_verifier: env.verifier }));
+    expect(response.status).toBe(200); expect((await response.json()).scope).toBe('mail:read mail:send');
 });

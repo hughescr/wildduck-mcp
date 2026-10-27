@@ -16,5 +16,5 @@ test('configured discovery and missing bearer need no secret access', async () =
     expect((await app.request('/.well-known/oauth-authorization-server')).status).toBe(200);
     const result = await app.request('/mcp'); expect(result.status).toBe(401); expect(result.headers.get('www-authenticate')).toContain('https://service.example/.well-known/oauth-protected-resource/mcp');
 });
-test('oversized MCP bodies are bounded', async () => { expect((await createApp().request('/mcp', { method: 'POST', body: 'x'.repeat(1048577) })).status).toBe(413); });
+test('oversized MCP bodies are bounded', async () => { expect((await createApp().request('/mcp', { method: 'POST', body: 'x'.repeat(5 * 1024 * 1024 + 1) })).status).toBe(413); });
 test.each(['http://example.com', 'https://user:password@example.com', 'https://example.com/path', 'https://example.com?secret=value'])('reject unsafe issuer %s', value => { expect(() => loadConfig({ PUBLIC_BASE_URL: value })).toThrow(); });
