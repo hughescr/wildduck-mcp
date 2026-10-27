@@ -38,6 +38,8 @@ Write receipts and account/mailbox/UID guards use the existing DynamoDB table wi
 
 Search uses a 45-second upstream ceiling, clamped at each dispatch to the live Lambda remaining time minus two seconds, after authentication. CloudFront’s origin-response timeout and Lambda’s request timeout are 60 seconds. Exhausted upstream budgets return explicit timeout advice; ordinary temporary failures do not claim a timeout. Filters are never silently narrowed and searches are not automatically retried. During diagnosis, five roughly ten-second Lambda calls strongly correlated by wall-clock time with backend HTTP 499 responses; this was not an exact request-trace join, and completed backend search latencies still need measurement.
 
+An MCP HTTP abort does not cancel MongoDB queries: underlying Wildduck work may continue past the deadline, so do not automatically retry or immediately repeat broad searches. Timing logs measure HTTP waiting and do not prove that MongoDB work has stopped.
+
 MCP HTTP request bodies are bounded to 5 MiB so supported attachment additions fit. The adapter separately measures full serialized request/response envelopes, including JSON escaping, base64 and metadata, with a conservative 6,000,000-byte safety bound. Oversized requests return 413 before application work; oversized buffered responses return 502 response_too_large without silently dropping fields. AWS may reject an oversized invocation before application code runs. Individual schema bounds do not guarantee that every aggregate combination fits; no labels, attachments or message data are silently dropped to make it fit. After any write error, retain the same operation ID.
 
 ## Local validation
