@@ -1,5 +1,6 @@
 import { handle, type APIGatewayProxyResult, type LambdaContext, type LambdaEvent } from '@hono/aws-lambda';
 import { createApp } from './app';
+import { withRequestBudget } from './request-budget';
 /** Conservative serialized-envelope bound, independent of the decoded HTTP cap.
  * Count JSON escaping, base64 bodies, headers, cookies and adapter metadata. */
 export const MAX_LAMBDA_PAYLOAD_BYTES = 6_000_000;
@@ -13,7 +14,11 @@ export function createLambdaHandler(app = createApp()) {
     const invoke = handle(app);
     return async (event: LambdaEvent, context?: LambdaContext): Promise<APIGatewayProxyResult> => {
         if (encodedSize(event) > MAX_LAMBDA_PAYLOAD_BYTES) { return sizeError(false); }
-        const result = await invoke(event, context);
+        // Only the AWS-owned context supplies this getter; HTTP data cannot set it.
+        // Read its live value at backend dispatch, after authentication, not here.
+        const result = await (context && 'getRemainingTimeInMillis' in context
+            ? withRequestBudget(() => context.getRemainingTimeInMillis(), () => invoke(event, context))
+            : invoke(event, context));
         return encodedSize(result) > MAX_LAMBDA_PAYLOAD_BYTES ? sizeError(true) : result;
     };
 }

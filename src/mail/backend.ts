@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { isEmailValid } from '@hapi/address';
 import { WILDDUCK_ORIGIN } from '../wildduck';
+import { remainingRequestTimeMs } from '../request-budget';
 import { MailError, MAIL_OPERATION_METADATA_KEY, type BackendMailSession, type MailBackendReader, type MailBackendWriter, type Mailbox, type MailInput, type MailOutput, type MessageKey, type DraftContent, type DraftPatch, type MessageSnapshot, type PreparedDraft, type MailOperationMarker, type MessageRef, type MessageSummary, type MailAddress, type AttachmentMetadata, type AttachmentDownload, type VerifiedMessageMutation, type AuthoredSourceDescriptor } from './contracts';
 import { draftContentSchema, mailboxIdSchema, messageKeySchema, mailInputSchemas, mailOutputSchemas, mailOperationMarkerSchema, addFlagSchema, labelSchema, MAX_READ_TEXT_BYTES, MAX_HTML_BYTES, MAX_ATTACHMENT_BYTES } from './schemas';
 import { createMime, inspectSource, preparePatch, verifyCandidate, MimeError, MIME_LIMITS, type MimeEnvelope } from './mime';
@@ -11,7 +12,10 @@ const ACCOUNT = /^[a-f0-9]{24}$/u;
 const TOKEN = /^[a-fA-F0-9]{40}$/u;
 const API_EMAIL_OPTIONS = { tlds: false } as unknown as Parameters<typeof isEmailValid>[1];
 type Json = Record<string, unknown>;
-export interface MailBackendOptions { fetch?: typeof globalThis.fetch; timeoutMs?: number }
+type SearchCategory = 'deadline' | 'network' | 'http_status' | 'invalid_json' | 'invalid_shape' | 'too_large';
+export interface SearchDiagnostic { event: 'wildduck_search'; outcome: 'success' | 'failure'; scope: 'global' | 'mailbox'; category?: SearchCategory; durationMs: number; headersMs?: number; bodyMs?: number; validationMs?: number; status?: number; timeoutMs?: number }
+interface SearchTiming { category: SearchCategory; headersMs?: number; bodyMs?: number; status?: number; timeoutMs?: number }
+export interface MailBackendOptions { fetch?: typeof globalThis.fetch; timeoutMs?: number; searchTimeoutMs?: number; onSearchDiagnostic?: (diagnostic: SearchDiagnostic) => void }
 const fail = (): never => { throw new MailError('temporarily_unavailable'); };
 function object(value: unknown): value is Json { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 function string(value: unknown): string { return typeof value === 'string' ? value : fail(); }
@@ -128,19 +132,35 @@ function normalizeMailbox(raw: unknown): Mailbox {
 class MailBackend implements MailBackendReader, MailBackendWriter {
     private readonly fetcher: typeof globalThis.fetch;
     private readonly timeoutMs: number;
+    private readonly searchTimeoutMs: number;
+    private readonly onSearchDiagnostic: (diagnostic: SearchDiagnostic) => void;
     private readonly snapshots = new WeakMap<MessageSnapshot, SnapshotState>();
     private readonly preparations = new WeakMap<PreparedDraft, PreparationState>();
     constructor(options: MailBackendOptions) {
         this.fetcher = options.fetch ?? globalThis.fetch; this.timeoutMs = options.timeoutMs ?? 10_000;
+        this.searchTimeoutMs = options.searchTimeoutMs ?? options.timeoutMs ?? 45_000;
+        this.onSearchDiagnostic = options.onSearchDiagnostic ?? (diagnostic => {
+            // eslint-disable-next-line no-console -- Deliberate structured, privacy-allowlisted operational diagnostic.
+            if (diagnostic.outcome === 'success') { console.info(JSON.stringify(diagnostic)); } else { console.warn(JSON.stringify(diagnostic)); }
+        });
         if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs < 1 || this.timeoutMs > 30_000) { throw new MailError('invalid_input'); }
+        if (!Number.isSafeInteger(this.searchTimeoutMs) || this.searchTimeoutMs < 1 || this.searchTimeoutMs > 120_000) { throw new MailError('invalid_input'); }
     }
-    private async transport(session: BackendMailSession, path: string, method: 'GET' | 'POST' | 'PUT' | 'DELETE', body: Json | undefined, cap: number, kind: 'json' | 'source' | 'attachment' = 'json'): Promise<{ bytes: Buffer; headers: Headers }> {
+    private async transport(session: BackendMailSession, path: string, method: 'GET' | 'POST' | 'PUT' | 'DELETE', body: Json | undefined, cap: number, kind: 'json' | 'source' | 'attachment' = 'json', timing?: SearchTiming): Promise<{ bytes: Buffer; headers: Headers }> {
         sessionValid(session);
-        const controller = new AbortController(); let timer: ReturnType<typeof setTimeout> | undefined;
+        const controller = new AbortController(); let timer: ReturnType<typeof setTimeout> | undefined; let deadline = false;
+        const started = performance.now();
+        const remaining = remainingRequestTimeMs();
+        const timeoutMs = Math.max(0, Math.min(timing ? this.searchTimeoutMs : this.timeoutMs, remaining === undefined ? Infinity : remaining - 2000));
+        if (timing) { timing.timeoutMs = timeoutMs; }
+        if (timeoutMs === 0) { if (timing) { timing.category = 'deadline'; } throw new MailError('upstream_timeout'); }
         const operation = async () => {
             const response = await this.fetcher(`${WILDDUCK_ORIGIN}/users/${session.accountId}${path}`, { method, redirect: 'error', signal: controller.signal,
                 headers: { Accept: kind === 'json' ? 'application/json' : kind === 'source' ? 'message/rfc822' : '*/*', 'Accept-Encoding': 'identity', 'X-Access-Token': session.accessToken, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
                 ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+            if (controller.signal.aborted) { void response.body?.cancel().catch(() => {}); throw new MailError('upstream_timeout'); }
+            const headersAt = performance.now();
+            if (timing) { timing.headersMs = Math.round(headersAt - started); timing.status = response.status; timing.category = response.status === 200 ? 'invalid_json' : 'http_status'; }
             const discard = () => { void response.body?.cancel().catch(() => {}); };
             if (response.redirected || response.status >= 300 && response.status < 400) { discard(); return fail(); }
             const encoded = response.headers.has('content-encoding') && response.headers.get('content-encoding') !== 'identity';
@@ -152,11 +172,13 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
             if (kind === 'source' && response.status === 200 && declared === null) { discard(); throw new MailError('source_integrity_unavailable'); }
             if (!response.body) { return fail(); }
             const reader = response.body.getReader(); const chunks: Uint8Array[] = []; let size = 0;
+            if (timing && response.status === 200) { timing.category = 'network'; }
             const cancel = () => { void reader.cancel().catch(() => {}); }; controller.signal.addEventListener('abort', cancel, { once: true });
             try {
                 while (true) { const chunk = await reader.read(); if (chunk.done) { break; } size += chunk.value.byteLength; if (size > cap) { throw new MailError('too_large'); } chunks.push(chunk.value); }
                 if (declared !== null && !encoded && size !== Number(declared)) { return fail(); }
                 const bytes = Buffer.concat(chunks);
+                if (timing) { timing.bodyMs = Math.round(performance.now() - headersAt); }
                 if (response.status === 200) { return { bytes, headers: response.headers }; }
                 const result = json(bytes);
                 if (response.status === 403 && result['code'] === 'InvalidToken') { throw new MailError('reconnect_required'); }
@@ -166,8 +188,8 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
                 return fail();
             } finally { controller.signal.removeEventListener('abort', cancel); cancel(); }
         };
-        try { return await Promise.race([operation(), new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new MailError('temporarily_unavailable')); }, this.timeoutMs); })]); }
-        catch (error) { if (error instanceof MailError) { throw error; } return fail(); }
+        try { return await Promise.race([operation(), new Promise<never>((_, reject) => { timer = setTimeout(() => { deadline = true; if (timing) { timing.category = 'deadline'; } controller.abort(); reject(new MailError('upstream_timeout')); }, timeoutMs); })]); }
+        catch (error) { if (deadline) { throw new MailError('upstream_timeout'); } if (timing && error instanceof MailError && error.code === 'too_large') { timing.category = 'too_large'; } if (error instanceof MailError) { throw error; } return fail(); }
         finally { if (timer !== undefined) { clearTimeout(timer); } controller.abort(); }
     }
     private async request(session: BackendMailSession, path: string, method: 'GET' | 'POST' | 'PUT' | 'DELETE', body?: Json, cap = META_BYTES): Promise<Json> {
@@ -212,8 +234,26 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         const query = new URLSearchParams({ order: 'desc', limit: String(data.limit), metaData: 'true' });
         const fields = { mailboxId: 'mailbox', from: 'from', to: 'to', subject: 'subject', text: 'query', receivedSince: 'datestart', receivedUntil: 'dateend', seen: 'seen', flagged: 'flagged', hasAttachments: 'attachments', next: 'next', previous: 'previous' } as const;
         for (const [key, field] of Object.entries(fields)) { const value = data[key as keyof typeof fields]; if (value !== undefined) { query.set(field, String(value)); } }
-        // Reject mismatched rows: WildDuck's timeout fallback can drop its mailbox filter.
-        return this.page(await this.request(session, `/search?${query}`, 'GET'), data.limit, session.accountId, data.mailboxId);
+        const started = performance.now(); const timing: SearchTiming = { category: 'network' }; let validationStarted: number | undefined; let outcome: 'success' | 'failure' = 'failure';
+        try {
+            const response = await this.transport(session, `/search?${query}`, 'GET', undefined, META_BYTES, 'json', timing);
+            validationStarted = performance.now(); timing.category = 'invalid_json'; const raw = json(response.bytes);
+            timing.category = 'invalid_shape';
+            if (raw['success'] !== true || raw['error'] !== undefined || raw['code'] !== undefined) { return fail(); }
+            // Reject mismatched rows: WildDuck's timeout fallback can drop its mailbox filter.
+            const result = this.page(raw, data.limit, session.accountId, data.mailboxId);
+            if (!mailOutputSchemas.search_messages.safeParse(result).success) { return fail(); }
+            outcome = 'success'; return result;
+        } finally {
+            // Construct only allowlisted primitives. Never log queries, identity, URLs,
+            // response values, caller headers or thrown errors. Late fetches cannot emit.
+            const diagnostic: SearchDiagnostic = { event: 'wildduck_search', outcome, scope: data.mailboxId === undefined ? 'global' : 'mailbox', durationMs: Math.round(performance.now() - started),
+                ...(outcome === 'failure' ? { category: timing.category } : {}),
+                ...(timing.headersMs === undefined ? {} : { headersMs: timing.headersMs }), ...(timing.bodyMs === undefined ? {} : { bodyMs: timing.bodyMs }),
+                ...(validationStarted === undefined ? {} : { validationMs: Math.round(performance.now() - validationStarted) }),
+                ...(timing.status === undefined ? {} : { status: timing.status }), ...(timing.timeoutMs === undefined ? {} : { timeoutMs: timing.timeoutMs }) };
+            try { this.onSearchDiagnostic(diagnostic); } catch { /* Diagnostics must not alter mail results. */ }
+        }
     }
     private async rawMessage(session: BackendMailSession, target: MessageKey): Promise<{ raw: Json; version: string }> {
         sessionValid(session); targetValid(target);

@@ -1,6 +1,7 @@
 import { expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { createMailBackend } from '../src/mail/backend';
+import { createMailBackend, type SearchDiagnostic } from '../src/mail/backend';
+import { withRequestBudget } from '../src/request-budget';
 import { MailError, MAIL_OPERATION_METADATA_KEY, type BackendMailSession, type DraftContent, type DraftPatch, type MailFailureCode, type MailOperationMarker, type AuthoredSourceDescriptor } from '../src/mail/contracts';
 import { mailOutputSchemas, MAX_READ_TEXT_BYTES } from '../src/mail/schemas';
 import { WILDDUCK_ORIGIN } from '../src/wildduck';
@@ -157,10 +158,10 @@ test('metadata/full-message caps, malformed JSON, fatal UTF8, redirects and malf
 test('deadline bounds stalled headers, stalled bodies and uncertain writes with one dispatch', async () => {
     let count = 0; let aborted: AbortSignal | null | undefined;
     const slow = createMailBackend({ timeoutMs: 5, fetch: (async (_url, init) => { count++; aborted = init?.signal; return await new Promise<Response>(() => {}); }) as typeof fetch });
-    await errorCode(slow.submitDraft(session, target), 'temporarily_unavailable'); expect(count).toBe(1); expect(aborted?.aborted).toBe(true);
+    await errorCode(slow.submitDraft(session, target), 'upstream_timeout'); expect(count).toBe(1); expect(aborted?.aborted).toBe(true);
     let cancelled = false;
     const stream = new ReadableStream({ cancel() { cancelled = true; } }); const f = fixture([new Response(stream, { headers: { 'content-type': 'application/json' } })], 5);
-    await errorCode(f.backend.readMessage(session, target), 'temporarily_unavailable'); expect(cancelled).toBe(true); expect(f.calls).toHaveLength(1);
+    await errorCode(f.backend.readMessage(session, target), 'upstream_timeout'); expect(cancelled).toBe(true); expect(f.calls).toHaveLength(1);
 });
 test('authored update preserves original MIME, Bcc, flags, labels and received date on the existing API', async () => {
     const f = model(); const before = await f.backend.inspectMessage(session, target);
@@ -335,4 +336,56 @@ test('sender requires exact primary or registered alias and never trusts whiteli
     const invalid = fixture([]);
     await errorCode(invalid.backend.prepareCreate(session, { ...content, to: [{ address: 'invalid recipient' }] }, marker), 'invalid_input');
     expect(invalid.calls).toHaveLength(0);
+});
+const pause = async (ms: number) => { await new Promise(resolve => setTimeout(resolve, ms)); };
+test('search alone gets the longer internal deadline and preserves query semantics', async () => {
+    const logs: SearchDiagnostic[] = []; const urls: string[] = [];
+    const backend = createMailBackend({ timeoutMs: 5, searchTimeoutMs: 60, onSearchDiagnostic: value => { logs.push(value); }, fetch: (async url => { urls.push(String(url)); await pause(15); return Response.json({ success: true, results: [] }); }) as typeof fetch });
+    expect(await backend.searchMessages(session, { from: 'synthetic@example.test', receivedSince: '2026-10-20T00:00:00Z', limit: 10 })).toEqual({ messages: [] });
+    expect(Object.fromEntries(new URL(urls[0] ?? '').searchParams)).toEqual({ order: 'desc', limit: '10', metaData: 'true', from: 'synthetic@example.test', datestart: '2026-10-20T00:00:00Z' });
+    expect(logs).toHaveLength(1); expect(logs[0]).toMatchObject({ event: 'wildduck_search', outcome: 'success', scope: 'global', timeoutMs: 60, status: 200 });
+    expect(logs[0]?.headersMs).toBeGreaterThanOrEqual(10); expect(logs[0]?.durationMs).toBeGreaterThanOrEqual(logs[0]?.headersMs ?? 0); expect(logs[0]).not.toHaveProperty('category');
+    await errorCode(backend.submitDraft(session, target), 'upstream_timeout'); expect(urls).toHaveLength(2);
+});
+test('default search budget is 45 seconds, override fallback remains compatible and live request remainder clamps it', async () => {
+    for (const [options, expected] of [[{}, 45000], [{ timeoutMs: 17 }, 17], [{ searchTimeoutMs: 120000 }, 120000]] as const) {
+        const logs: SearchDiagnostic[] = []; const backend = createMailBackend({ ...options, onSearchDiagnostic: value => { logs.push(value); }, fetch: (async _url => Response.json({ success: true, results: [] })) as typeof fetch });
+        await backend.searchMessages(session, { subject: 'synthetic', limit: 1 }); expect(logs[0]?.timeoutMs).toBe(expected);
+    }
+    const logs: SearchDiagnostic[] = []; let calls = 0; let remaining = 60000;
+    const backend = createMailBackend({ onSearchDiagnostic: value => { logs.push(value); }, fetch: (async _url => { calls++; return Response.json({ success: true, results: [] }); }) as typeof fetch });
+    await withRequestBudget(() => remaining, async () => { remaining = 2007; await backend.searchMessages(session, { mailboxId, subject: 'synthetic', limit: 1 }); });
+    expect(logs[0]).toMatchObject({ timeoutMs: 7, scope: 'mailbox', outcome: 'success' });
+    for (const exhausted of [2000, 0]) {
+        await withRequestBudget(() => exhausted, async () => { await errorCode(backend.searchMessages(session, { subject: 'synthetic', limit: 1 }), 'upstream_timeout'); });
+    }
+    expect(calls).toBe(1); expect(logs).toHaveLength(3); expect(logs[1]).toMatchObject({ category: 'deadline', timeoutMs: 0 });
+    for (const bad of [0, 120001, NaN]) { expect(() => createMailBackend({ searchTimeoutMs: bad })).toThrow(MailError); }
+});
+test('one sanitized diagnostic distinguishes deadline, network, HTTP, JSON, shape and response cap failures', async () => {
+    const cases: Array<{ category: string; code: MailFailureCode; fetcher: typeof fetch }> = [
+        { category: 'deadline', code: 'upstream_timeout', fetcher: (async (_url, init) => await new Promise((_resolve, reject) => { init?.signal?.addEventListener('abort', () => { reject(new Error(`hostile ${token}`)); }); })) as typeof fetch },
+        { category: 'network', code: 'temporarily_unavailable', fetcher: (async (_url): Promise<Response> => { throw Object.assign(new Error(`hostile ${token}`), { url: `private-${accountId}`, query: 'private-query' }); }) as typeof fetch },
+        { category: 'http_status', code: 'temporarily_unavailable', fetcher: (async _url => new Response(`private ${token}`, { status: 502, headers: { 'content-type': 'text/html' } })) as typeof fetch },
+        { category: 'invalid_json', code: 'temporarily_unavailable', fetcher: (async _url => new Response(`{private ${token}`, { headers: { 'content-type': 'application/json' } })) as typeof fetch },
+        { category: 'invalid_shape', code: 'temporarily_unavailable', fetcher: (async _url => Response.json({ success: true, results: [message({ flagged: undefined })] })) as typeof fetch },
+        { category: 'too_large', code: 'too_large', fetcher: (async _url => Response.json({ success: true, results: [], private: token, extra: 'x'.repeat(512 * 1024) })) as typeof fetch },
+    ];
+    for (const value of cases) {
+        const logs: SearchDiagnostic[] = []; const backend = createMailBackend({ timeoutMs: 5, fetch: value.fetcher, onSearchDiagnostic: diagnostic => { logs.push(diagnostic); } });
+        await errorCode(backend.searchMessages(session, { from: 'private-query', limit: 1 }), value.code);
+        expect(logs).toHaveLength(1); expect(logs[0]).toMatchObject({ event: 'wildduck_search', outcome: 'failure', scope: 'global', category: value.category });
+        const serialized = JSON.stringify(logs); for (const secret of [token, accountId, mailboxId, 'private-query', 'hostile']) { expect(serialized).not.toContain(secret); }
+        expect(Object.keys(logs[0] ?? {}).every(key => ['event', 'outcome', 'scope', 'category', 'durationMs', 'headersMs', 'bodyMs', 'validationMs', 'status', 'timeoutMs'].includes(key))).toBe(true);
+    }
+});
+test('body and validation timings are retained and throwing logger or late fetch cannot change results or log twice', async () => {
+    const logs: SearchDiagnostic[] = [];
+    const backend = createMailBackend({ timeoutMs: 100, onSearchDiagnostic: value => { logs.push(value); throw new Error('logger failure'); }, fetch: (async _url => new Response(new ReadableStream({ async start(controller) { await pause(8); controller.enqueue(new TextEncoder().encode('{"success":true,"results":[]}')); controller.close(); } }), { headers: { 'content-type': 'application/json' } })) as typeof fetch });
+    expect(await backend.searchMessages(session, { subject: 'synthetic', limit: 1 })).toEqual({ messages: [] });
+    expect(logs[0]?.bodyMs).toBeGreaterThanOrEqual(5); expect(logs[0]?.validationMs).toBeGreaterThanOrEqual(0);
+    const late: SearchDiagnostic[] = [];
+    const slow = createMailBackend({ timeoutMs: 5, onSearchDiagnostic: value => { late.push(value); }, fetch: (async _url => { await pause(20); return Response.json({ success: true, results: [] }); }) as typeof fetch });
+    await errorCode(slow.searchMessages(session, { subject: 'synthetic', limit: 1 }), 'upstream_timeout');
+    const first = JSON.stringify(late); await pause(30); expect(late).toHaveLength(1); expect(JSON.stringify(late)).toBe(first);
 });

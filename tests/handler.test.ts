@@ -24,3 +24,26 @@ test('serialized response bound prevents silent omission and counts escaped JSON
     expect(denied.statusCode).toBe(502); expect(JSON.parse(denied.body).error).toBe('response_too_large'); expect(denied.body).toContain('no data was silently dropped'); expect(denied.body).toContain('identical operation_id'); expect(denied.body).not.toContain('private-response-data'); expect(Buffer.byteLength(JSON.stringify(denied))).toBeLessThan(MAX_LAMBDA_PAYLOAD_BYTES);
     const ordinary = await invoke(lambdaEvent('/small')); expect(ordinary.statusCode).toBe(200); expect(JSON.parse(ordinary.body)).toEqual({ ok: true }); expect(ordinary.cookies).toEqual(['safe=value; Secure; HttpOnly']);
 });
+test('Lambda budget remains live after authentication and trusts only the bound server context', async () => {
+    const { remainingRequestTimeMs } = await import('../src/request-budget');
+    let remaining = 30_000, reads = 0; const app = new Hono();
+    app.use('*', async (_context, next) => { expect(reads).toBe(0); await Promise.resolve(); remaining = 1900; await next(); });
+    app.post('/mcp', context => context.json({ remaining: remainingRequestTimeMs() }));
+    const invoke = createLambdaHandler(app); const event = lambdaEvent('/mcp', 'POST', JSON.stringify({ remainingRequestTimeMs: 999_999, getRemainingTimeInMillis: 999_999 })); event.headers['x-request-budget-ms'] = '999999'; event.headers['x-lambda-remaining-time'] = '999999';
+    const serverContext = { getRemainingTimeInMillis() { expect(this).toBe(serverContext); reads++; return remaining; } };
+    const result = await invoke(event, serverContext as import('@hono/aws-lambda').LambdaContext);
+    expect(JSON.parse(result.body).remaining).toBe(1900); expect(reads).toBe(1); expect(remainingRequestTimeMs()).toBeUndefined();
+    const absent = new Hono(); absent.post('/mcp', context => context.json({ remaining: remainingRequestTimeMs() ?? null }));
+    const withoutContext = await createLambdaHandler(absent)(event); expect(JSON.parse(withoutContext.body).remaining).toBeNull();
+});
+test('concurrent Lambda invocations isolate live budgets and exhausted or invalid contexts fail closed', async () => {
+    const { remainingRequestTimeMs } = await import('../src/request-budget');
+    const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>(); let firstRemaining = 15_000;
+    const app = new Hono(); app.get('/first', async context => { entered.resolve(); await release.promise; return context.json({ remaining: remainingRequestTimeMs() }); }); app.get('/second', context => context.json({ remaining: remainingRequestTimeMs() }));
+    const invoke = createLambdaHandler(app); const first = invoke(lambdaEvent('/first'), { getRemainingTimeInMillis: () => firstRemaining } as import('@hono/aws-lambda').LambdaContext); await entered.promise;
+    const second = await invoke(lambdaEvent('/second'), { getRemainingTimeInMillis: () => 4000 } as import('@hono/aws-lambda').LambdaContext); expect(JSON.parse(second.body).remaining).toBe(4000); const absent = await invoke(lambdaEvent('/second')); expect(JSON.parse(absent.body).remaining).toBeUndefined(); firstRemaining = 1000; release.resolve(); expect(JSON.parse((await first).body).remaining).toBe(1000);
+    for (const getter of [() => 0, () => NaN, () => { throw new Error('private budget failure'); }, undefined]) {
+        const result = await invoke(lambdaEvent('/second'), { getRemainingTimeInMillis: getter } as unknown as import('@hono/aws-lambda').LambdaContext); expect(JSON.parse(result.body).remaining).toBe(0); expect(result.body).not.toContain('private');
+    }
+    expect(remainingRequestTimeMs()).toBeUndefined();
+});

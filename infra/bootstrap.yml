@@ -84,6 +84,7 @@ Resources:
               Fn::Select: [2, {Fn::Split: ['/', {Ref: FunctionUrlOrigin}]}]
             CustomOriginConfig:
               OriginProtocolPolicy: https-only
+              OriginReadTimeout: 60
               OriginSSLProtocols: [TLSv1.2]
         DefaultCacheBehavior:
           TargetOriginId: lambda-function-url

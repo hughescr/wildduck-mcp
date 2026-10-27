@@ -98,3 +98,37 @@ test('published descriptions distinguish existing API snapshots and authored sou
     expect(description('update_draft')).toContain('legacy/observed drafts are rejected before upload'); expect(description('send_draft')).toContain('verified before dispatch'); expect(description('read_message')).toContain('potential upstream truncation');
     const read = tools.find((tool: { name: string }) => tool.name === 'read_message'); expect(read.outputSchema.properties.textTruncated.description).toContain('potentially truncated upstream');
 });
+test('read errors never prescribe operation IDs or write ambiguity handling', async () => {
+    const inputs = { list_mailboxes: {}, list_messages: { mailboxId }, search_messages: { subject: 'Requested search' }, read_message: { mailboxId, uid: 1 }, read_attachment: { mailboxId, uid: 1, attachmentId: 'ATT1' } };
+    for (const name of Object.keys(inputs) as (keyof typeof inputs)[]) {
+        for (const error of [new MailError('temporarily_unavailable'), new MailError('upstream_timeout'), new MailError('verification_failed'), new MailError('version_conflict'), new MailError('unsupported_content'), new MailError('unsupported_draft'), new MailError('no_recipients'), new Error('private failure')]) {
+            const f = fixture(); f.mail[name] = async () => { throw error; };
+            const result = (await f.call(name, inputs[name])).result; const text = result.content[0].text;
+            expect(result.isError).toBe(true); expect(text).not.toMatch(/operation_id|resend|new (?:ID|operation)|for (?:a )?write|uncertain outcome|editing or sending|before sending|canonical Drafts/i); expect(text).not.toContain('private failure');
+        }
+    }
+    const f = fixture(); const searches: unknown[] = []; f.mail.search_messages = async input => { searches.push(input); throw new MailError('temporarily_unavailable'); };
+    const unavailable = (await f.call('search_messages', { subject: 'Requested search' })).result.content[0].text;
+    expect(unavailable).toContain('search is temporarily unavailable'); expect(unavailable).not.toMatch(/timeout|timed out/i); expect(searches).toEqual([{ subject: 'Requested search', limit: 20 }]);
+});
+test('write temporary and verification failures retain conservative same-operation retry guidance', async () => {
+    const inputs = { create_draft: { operation_id, subject: '', body: { text: '', html: null } }, update_draft: { uid: 1, expected_version: version, operation_id, subject: 'Change' }, delete_draft: { uid: 1, expected_version: version, operation_id }, send_draft: { uid: 1, expected_version: version, operation_id }, move_message: { mailboxId, uid: 1, destinationMailboxId: 'c'.repeat(24), expected_version: version, operation_id }, update_message_flags: { mailboxId, uid: 1, expected_version: version, operation_id, seen: false } };
+    for (const name of Object.keys(inputs) as (keyof typeof inputs)[]) {
+        for (const code of ['temporarily_unavailable', 'upstream_timeout', 'verification_failed'] as const) {
+            const f = fixture(); f.mail[name] = async () => { throw new MailError(code); };
+            const result = (await f.call(name, inputs[name])).result; expect(result.isError).toBe(true); expect(result.content[0].text).toContain('same operation_id'); expect(result.content[0].text).toMatch(/do not (?:retry under a new ID|submit a new operation)/i);
+        }
+    }
+});
+
+test('actual upstream timeout reports read budget exhaustion without guessing generic failures are timeouts', async () => {
+    const f = fixture(); f.mail.search_messages = async () => { throw new MailError('upstream_timeout'); };
+    const result = (await f.call('search_messages', { subject: 'Requested search' })).result;
+    expect(result.isError).toBe(true); expect(result.content[0].text).toContain('exceeded the available request time budget'); expect(result.content[0].text).toContain('explicitly narrow'); expect(result.content[0].text).not.toContain('operation_id');
+});
+
+test('durable preflight timeout receipts retain explicit same-operation guidance', async () => {
+    const f = fixture(); f.mail.create_draft = async input => ({ status: 'failed', operation_id: input.operation_id, reason: 'upstream_timeout' });
+    const result = (await f.call('create_draft', { operation_id, subject: '', body: { text: '', html: null } })).result;
+    expect(result.isError).toBe(true); expect(result.structuredContent.reason).toBe('upstream_timeout'); expect(result.content[1].text).toContain('same operation_id');
+});

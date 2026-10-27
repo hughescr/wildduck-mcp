@@ -4,19 +4,22 @@ import { MailError, type AttachmentDownload, type BoundMailService, type MailInp
 import { mailInputSchemas, mailOutputSchemas, MAX_ATTACHMENT_BYTES } from './mail/schemas';
 const requiredScope = { list_mailboxes: 'mail:read', list_messages: 'mail:read', search_messages: 'mail:read', read_message: 'mail:read', read_attachment: 'mail:read', create_draft: 'mail:draft', update_draft: 'mail:draft', delete_draft: 'mail:draft', send_draft: 'mail:send', move_message: 'mail:modify', update_message_flags: 'mail:modify' } as const;
 function errorText(error: unknown, name: MailToolName): string {
+    const write = requiredScope[name] !== 'mail:read';
+    const readUnavailable = name === 'search_messages' ? 'Mail search is temporarily unavailable. You may try again later or explicitly narrow the mailbox or date filters.' : 'Mail is temporarily unavailable. Please try again later.';
     const messages = {
         forbidden: `Access denied. This tool requires ${requiredScope[name]}; reconnect and authorize that scope if it is missing.`,
         reconnect_required: 'Reconnect your mail account before using this tool.',
         not_found: 'The requested mailbox, message or attachment was not found.',
-        version_conflict: 'The message changed. Read it again and review the current version before creating a new operation.',
-        unsupported_draft: 'This operation requires a supported draft in the account’s canonical Drafts mailbox.',
-        unsupported_content: 'This content cannot be preserved safely. Editing or sending requires durable MCP-authored source proof with matching current bytes; legacy or externally changed drafts may be unsupported. Create a new draft through this service when needed. No content is silently dropped.',
+        version_conflict: write ? 'The message changed. Read it again and review the current version before creating a new operation.' : 'The message changed. Read it again and review the current version.',
+        unsupported_draft: write ? 'This operation requires a supported draft in the account’s canonical Drafts mailbox.' : 'The requested message is not supported by this read operation.',
+        unsupported_content: write ? 'This content cannot be preserved safely. Editing or sending requires durable MCP-authored source proof with matching current bytes; legacy or externally changed drafts may be unsupported. Create a new draft through this service when needed. No content is silently dropped.' : 'The requested message or attachment content is unsupported. No content is silently dropped.',
         source_integrity_unavailable: 'Available message source or metadata could not be verified. The operation cannot proceed safely; missing data is not reconstructed.',
         too_large: 'The request, message or attachment exceeds a supported bound. It has not been silently truncated.',
-        verification_failed: 'The requested result could not be verified. For writes, keep the same operation_id and review its durable status; do not retry under a new ID.',
-        no_recipients: 'The draft has no recipients, including Bcc. Add a recipient before sending.',
+        verification_failed: write ? 'The requested result could not be verified. For writes, keep the same operation_id and review its durable status; do not retry under a new ID.' : 'The requested result could not be verified. Please try again later.',
+        no_recipients: write ? 'The draft has no recipients, including Bcc. Add a recipient before sending.' : 'The mail response lacks required recipient information.',
         invalid_input: 'The mail request is invalid.',
-        temporarily_unavailable: 'Mail is temporarily unavailable. For a write, keep the same operation_id when checking its result; do not submit a new operation after an uncertain outcome.',
+        upstream_timeout: write ? 'The upstream request exceeded the available time budget. Keep the same operation_id when checking its durable result; do not submit a new operation after an uncertain outcome.' : name === 'search_messages' ? 'Mail search exceeded the available request time budget. You may try again later or explicitly narrow the mailbox or date filters.' : 'The mail read exceeded the available request time budget. Please try again later.',
+        temporarily_unavailable: write ? 'Mail is temporarily unavailable. For a write, keep the same operation_id when checking its result; do not submit a new operation after an uncertain outcome.' : readUnavailable,
     };
     return error instanceof MailError ? messages[error.code] ?? messages.temporarily_unavailable : messages.temporarily_unavailable;
 }
@@ -43,7 +46,8 @@ export async function handleMcp(request: Request, authInfo: AuthInfo, mail: Boun
             const status = 'status' in result ? result.status : undefined;
             const truncated = ('textTruncated' in result && result.textTruncated) || ('htmlTruncated' in result && result.htmlTruncated);
             const incomplete = truncated || ['failed', 'conflict', 'partial', 'in_progress', 'outcome_unknown'].includes(status ?? '');
-            const explanation = status === 'outcome_unknown' ? 'Outcome unknown. Do not resend or use a new operation_id. Repeating the identical request only retrieves its stored status.'
+            const explanation = status === 'failed' && 'reason' in result && result.reason === 'upstream_timeout' ? errorText(new MailError('upstream_timeout'), name)
+                : status === 'outcome_unknown' ? 'Outcome unknown. Do not resend or use a new operation_id. Repeating the identical request only retrieves its stored status.'
                 : status === 'partial' ? 'Partial operation: inspect candidate verification and originalDeletion. This is not complete success. Manual review may be needed; do not retry under a new operation_id.'
                 : status === 'in_progress' ? 'Operation pending. Repeat only the identical request with the same operation_id to check its stored status.'
                 : truncated ? 'Incomplete read: returned text or HTML is truncated locally or potentially truncated upstream. Do not treat it as the complete message.' : undefined;

@@ -9,7 +9,7 @@ provider:
   region: us-west-2
   stage: prod
   memorySize: 1024
-  timeout: 30
+  timeout: 60
   versionFunctions: true
   logRetentionInDays: 14
   deploymentBucket:

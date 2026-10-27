@@ -406,3 +406,55 @@ test('queued Sent activation never carries authored bytes into later flags or pr
     expect(flagged.status).toBe('completed'); if (flagged.status === 'completed') { expect(flagged.proof.sourceGrade).toBe('observed'); }
     expect(f.calls.filter(call => call.method === 'sourcecheck')).toHaveLength(1);
 });
+
+test('upstream_timeout after dispatched upload, submit or flags preserves uncertainty and every client fence', async () => {
+    for (const tool of ['update_draft', 'send_draft', 'update_message_flags'] as const) {
+        const f = fixture(); let effects = 0;
+        const observedEffect = () => {
+            const record = f.operations.records.get(keyOf({ accountId, clientIdHash: digest(context.clientId), operationId: operation_id }));
+            expect(record?.state).toBe('dispatched'); effects++;
+        };
+        if (tool === 'update_draft') {
+            const upload = f.writer.uploadPreparedDraft;
+            f.writer.uploadPreparedDraft = async (...args) => { await upload(...args); observedEffect(); throw new MailError('upstream_timeout'); };
+        } else if (tool === 'send_draft') {
+            const submit = f.writer.submitDraft;
+            f.writer.submitDraft = async (...args) => { await submit(...args); observedEffect(); throw new MailError('upstream_timeout'); };
+        } else {
+            const flags = f.writer.updateMessageFlags;
+            f.writer.updateMessageFlags = async (...args) => { await flags(...args); observedEffect(); throw new MailError('upstream_timeout'); };
+        }
+        const request = tool === 'update_draft' ? { ...target, subject: 'change' } : tool === 'update_message_flags' ? { ...target, mailboxId, seen: true } : target;
+        const unknown = { status: 'outcome_unknown', operation_id, reason: 'dispatch_uncertain' } as const;
+        expect(await f.service[tool](context, request as never)).toEqual(unknown);
+        const calls = f.calls.length;
+        expect(await f.service[tool](context, request as never)).toEqual(unknown);
+        expect(f.calls.length).toBe(calls); expect(effects).toBe(1); expect(f.operations.guards.size).toBe(1);
+        for (const client of [context, { ...context, clientId: 'another-client' }]) {
+            expect(await f.service[tool](client, { ...request, operation_id: 'deadline_followup_001' } as never)).toEqual({ status: 'conflict', operation_id: 'deadline_followup_001', reason: 'draft_fenced' });
+        }
+        expect(effects).toBe(1); expect(f.operations.guards.size).toBe(1);
+        expect(f.calls.filter(call => ['upload', 'submit', 'flags'].includes(call.method))).toHaveLength(1);
+    }
+});
+test('upstream_timeout during source verification settles failure and releases the guard before dispatch', async () => {
+    const f = fixture(); let checks = 0;
+    const verify = f.writer.verifyAuthoredSource;
+    f.writer.verifyAuthoredSource = async () => { checks++; throw new MailError('upstream_timeout'); };
+    const failed = { status: 'failed', operation_id, reason: 'upstream_timeout' } as const;
+    expect(await f.service.send_draft(context, target)).toEqual(failed);
+    expect(f.operations.calls).not.toContain('dispatch'); expect(posts(f)).toHaveLength(0);
+    expect(f.calls.some(call => call.method === 'stamp')).toBe(false); expect(f.operations.guards.size).toBe(0);
+    expect(await f.service.send_draft(context, target)).toEqual(failed); expect(checks).toBe(1);
+    f.writer.verifyAuthoredSource = verify;
+    expect((await f.service.send_draft(context, { ...target, operation_id: 'deadline_retry_new_001' })).status).toBe('queued');
+    expect(f.calls.filter(call => call.method === 'submit')).toHaveLength(1);
+});
+test('read and search upstream_timeout stay read errors without operation records or guards', async () => {
+    const f = fixture(false);
+    f.reader.readMessage = async () => { throw new MailError('upstream_timeout'); };
+    f.reader.searchMessages = async () => { throw new MailError('upstream_timeout'); };
+    await expect(f.service.read_message(context, { mailboxId, uid: 7 })).rejects.toMatchObject({ code: 'upstream_timeout', message: 'upstream_timeout' });
+    await expect(f.service.search_messages(context, { text: 'needle', limit: 20 })).rejects.toMatchObject({ code: 'upstream_timeout', message: 'upstream_timeout' });
+    expect(f.operations.calls).toHaveLength(0); expect(f.operations.records.size).toBe(0); expect(f.operations.guards.size).toBe(0); expect(posts(f)).toHaveLength(0);
+});

@@ -114,7 +114,7 @@ test('CloudFront uses the approved shared certificate and DNS pattern with an in
 test('all OAuth ingress paths disable caching and forward auth, cookies, origin and query metadata', () => {
     expect(cloudFront.Origins).toHaveLength(1);
     expect(cloudFront.Origins[0]?.DomainName).toEqual({ 'Fn::Select': [2, { 'Fn::Split': ['/', { Ref: 'FunctionUrlOrigin' }] }] });
-    expect(cloudFront.Origins[0]?.CustomOriginConfig).toEqual({ OriginProtocolPolicy: 'https-only', OriginSSLProtocols: ['TLSv1.2'] });
+    expect(cloudFront.Origins[0]?.CustomOriginConfig).toEqual({ OriginProtocolPolicy: 'https-only', OriginSSLProtocols: ['TLSv1.2'], OriginReadTimeout: 60 });
     expect(cloudFront.CacheBehaviors.map(behavior => behavior.PathPattern)).toEqual(['/token', '/revoke']);
     for (const behavior of [cloudFront.DefaultCacheBehavior, ...cloudFront.CacheBehaviors]) {
         expect(behavior.AllowedMethods).toEqual(['GET', 'HEAD', 'OPTIONS', 'PUT', 'PATCH', 'POST', 'DELETE']);
