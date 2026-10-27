@@ -103,7 +103,7 @@ test('invalid pagination and target inputs fail before network and no endpoint a
     await errorCode(f.backend.searchMessages(session, { text: 'x'.repeat(256), limit: 20 }), 'invalid_input'); expect(f.calls).toHaveLength(0);
 });
 test('read returns plain bounded text and normalized metadata without changing Seen or fetching bytes', async () => {
-    const f = fixture([message({ text: '🦊'.repeat(MAX_READ_TEXT_BYTES / 4 + 1), attachments: [{ id: 'ATT00001', filename: 'photo.png', contentType: 'image/png', size: 4, related: true }], date: 'invalid', idate: '2026-10-26T02:00:00Z' })]);
+    const f = fixture([message({ text: '🦊'.repeat(MAX_READ_TEXT_BYTES / 4 + 1), attachments: [{ id: 'ATT00001', filename: 'photo.png', contentType: 'image/png', transferEncoding: 'binary', size: 4, related: true }], date: 'invalid', idate: '2026-10-26T02:00:00Z' })]);
     const { message: result } = await f.backend.readMessage(session, target);
     expect(result.textTruncated).toBe(true); expect(Buffer.byteLength(result.text)).toBe(MAX_READ_TEXT_BYTES); expect(result.text.endsWith('🦊')).toBe(true); expect(result.date).toBe(null); expect(result.receivedAt).toBe('2026-10-26T02:00:00.000Z');
     expect(result.attachments).toEqual([{ attachmentId: 'ATT00001', filename: 'photo.png', contentType: 'image/png', size: 4, sizeIsApproximate: false, inline: true, cid: null }]); expect(result.htmlRepresentation).toBe('wildduck_normalized'); expect(result.version).toMatch(/^[A-Za-z0-9_-]{43}$/u);
@@ -254,7 +254,7 @@ test('attachment retrieval returns exact bytes once, preserves unknown metadata 
     const f = fixture([message({ attachments: [{ id: 'ATT00001', filename: 'x.bin', contentType: 'application/octet-stream', cid: '<cid@example.com>' }] }), new Response(new Uint8Array([0, 1, 255]), { headers: { 'content-type': 'application/octet-stream', 'content-length': '3' } })]);
     const result = await f.backend.readAttachment(session, { ...target, attachmentId: 'ATT00001' });
     expect([...result.bytes]).toEqual([0, 1, 255]); expect(result.metadata.size).toBe(3); expect(result.metadata).not.toHaveProperty('bytes'); expect(result.metadata.resourceUri).toContain(accountId);
-    const tooLarge = fixture([message({ attachments: [{ id: 'ATT00001', contentType: 'application/octet-stream', size: 3 * 1024 * 1024 }] })]);
+    const tooLarge = fixture([message({ attachments: [{ id: 'ATT00001', contentType: 'application/octet-stream', transferEncoding: 'binary', size: 3 * 1024 * 1024 }] })]);
     await errorCode(tooLarge.backend.readAttachment(session, { ...target, attachmentId: 'ATT00001' }), 'too_large'); expect(tooLarge.calls).toHaveLength(1);
 });
 test('send marker PUT preserves source and metadata then queue response reports actual Sent key', async () => {
@@ -431,21 +431,21 @@ test('reply preparation derives recipients and MIME threading without changing t
 });
 test('staged download streams only the validated attachment and returns binary-free bounded metadata', async () => {
     const calls: { url: string; init: RequestInit }[] = []; let staged = 0; let bytes = 0;
-    const backend = createMailBackend({ fetch: (async (url, init) => { calls.push({ url: String(url), init: init ?? {} }); return calls.length === 1 ? Response.json(message({ attachments: [{ id: 'ATT1', hash: 'e'.repeat(64), filename: 'file.bin', contentType: 'application/octet-stream', size: 3 }] })) : new Response(new Uint8Array([0,1,255]), { headers: { 'content-length': '3' } }); }) as typeof fetch, downloadStager: { stage: async source => { staged++; const opened = await source.open(new AbortController().signal); expect(opened.expectedSize).toBe(3); const reader = opened.body.getReader(); while (true) { const part = await reader.read(); if (part.done) { break; } bytes += part.value.byteLength; } return { url: 'https://bucket.s3.amazonaws.com/downloads/opaque?signature=temporary', size: bytes, expiresAt: '2026-10-26T10:00:00.000Z' }; } } });
+    const backend = createMailBackend({ fetch: (async (url, init) => { calls.push({ url: String(url), init: init ?? {} }); return calls.length === 1 ? Response.json(message({ attachments: [{ id: 'ATT1', hash: 'e'.repeat(64), transferEncoding: 'binary', filename: 'file.bin', contentType: 'application/octet-stream', size: 3 }] })) : new Response(new Uint8Array([0,1,255]), { headers: { 'content-length': '3' } }); }) as typeof fetch, downloadStager: { stage: async source => { staged++; const opened = await source.open(new AbortController().signal); expect(opened.expectedSize).toBe(3); const reader = opened.body.getReader(); while (true) { const part = await reader.read(); if (part.done) { break; } bytes += part.value.byteLength; } return { url: 'https://bucket.s3.amazonaws.com/downloads/opaque?signature=temporary', size: bytes, expiresAt: '2026-10-26T10:00:00.000Z' }; } } });
     const result = await backend.getAttachmentDownload(session, { ...target, attachmentId: 'ATT1' }); expect(staged).toBe(1); expect(bytes).toBe(3); expect(result.size).toBe(3); expect(result.attachmentId).toBe('ATT1'); expect(result).not.toHaveProperty('blob'); expect(result).not.toHaveProperty('bytes'); expect(calls).toHaveLength(2); expect(calls[0]?.url).toEndWith('?markAsSeen=false&replaceCidLinks=false'); expect(calls[1]?.url).toEndWith('/attachments/ATT1'); expect(calls.every(call => call.init.method === 'GET' && new Headers(call.init.headers).get('X-Access-Token') === token)).toBe(true);
 });
 test('staged download rejects absent or oversized metadata before fetching bytes and fails closed on mismatch', async () => {
-    for (const attachments of [[], [{ id: 'ATT1', hash: 'e'.repeat(64), contentType: 'text/plain', size: 20 * 1024 * 1024 + 1 }]]) {
+    for (const attachments of [[], [{ id: 'ATT1', hash: 'e'.repeat(64), transferEncoding: 'binary', contentType: 'text/plain', size: 20 * 1024 * 1024 + 1 }]]) {
         let calls = 0; const backend = createMailBackend({ fetch: (async (_url: string | URL | Request) => { calls++; return Response.json(message({ attachments })); }) as typeof fetch, downloadStager: { stage: async () => { throw new Error('must not stage'); } } });
         await errorCode(backend.getAttachmentDownload(session, { ...target, attachmentId: 'ATT1' }), attachments.length ? 'too_large' : 'not_found'); expect(calls).toBe(1);
     }
-    let calls = 0; const backend = createMailBackend({ fetch: (async (_url: string | URL | Request) => ++calls === 1 ? Response.json(message({ attachments: [{ id: 'ATT1', hash: 'e'.repeat(64), contentType: 'text/plain', size: 3 }] })) : new Response('abc', { headers: { 'content-length': '3' } })) as typeof fetch, downloadStager: { stage: async source => { const opened = await source.open(new AbortController().signal); await opened.body.cancel(); return { url: 'https://bucket.s3.amazonaws.com/file', size: 2, expiresAt: '2026-10-26T10:00:00.000Z' }; } } });
+    let calls = 0; const backend = createMailBackend({ fetch: (async (_url: string | URL | Request) => ++calls === 1 ? Response.json(message({ attachments: [{ id: 'ATT1', hash: 'e'.repeat(64), transferEncoding: 'binary', contentType: 'text/plain', size: 3 }] })) : new Response('abc', { headers: { 'content-length': '3' } })) as typeof fetch, downloadStager: { stage: async source => { const opened = await source.open(new AbortController().signal); await opened.body.cancel(); return { url: 'https://bucket.s3.amazonaws.com/file', size: 2, expiresAt: '2026-10-26T10:00:00.000Z' }; } } });
     await errorCode(backend.getAttachmentDownload(session, { ...target, attachmentId: 'ATT1' }), 'verification_failed');
 });
 
 test('conflicting exact attachment lengths fail before staging and cancel the body', async () => {
     let calls = 0; let stages = 0; let cancelled = false;
-    const backend = createMailBackend({ fetch: (async (_url: string | URL | Request) => ++calls === 1 ? Response.json(message({ attachments: [{ id: 'ATT1', hash: 'e'.repeat(64), contentType: 'text/plain', size: 3 }] })) : new Response(new ReadableStream({ cancel() { cancelled = true; } }), { headers: { 'content-length': '4' } })) as typeof fetch, downloadStager: { stage: async source => { stages++; await source.open(new AbortController().signal); throw new Error('must not complete staging'); } } });
+    const backend = createMailBackend({ fetch: (async (_url: string | URL | Request) => ++calls === 1 ? Response.json(message({ attachments: [{ id: 'ATT1', hash: 'e'.repeat(64), transferEncoding: 'binary', contentType: 'text/plain', size: 3 }] })) : new Response(new ReadableStream({ cancel() { cancelled = true; } }), { headers: { 'content-length': '4' } })) as typeof fetch, downloadStager: { stage: async source => { stages++; await source.open(new AbortController().signal); throw new Error('must not complete staging'); } } });
     await errorCode(backend.getAttachmentDownload(session, { ...target, attachmentId: 'ATT1' }), 'verification_failed'); expect(stages).toBe(1); expect(cancelled).toBe(true);
 });
 
@@ -455,7 +455,7 @@ test('cached attachment links revalidate message access and reuse identity acros
     const backend = createMailBackend({ fetch: (async (url: string | URL | Request) => {
         if (String(url).endsWith('/attachments/ATT1')) { byteReads++; return new Response('abc', { headers: { 'content-length': '3' } }); }
         metadataReads++; if (removed) { return Response.json({ error: 'Gone' }, { status: 404 }); }
-        return Response.json(message({ seen: metadataReads > 1, flags: metadataReads > 1 ? ['\\Seen'] : [], attachments: [{ id: 'ATT1', hash: 'e'.repeat(64), contentType: 'text/plain', filename: 'same.txt', size: 3 }] }));
+        return Response.json(message({ seen: metadataReads > 1, flags: metadataReads > 1 ? ['\\Seen'] : [], attachments: [{ id: 'ATT1', hash: 'e'.repeat(64), transferEncoding: 'binary', contentType: 'text/plain', filename: 'same.txt', size: 3 }] }));
     }) as typeof fetch, downloadStager: { stage: async source => {
         stages++; identities.push(source.cacheIdentity); let size = cached.get(source.cacheIdentity);
         if (size === undefined) { const opened = await source.open(new AbortController().signal); const bytes = await new Response(opened.body).arrayBuffer(); size = bytes.byteLength; cached.set(source.cacheIdentity, size); }
@@ -470,7 +470,7 @@ test('cached attachment identity is account and message scoped and changes with 
     const identities: string[] = []; let hash = 'e'.repeat(64);
     const backend = createMailBackend({ fetch: (async (url: string | URL | Request) => {
         const parts = new URL(String(url)).pathname.split('/');
-        return Response.json(message({ user: parts[2], mailbox: parts[4], id: Number(parts[6]), attachments: [{ id: 'ATT1', hash, contentType: 'text/plain', size: 3 }] }));
+        return Response.json(message({ user: parts[2], mailbox: parts[4], id: Number(parts[6]), attachments: [{ id: 'ATT1', hash, transferEncoding: 'binary', contentType: 'text/plain', size: 3 }] }));
     }) as typeof fetch, downloadStager: { stage: async source => { identities.push(source.cacheIdentity); return { url: 'https://bucket.s3.amazonaws.com/file', size: 3, expiresAt: new Date(Date.now() + 300000).toISOString() }; } } });
     await backend.getAttachmentDownload(session, { ...target, attachmentId: 'ATT1' });
     await backend.getAttachmentDownload({ ...session, accountId: 'f'.repeat(24) }, { ...target, attachmentId: 'ATT1' });
@@ -490,10 +490,37 @@ test('missing or invalid immutable hashes fail before cache lookup or upstream b
 test('lazy cache miss fetch preserves sanitized attachment status errors and supplied retry hints', async () => {
     for (const [status, code, expected] of [[403, 'InvalidToken', 'reconnect_required'], [403, 'AccessDenied', 'forbidden'], [404, 'MessageNotFound', 'not_found'], [429, 'RateLimited', 'temporarily_unavailable']] as const) {
         let requests = 0;
-        const backend = createMailBackend({ fetch: (async (_url: string | URL | Request) => ++requests === 1 ? Response.json(message({ attachments: [{ id: 'ATT1', hash: 'e'.repeat(64), contentType: 'text/plain', size: 3 }] })) : Response.json({ code, error: 'private upstream response' }, { status, headers: { 'Retry-After': '20' } })) as typeof fetch, downloadStager: { stage: async source => { await source.open(new AbortController().signal); throw new Error('must not complete'); } } });
+        const backend = createMailBackend({ fetch: (async (_url: string | URL | Request) => ++requests === 1 ? Response.json(message({ attachments: [{ id: 'ATT1', hash: 'e'.repeat(64), transferEncoding: 'binary', contentType: 'text/plain', size: 3 }] })) : Response.json({ code, error: 'private upstream response' }, { status, headers: { 'Retry-After': '20' } })) as typeof fetch, downloadStager: { stage: async source => { await source.open(new AbortController().signal); throw new Error('must not complete'); } } });
         try { await backend.getAttachmentDownload(session, { ...target, attachmentId: 'ATT1' }); throw new Error('Expected failure'); } catch (error) {
             expect(error).toBeInstanceOf(MailError); expect((error as MailError).code).toBe(expected); expect((error as MailError).retryAfter).toBe(status === 429 ? 20 : undefined); expect(JSON.stringify(error)).not.toContain('private');
         }
         expect(requests).toBe(2);
     }
+});
+
+test('attachment sizes describe decoded bytes honestly for encoded, identity and unknown transfer encodings', async () => {
+    const cases = [
+        { raw: { size: 828924, sizeKb: 592, transferEncoding: 'base64' }, size: 606208, approximate: true },
+        { raw: { size: 828924, transferEncoding: 'base64' }, size: 828924, approximate: true },
+        { raw: { size: 24, sizeKb: 1, transferEncoding: 'quoted-printable' }, size: 1024, approximate: true },
+        { raw: { size: 4, sizeKb: 1, transferEncoding: '7bit' }, size: 4, approximate: false },
+        { raw: { size: 4, transferEncoding: '8bit' }, size: 4, approximate: false },
+        { raw: { size: 4, transferEncoding: 'binary' }, size: 4, approximate: false },
+        { raw: { size: 4, transferEncoding: ' BASE64 ' }, size: 4, approximate: true },
+        { raw: { size: 4, transferEncoding: 'unknown' }, size: 4, approximate: true },
+        { raw: { size: 4 }, size: 4, approximate: true },
+        { raw: { size: 4, transferEncoding: null }, size: 4, approximate: true },
+        { raw: { size: 4, transferEncoding: 7 }, size: 4, approximate: true },
+        { raw: { sizeKb: 1, transferEncoding: 'binary' }, size: 1024, approximate: true },
+    ];
+    for (const value of cases) {
+        const f = fixture([message({ attachments: [{ id: 'ATT1', contentType: 'application/octet-stream', ...value.raw }] })]);
+        const metadata = (await f.backend.readMessage(session, target)).message.attachments[0];
+        expect(metadata?.size).toBe(value.size); expect(metadata?.sizeIsApproximate).toBe(value.approximate);
+    }
+});
+test('inline attachment decoded cap does not reject an oversized transfer-encoded metadata size', async () => {
+    const decoded = Buffer.alloc(1600 * 1024, 13);
+    const f = fixture([message({ attachments: [{ id: 'ATT1', contentType: 'application/octet-stream', transferEncoding: 'base64', size: 2242010, sizeKb: 1600 }] }), new Response(decoded, { headers: { 'content-length': String(decoded.byteLength) } })]);
+    const result = await f.backend.readAttachment(session, { ...target, attachmentId: 'ATT1' }); expect(result.bytes).toEqual(decoded); expect(result.metadata.size).toBe(decoded.byteLength); expect(f.calls).toHaveLength(2);
 });

@@ -94,9 +94,16 @@ function summary(raw: Json, mailbox?: string): MessageSummary {
 }
 function attachment(raw: unknown): AttachmentMetadata {
     if (!object(raw)) { return fail(); }
-    const bytes = raw['size'] === undefined && typeof raw['sizeKb'] === 'number' && Number.isFinite(raw['sizeKb']) && raw['sizeKb'] >= 0 ? Math.ceil(raw['sizeKb'] * 1024) : raw['size'];
+    // WildDuck stores attachments[].size as the transfer-encoded MIME body
+    // length. Its attachment endpoint decodes base64/quoted-printable, so that
+    // stored count is exact for a download only under a known identity encoding.
+    const storedBytes = raw['size'] === undefined ? undefined : count(raw['size']);
+    const encoding = typeof raw['transferEncoding'] === 'string' ? raw['transferEncoding'].trim().toLowerCase() : undefined;
+    const exact = storedBytes !== undefined && (encoding === '7bit' || encoding === '8bit' || encoding === 'binary');
+    const estimate = typeof raw['sizeKb'] === 'number' && Number.isFinite(raw['sizeKb']) && raw['sizeKb'] >= 0 ? Math.ceil(raw['sizeKb'] * 1024) : storedBytes;
+    const bytes = exact ? storedBytes : estimate;
     if (raw['related'] !== undefined && typeof raw['related'] !== 'boolean') { return fail(); }
-    return { attachmentId: string(raw['id']), filename: raw['filename'] === undefined || raw['filename'] === null ? null : string(raw['filename']), contentType: string(raw['contentType']), size: bytes === undefined ? null : count(bytes), sizeIsApproximate: bytes !== undefined && raw['size'] === undefined, inline: raw['related'] === true || raw['disposition'] === 'inline', cid: raw['cid'] === undefined || raw['cid'] === null ? null : string(raw['cid']) };
+    return { attachmentId: string(raw['id']), filename: raw['filename'] === undefined || raw['filename'] === null ? null : string(raw['filename']), contentType: string(raw['contentType']), size: bytes === undefined ? null : count(bytes), sizeIsApproximate: bytes !== undefined && !exact, inline: raw['related'] === true || raw['disposition'] === 'inline', cid: raw['cid'] === undefined || raw['cid'] === null ? null : string(raw['cid']) };
 }
 /** Preserve missing versus null, exact strings/array ordering and recursively sorted keys. */
 function stable(value: unknown): string {

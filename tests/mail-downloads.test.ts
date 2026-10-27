@@ -3,6 +3,7 @@ import { S3Client, type HeadObjectCommandOutput } from '@aws-sdk/client-s3';
 import { type getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { attachmentDisposition, createS3AttachmentDownloadStager, MAX_DOWNLOAD_BYTES, type AttachmentDownloadSource } from '../src/mail/downloads';
 import { withRequestBudget } from '../src/request-budget';
+import { createMailBackend } from '../src/mail/backend';
 import { MailError, type AttachmentMetadata, type MailFailureCode } from '../src/mail/contracts';
 
 type Command = { constructor: { name: string }; input: Record<string, unknown> };
@@ -213,4 +214,54 @@ test('lazy opener preserves sanitized upstream mail failures and Retry-After wit
     }
     const f = fixture(); const input = source([]); input.open = async () => { throw new Error('token-private upstream body'); };
     await fails(f.stager.stage(input), 'temporarily_unavailable');
+});
+
+function decodedAttachmentBackend(stager: ReturnType<typeof fixture>['stager'], attachment: { transferEncoding: string; encodedSize: number; decodedSize: number }, declaredSize?: number) {
+    const session = { accountId: 'a'.repeat(24), accessToken: 'c'.repeat(40) }; const target = { mailboxId: 'b'.repeat(24), uid: 12, attachmentId: 'ATT1' };
+    const decoded = Buffer.alloc(attachment.decodedSize, 19); let metadataReads = 0; let attachmentReads = 0;
+    const backend = createMailBackend({ downloadStager: stager, fetch: (async (url, init) => {
+        expect(init?.method).toBe('GET'); expect(new Headers(init?.headers).get('X-Access-Token')).toBe(session.accessToken);
+        if (String(url).endsWith('/attachments/ATT1')) {
+            attachmentReads++;
+            return new Response(new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(decoded); controller.close(); } }), {
+                headers: { 'content-type': 'application/pdf', ...(declaredSize === undefined ? {} : { 'content-length': String(declaredSize) }) },
+            });
+        }
+        metadataReads++; expect(String(url)).toEndWith('?markAsSeen=false&replaceCidLinks=false');
+        return Response.json({ success: true, user: session.accountId, id: target.uid, mailbox: target.mailboxId, subject: '', from: [], to: [], replyTo: [], cc: [], bcc: [],
+            date: '2026-10-26T00:00:00.000Z', idate: '2026-10-26T00:00:00.000Z', flags: [], labels: [], seen: false, flagged: false, draft: false, answered: false, deleted: false, forwarded: false,
+            text: '', html: [], envelope: { from: '', rcpt: [] }, metaData: {}, references: [], contentType: { value: 'multipart/mixed' },
+            attachments: [{ id: target.attachmentId, hash: 'e'.repeat(64), filename: 'synthetic.pdf', contentType: 'application/pdf', size: attachment.encodedSize, transferEncoding: attachment.transferEncoding }],
+        });
+    }) as typeof fetch });
+    return { backend, session, target, decoded, reads: () => ({ metadata: metadataReads, attachment: attachmentReads }) };
+}
+
+test('backend and real stager accept encoded attachment metadata but measure decoded bytes and reuse the cached object', async () => {
+    for (const attachment of [
+        { transferEncoding: 'base64', encodedSize: 828924, decodedSize: 605750 },
+        { transferEncoding: 'quoted-printable', encodedSize: 1800, decodedSize: 600 },
+    ]) {
+        for (const withContentLength of [true, false]) {
+            const f = fixture(); const upstream = decodedAttachmentBackend(f.stager, attachment, withContentLength ? attachment.decodedSize : undefined);
+            const first = await upstream.backend.getAttachmentDownload(upstream.session, upstream.target);
+            expect(first.size).toBe(attachment.decodedSize); expect(Buffer.concat(f.uploaded)).toEqual(upstream.decoded);
+            const calls = f.calls.length;
+            const second = await upstream.backend.getAttachmentDownload(upstream.session, upstream.target);
+            expect(second.size).toBe(attachment.decodedSize); expect(second.url).not.toBe(first.url);
+            expect(upstream.reads()).toEqual({ metadata: 2, attachment: 1 });
+            expect(f.objects.size).toBe(1); expect(f.signed[1]?.key).toBe(f.signed[0]?.key); expect(names(f.calls.slice(calls))).toEqual(['HeadObjectCommand']);
+        }
+    }
+});
+
+test('encoded metadata does not weaken authoritative decoded Content-Length verification in the real stager', async () => {
+    const attachment = { transferEncoding: 'base64', encodedSize: 828924, decodedSize: 605750 };
+    for (const declaredSize of [attachment.decodedSize - 1, attachment.decodedSize + 1]) {
+        const f = fixture(); const upstream = decodedAttachmentBackend(f.stager, attachment, declaredSize);
+        await fails(upstream.backend.getAttachmentDownload(upstream.session, upstream.target), 'verification_failed');
+        expect(upstream.reads()).toEqual({ metadata: 1, attachment: 1 }); expect(f.signed).toHaveLength(0);
+        expect(f.objects.size).toBe(0); expect(f.uploads.size).toBe(0); expect(names(f.calls)).not.toContain('CompleteMultipartUploadCommand');
+        expect(names(f.calls).at(-1)).toBe('AbortMultipartUploadCommand');
+    }
 });
