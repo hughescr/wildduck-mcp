@@ -140,7 +140,7 @@ export function createMailService({ reader, writer, operations }: Dependencies):
                 try {
                     const available = deadline - performance.now() - 2000; if (available <= 0) { throw new MailError('upstream_timeout'); }
                     const message = await Promise.race([read('read_message', context, key), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new MailError('upstream_timeout')), available); })]);
-                    const { html: _html, ...textOnly } = message;
+                    const { html: _html, htmlTruncated: _htmlTruncated, htmlRepresentation: _htmlRepresentation, ...textOnly } = message;
                     return { status: 'ok' as const, message: parsed.includeHtml ? { ...message, htmlOmitted: false as const } : { ...textOnly, htmlOmitted: true as const } };
                 } catch (error) { return failure(key, error); } finally { if (timer !== undefined) { clearTimeout(timer); } }
             }));

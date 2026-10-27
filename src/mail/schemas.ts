@@ -107,7 +107,7 @@ export const failureReasonSchema = z.enum(['not_found', 'version_conflict', 'uns
 export const mailErrorOutputSchema = z.strictObject({ code: failureReasonSchema, message: z.string().max(1024), retry_after: z.number().int().min(0).max(86400).optional() });
 export const batchMessageOutputSchema = z.discriminatedUnion('htmlOmitted', [
     readMessageOutputSchema.extend({ htmlOmitted: z.literal(false) }),
-    readMessageOutputSchema.omit({ html: true }).extend({ htmlOmitted: z.literal(true).describe('The HTML field was intentionally omitted; original truncation flags remain independent.') }),
+    readMessageOutputSchema.omit({ html: true, htmlTruncated: true, htmlRepresentation: true }).extend({ htmlOmitted: z.literal(true).describe('HTML-related fields were intentionally omitted; textTruncated retains its original meaning.') }),
 ]);
 export const readMessagesOutputSchema = z.strictObject({ includeHtml: z.boolean(), results: z.array(z.discriminatedUnion('status', [z.strictObject({ status: z.literal('ok'), message: batchMessageOutputSchema }), z.strictObject({ status: z.literal('failed'), ...messageKeySchema.shape, error: mailErrorOutputSchema })])).min(1).max(MAX_BATCH_MESSAGES), byteBudget: z.literal(MAX_BATCH_BYTES), bytesReturned: z.number().int().min(0).max(MAX_BATCH_BYTES) }).refine(value => value.results.every(item => item.status === 'failed' || item.message.htmlOmitted !== value.includeHtml), 'Batch HTML projection must match includeHtml.');
 export const getThreadOutputSchema = z.strictObject({ threadId: threadIdSchema, ...pageOutput, bodies: readMessagesOutputSchema.optional() });
