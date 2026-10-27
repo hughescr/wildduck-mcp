@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test';
 import type { AuthInfo } from '@modelcontextprotocol/server';
 import { handleMcp } from '../src/mcp';
 import { MailError, type BoundMailService } from '../src/mail/contracts';
+import { mailOutputSchemas } from '../src/mail/schemas';
 const mailboxId = 'b'.repeat(24);
 const version = 'v'.repeat(43);
 const operation_id = '9ea75b7b-64fa-455e-b83b-37081fc1ec2a';
@@ -186,15 +187,15 @@ test('all not_found batch items remain a normal result rather than a whole-tool 
 });
 
 test('batch defaults retain HTML while text-only and mixed failed/truncated items are normal SDK results', async () => {
-    const f = fixture(); const message = await f.mail.read_message({ mailboxId, uid: 1 }); const privateHtml = 'PRIVATE_HTML_PAYLOAD_ONLY';
+    const f = fixture(); const message = await f.mail.read_message({ mailboxId, uid: 1 }); const privateHtml = 'PRIVATE_HTML_PAYLOAD_ONLY'; const { html: _html, ...textOnly } = message;
     f.mail.read_messages = async input => ({ includeHtml: input.includeHtml, results: [
-        { status: 'ok', message: { ...message, html: input.includeHtml ? [privateHtml] : [], htmlOmitted: !input.includeHtml, textTruncated: true, htmlTruncated: true } },
+        { status: 'ok', message: input.includeHtml ? { ...message, html: [privateHtml], htmlOmitted: false, textTruncated: true, htmlTruncated: true } : { ...textOnly, htmlOmitted: true, textTruncated: true, htmlTruncated: true } },
         { status: 'failed', mailboxId, uid: 2, error: { code: 'not_found', message: 'not_found' } },
     ], byteBudget: 1048576, bytesReturned: 500 });
     const defaults = (await f.call('read_messages', { messages: [{ mailboxId, uid: 1 }, { mailboxId, uid: 2 }] })).result;
     expect(defaults.isError).toBeUndefined(); expect(defaults.structuredContent.includeHtml).toBe(true); expect(defaults.structuredContent.results[0].message).toMatchObject({ html: [privateHtml], htmlOmitted: false });
     const text = await f.call('read_messages', { messages: [{ mailboxId, uid: 1 }, { mailboxId, uid: 2 }], includeHtml: false });
-    expect(text.result.isError).toBeUndefined(); expect(text.result.structuredContent.includeHtml).toBe(false); expect(text.result.structuredContent.results[0].message).toMatchObject({ html: [], htmlOmitted: true, textTruncated: true, htmlTruncated: true }); expect(JSON.stringify(text)).not.toContain(privateHtml);
+    expect(text.result.isError).toBeUndefined(); expect(text.result.structuredContent.includeHtml).toBe(false); expect(text.result.structuredContent.results[0].message).toMatchObject({ htmlOmitted: true, textTruncated: true, htmlTruncated: true }); expect(text.result.structuredContent.results[0].message).not.toHaveProperty('html'); expect(JSON.parse(text.result.content[0].text).results[0].message).not.toHaveProperty('html'); expect(JSON.stringify(text)).not.toContain(privateHtml);
     expect(message).not.toHaveProperty('htmlOmitted');
 });
 test('whole batch scope, input and execution failures remain tool errors', async () => {
@@ -210,4 +211,35 @@ test('thread body item failures remain normal navigation while thread lookup fai
     const page = (await f.call('get_thread', { threadId: mailboxId, limit: 1, includeBodies: true })).result; expect(page.isError).toBeUndefined(); expect(page.structuredContent.bodies.results[0].status).toBe('failed');
     f.mail.get_thread = async () => { throw new MailError('not_found'); };
     const missing = (await f.call('get_thread', { threadId: mailboxId })).result; expect(missing.isError).toBe(true); expect(missing.structuredContent.error.code).toBe('not_found');
+});
+
+test('published batch schema requires html only for the full-body variant', async () => {
+    const f = fixture(); const tool = (await f.rpc('tools/list')).result.tools.find((item: { name: string }) => item.name === 'read_messages');
+    const items = tool.outputSchema.properties.results.items; const ok = (items.anyOf ?? items.oneOf).find((variant: { properties: { status: { const: string } } }) => variant.properties.status.const === 'ok');
+    const variants = ok.properties.message.anyOf ?? ok.properties.message.oneOf; expect(variants).toHaveLength(2);
+    const omitted = variants.find((variant: { properties: { htmlOmitted: { const: boolean } } }) => variant.properties.htmlOmitted.const === true);
+    const full = variants.find((variant: { properties: { htmlOmitted: { const: boolean } } }) => variant.properties.htmlOmitted.const === false);
+    expect(omitted.properties.html).toBeUndefined(); expect(omitted.required).not.toContain('html'); expect(omitted.additionalProperties).toBe(false);
+    expect(full.properties.html.type).toBe('array'); expect(full.required).toContain('html'); expect(full.additionalProperties).toBe(false);
+});
+
+test('batch output variants reject empty or undefined HTML on text-only items and require HTML for full items', async () => {
+    const f = fixture(); const full = await f.mail.read_message({ mailboxId, uid: 1 }); const { html: _html, ...textOnly } = full;
+    const batch = (includeHtml: boolean, message: unknown) => ({ includeHtml, results: [{ status: 'ok', message }], byteBudget: 1048576, bytesReturned: 500 });
+    const omitted = { ...textOnly, htmlOmitted: true };
+    expect(mailOutputSchemas.read_messages.safeParse(batch(false, omitted)).success).toBe(true);
+    for (const html of [undefined, []]) { expect(mailOutputSchemas.read_messages.safeParse(batch(false, { ...omitted, html })).success).toBe(false); }
+    expect(mailOutputSchemas.read_messages.safeParse(batch(true, { ...full, html: [], htmlOmitted: false })).success).toBe(true);
+    expect(mailOutputSchemas.read_messages.safeParse(batch(true, { ...textOnly, htmlOmitted: false })).success).toBe(false);
+    expect(mailOutputSchemas.read_messages.safeParse(batch(true, omitted)).success).toBe(false);
+    expect(mailOutputSchemas.read_message.safeParse(full).success).toBe(true); expect(mailOutputSchemas.read_message.safeParse(textOnly).success).toBe(false);
+});
+test('batch callers cannot forge output HTML projection fields in tool input', async () => {
+    const f = fixture(); let executed = 0; f.mail.read_messages = async () => { executed++; throw new Error('must not execute'); };
+    for (const input of [
+        { messages: [{ mailboxId, uid: 1 }], includeHtml: false, htmlOmitted: true },
+        { messages: [{ mailboxId, uid: 1, htmlOmitted: true }], includeHtml: false },
+        { messages: [{ mailboxId, uid: 1, html: [] }], includeHtml: false },
+    ]) { const reply = await f.call('read_messages', input); expect(Boolean(reply.error || reply.result?.isError)).toBe(true); }
+    expect(executed).toBe(0);
 });

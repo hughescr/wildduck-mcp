@@ -105,7 +105,10 @@ export const activationProofSchema = messageRefSchema.extend({ accountId: mailbo
 const authoredActivationProofSchema = activationProofSchema.extend({ sourceGrade: z.literal('mcp_authored') });
 export const failureReasonSchema = z.enum(['not_found', 'version_conflict', 'unsupported_draft', 'no_recipients', 'forbidden', 'reconnect_required', 'temporarily_unavailable', 'upstream_timeout', 'invalid_input', 'unsupported_content', 'source_integrity_unavailable', 'too_large', 'verification_failed']);
 export const mailErrorOutputSchema = z.strictObject({ code: failureReasonSchema, message: z.string().max(1024), retry_after: z.number().int().min(0).max(86400).optional() });
-export const batchMessageOutputSchema = readMessageOutputSchema.extend({ htmlOmitted: z.boolean().describe('HTML was intentionally omitted by the batch projection; independent of original truncation flags.') }).refine(value => !value.htmlOmitted || value.html.length === 0, 'Omitted HTML must be empty.');
+export const batchMessageOutputSchema = z.discriminatedUnion('htmlOmitted', [
+    readMessageOutputSchema.extend({ htmlOmitted: z.literal(false) }),
+    readMessageOutputSchema.omit({ html: true }).extend({ htmlOmitted: z.literal(true).describe('The HTML field was intentionally omitted; original truncation flags remain independent.') }),
+]);
 export const readMessagesOutputSchema = z.strictObject({ includeHtml: z.boolean(), results: z.array(z.discriminatedUnion('status', [z.strictObject({ status: z.literal('ok'), message: batchMessageOutputSchema }), z.strictObject({ status: z.literal('failed'), ...messageKeySchema.shape, error: mailErrorOutputSchema })])).min(1).max(MAX_BATCH_MESSAGES), byteBudget: z.literal(MAX_BATCH_BYTES), bytesReturned: z.number().int().min(0).max(MAX_BATCH_BYTES) }).refine(value => value.results.every(item => item.status === 'failed' || item.message.htmlOmitted !== value.includeHtml), 'Batch HTML projection must match includeHtml.');
 export const getThreadOutputSchema = z.strictObject({ threadId: threadIdSchema, ...pageOutput, bodies: readMessagesOutputSchema.optional() });
 const operationOutput = { operation_id: operationIdSchema };

@@ -494,7 +494,7 @@ test('thread body pages reuse bounded batch reader, retaining per-item failures 
     const f = fixture(false); const original = f.reader.readMessage;
     f.reader.getThread = async () => { const summary = (await f.reader.listMessages(context, { mailboxId, limit: 20 })).messages[0]; if (!summary) { throw new Error('missing summary'); } return { threadId: mailboxId, messages: [summary, { ...summary, uid: 8 }], next: 'thread-next' }; };
     f.reader.readMessage = async (bound, key) => { if (key.uid === 8) { throw new MailError('not_found'); } return original(bound, key); };
-    const page = await f.service.get_thread(context, { threadId: mailboxId, limit: 2, includeBodies: true }); expect(page.next).toBe('thread-next'); expect(page.bodies?.results.map(item => item.status)).toEqual(['ok', 'failed']);
+    const page = await f.service.get_thread(context, { threadId: mailboxId, limit: 2, includeBodies: true }); expect(page.next).toBe('thread-next'); expect(page.bodies?.results.map(item => item.status)).toEqual(['ok', 'failed']); expect(page.bodies?.includeHtml).toBe(true); expect(page.bodies?.results[0]).toMatchObject({ status: 'ok', message: { html: ['<p>html</p>'], htmlOmitted: false } });
     await expect(f.service.get_thread(context, { threadId: mailboxId, limit: 11, includeBodies: true })).rejects.toMatchObject({ code: 'invalid_input' });
 });
 test('batch deadline includes a stalled provenance lookup and returns item timeout', async () => {
@@ -523,6 +523,6 @@ test('text-only batches omit HTML explicitly before aggregate budgeting and pres
     const full = await f.service.read_messages(context, { messages, includeHtml: true }); expect(full.includeHtml).toBe(true); expect(full.results.filter(item => item.status === 'ok').length).toBeLessThan(messages.length);
     const result = await f.service.read_messages(context, { messages, includeHtml: false });
     expect(result.results.every((item: { status: string }) => item.status === 'ok')).toBe(true); expect(result.includeHtml).toBe(false);
-    for (const item of result.results) { if (item.status !== 'ok') { throw new Error('expected successful text-only projection'); } expect(item.message.html).toEqual([]); expect(item.message.htmlOmitted).toBe(true); expect(item.message.htmlTruncated).toBe(true); }
+    for (const item of result.results) { if (item.status !== 'ok') { throw new Error('expected successful text-only projection'); } expect(item.message).not.toHaveProperty('html'); expect('html' in item.message).toBe(false); expect(item.message.htmlOmitted).toBe(true); expect(item.message.htmlTruncated).toBe(true); }
     expect(result.results[0]).toMatchObject({ status: 'ok', message: { textTruncated: true } }); expect(JSON.stringify(result)).not.toContain('PRIVATE_HTML_PAYLOAD_'); expect(result.bytesReturned).toBe(Buffer.byteLength(JSON.stringify(result))); expect(result.bytesReturned).toBeLessThan(1048576);
 });
