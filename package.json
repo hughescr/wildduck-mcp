@@ -24,7 +24,7 @@
     "@modelcontextprotocol/server": "^2.4.0",
     "@zone-eu/mailsplit": "5.4.20",
     "hono": "^4.13.14",
-    "nodemailer": "10.1.1",
+    "nodemailer": "10.1.4",
     "zod": "^4.6.7"
   },
   "devDependencies": {

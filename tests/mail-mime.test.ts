@@ -258,3 +258,47 @@ describe('MIME rejects ambiguous or unsupported semantics before any candidate',
         expect(bodyOf((await preparePatch(source, { subject: 'still safe' })).raw).equals(bodyOf(raw))).toBe(true);
     });
 });
+
+describe('MIME address-parser security regressions', () => {
+    // Published PoCs: https://github.com/nodemailer/nodemailer/security/advisories/<id>
+    const unsupported = [
+        { id: 'GHSA-85x2-q946-cp5h', address: '<"a@evil.com>"@good.com>' },
+        { id: 'GHSA-m943-m63m-w62w comment', address: 'G: (a; <evil@evil.com>) <v@victim.com>;' },
+        { id: 'GHSA-m943-m63m-w62w quoted words', address: 'G: "a;" "<evil@evil.com>" <v@victim.com>;' },
+        { id: 'GHSA-8c8m-p3m8-cjg8', address: 'Victim (x(y) <evil@evil.com>) <v@victim.com>' },
+    ];
+    test.each(unsupported)('$id rejects unsupported source syntax before preparing an upload', async ({ address }) => {
+        for (const header of ['From', 'Reply-To', 'To', 'Cc', 'Bcc']) {
+            const rawHeaders = rootHeaders.replace(new RegExp(`^${header}:[^\r\n]*`, 'mu'), `${header}: ${address}`);
+            await expect(inspectSource(Buffer.from(rawHeaders + plain()))).rejects.toMatchObject({ code: 'unsupported_mime' });
+        }
+    });
+    test('supported quoted display punctuation inside a group names only its explicit mailbox', async () => {
+        const header = 'To: G: "a; <evil@evil.com>" <v@victim.com>;\r\n';
+        const raw = Buffer.from(rootHeaders.replace(/^To:[^\r\n]*\r\n/mu, header) + plain());
+        const inspected = await inspectSource(raw);
+        expect(inspected.envelope.to.map(entry => entry.address)).toEqual(['v@victim.com']);
+        const candidate = await preparePatch(inspected, { subject: 'Preserve the supported group' });
+        expect(candidate.envelope.to.map(entry => entry.address)).toEqual(['v@victim.com']);
+        expect(candidate.raw.includes(Buffer.from(header))).toBe(true);
+        expect(bodyOf(candidate.raw).equals(bodyOf(raw))).toBe(true);
+    });
+    test('structured display punctuation cannot change create or patch mailbox sets', async () => {
+        const inspected = await inspectSource(rich());
+        const expected = { from: ['alias@example.test'], replyTo: ['reply@example.test'], to: ['to@example.test'], cc: ['cc@example.test'], bcc: ['bcc@example.test'] };
+        for (const name of ['a; <evil@evil.com>', 'Victim (x(y) <evil@evil.com>)', 'a@evil.com>']) {
+            const fields = {
+                from: { address: 'alias@example.test', name }, replyTo: [{ address: 'reply@example.test', name }],
+                to: [{ address: 'to@example.test', name }], cc: [{ address: 'cc@example.test', name }], bcc: [{ address: 'bcc@example.test', name }],
+            };
+            const created = await createMime({ ...fresh, ...fields });
+            const patched = await preparePatch(inspected, fields);
+            for (const candidate of [created, patched]) {
+                for (const field of ['from', 'replyTo', 'to', 'cc', 'bcc'] as const) {
+                    expect(candidate.envelope[field].map(entry => entry.address)).toEqual(expected[field]);
+                }
+            }
+            expect(bodyOf(patched.raw).equals(bodyOf(rich()))).toBe(true);
+        }
+    });
+});

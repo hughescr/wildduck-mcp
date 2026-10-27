@@ -14,7 +14,7 @@
         "@modelcontextprotocol/server": "^2.4.0",
         "@zone-eu/mailsplit": "5.4.20",
         "hono": "^4.13.14",
-        "nodemailer": "10.1.1",
+        "nodemailer": "10.1.4",
         "zod": "^4.6.7",
       },
       "devDependencies": {
@@ -196,7 +196,7 @@
 
     "nanostores": ["nanostores@1.5.5", "", {}, "sha512-FixtE239Gl6Gz0ZGCK0WzvNwObNCIwVT+L7zQcf1QgcA6AzBxblzqe9OT88qiucNkhsjSOqiogSaF5jVbJiqSA=="],
 
-    "nodemailer": ["nodemailer@10.1.1", "", {}, "sha512-pbqZRoeYUO+1E8TJ/11WeY4D2EVujj1hsYjz3qff/vUFDtGnmi7p3iqzTFslYOfQ6PnjVcWxx/CIUSHCSrO/QA=="],
+    "nodemailer": ["nodemailer@10.1.4", "", {}, "sha512-EsMnOR2oRv4LGnWvHgcVYkkQ4O2j8KO4WTw6l+PHR4sOXo8SAgIraxtEnGDmotjbhv0hDsu3IuDIFZm8iXwO4A=="],
 
     "obliterator": ["obliterator@1.6.1", "", {}, "sha512-9WXswnqINnnhOG/5SLimUlzuU1hFJUc8zkwyD59Sd+dPOMf05PmnYG/d6Q7HZ+KmgkZJa1PxRso6QdM3sTNHig=="],
 
