@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { isEmailValid } from '@hapi/address';
 import { WILDDUCK_ORIGIN } from '../wildduck';
 import { remainingRequestTimeMs, withRequestBudget } from '../request-budget';
@@ -14,6 +14,21 @@ const ACCOUNT = /^[a-f0-9]{24}$/u;
 const TOKEN = /^[a-fA-F0-9]{40}$/u;
 const API_EMAIL_OPTIONS = { tlds: false } as unknown as Parameters<typeof isEmailValid>[1];
 type Json = Record<string, unknown>;
+/** WildDuck's JSON binary validator treats strings as UTF-8, not base64.
+ * Multipart keeps RFC822 bytes exact and parses application/json fields into
+ * their native types, so the operation marker travels atomically with them. */
+class MultipartUpload {
+    readonly contentType: string;
+    readonly bytes: Buffer<ArrayBuffer>;
+    constructor(raw: Buffer, fields: Json) {
+        const parts = Object.entries(fields).map(([name, value]) => Buffer.from(`Content-Disposition: form-data; name="${name}"\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(value)}\r\n`));
+        parts.push(Buffer.concat([Buffer.from('Content-Disposition: form-data; name="raw"; filename="message.eml"\r\nContent-Type: message/rfc822\r\n\r\n'), raw, Buffer.from('\r\n')]));
+        let boundary: string;
+        do { boundary = `wildduck-mcp-${randomUUID()}`; } while (parts.some(part => part.includes(boundary)));
+        this.contentType = `multipart/form-data; boundary=${boundary}`;
+        this.bytes = Buffer.concat([...parts.flatMap(part => [Buffer.from(`--${boundary}\r\n`), part]), Buffer.from(`--${boundary}--\r\n`)]);
+    }
+}
 type SearchCategory = 'deadline' | 'network' | 'http_status' | 'invalid_json' | 'invalid_shape' | 'too_large';
 export interface SearchDiagnostic { event: 'wildduck_search'; outcome: 'success' | 'failure'; scope: 'global' | 'mailbox'; category?: SearchCategory; durationMs: number; headersMs?: number; bodyMs?: number; validationMs?: number; status?: number; timeoutMs?: number }
 interface SearchTiming { category: SearchCategory; headersMs?: number; bodyMs?: number; status?: number; timeoutMs?: number }
@@ -157,7 +172,7 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs < 1 || this.timeoutMs > 30_000) { throw new MailError('invalid_input'); }
         if (!Number.isSafeInteger(this.searchTimeoutMs) || this.searchTimeoutMs < 1 || this.searchTimeoutMs > 120_000) { throw new MailError('invalid_input'); }
     }
-    private async transport(session: BackendMailSession, path: string, method: 'GET' | 'POST' | 'PUT' | 'DELETE', body: Json | undefined, cap: number, kind: 'json' | 'source' | 'attachment' = 'json', timing?: SearchTiming): Promise<{ bytes: Buffer; headers: Headers }> {
+    private async transport(session: BackendMailSession, path: string, method: 'GET' | 'POST' | 'PUT' | 'DELETE', body: Json | MultipartUpload | undefined, cap: number, kind: 'json' | 'source' | 'attachment' = 'json', timing?: SearchTiming): Promise<{ bytes: Buffer; headers: Headers }> {
         sessionValid(session);
         const controller = new AbortController(); let timer: ReturnType<typeof setTimeout> | undefined; let deadline = false;
         const started = performance.now();
@@ -167,8 +182,8 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         if (timeoutMs === 0) { if (timing) { timing.category = 'deadline'; } throw new MailError('upstream_timeout'); }
         const operation = async () => {
             const response = await this.fetcher(`${WILDDUCK_ORIGIN}/users/${session.accountId}${path}`, { method, redirect: 'error', signal: controller.signal,
-                headers: { Accept: kind === 'json' ? 'application/json' : kind === 'source' ? 'message/rfc822' : '*/*', 'Accept-Encoding': 'identity', 'X-Access-Token': session.accessToken, ...(body === undefined ? {} : { 'Content-Type': 'application/json' }) },
-                ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+                headers: { Accept: kind === 'json' ? 'application/json' : kind === 'source' ? 'message/rfc822' : '*/*', 'Accept-Encoding': 'identity', 'X-Access-Token': session.accessToken, ...(body === undefined ? {} : { 'Content-Type': body instanceof MultipartUpload ? body.contentType : 'application/json' }) },
+                ...(body === undefined ? {} : { body: body instanceof MultipartUpload ? body.bytes : JSON.stringify(body) }) });
             if (controller.signal.aborted) { void response.body?.cancel().catch(() => {}); throw new MailError('upstream_timeout'); }
             const headersAt = performance.now();
             if (timing) { timing.headersMs = Math.round(headersAt - started); timing.status = response.status; timing.category = response.status === 200 ? 'invalid_json' : 'http_status'; }
@@ -205,7 +220,7 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         catch (error) { if (deadline) { throw new MailError('upstream_timeout'); } if (timing && error instanceof MailError && error.code === 'too_large') { timing.category = 'too_large'; } if (error instanceof MailError) { throw error; } return fail(); }
         finally { if (timer !== undefined) { clearTimeout(timer); } controller.abort(); }
     }
-    private async request(session: BackendMailSession, path: string, method: 'GET' | 'POST' | 'PUT' | 'DELETE', body?: Json, cap = META_BYTES): Promise<Json> {
+    private async request(session: BackendMailSession, path: string, method: 'GET' | 'POST' | 'PUT' | 'DELETE', body?: Json | MultipartUpload, cap = META_BYTES): Promise<Json> {
         const result = json((await this.transport(session, path, method, body, cap)).bytes);
         if (result['success'] !== true || result['error'] !== undefined || result['code'] !== undefined) { return fail(); }
         return result;
@@ -496,11 +511,11 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
     }
     async uploadPreparedDraft(session: BackendMailSession, prepared: PreparedDraft): Promise<MessageKey> {
         const state = this.preparedState(session, prepared);
-        const result = await this.request(session, `/mailboxes/${prepared.mailboxId}/messages`, 'POST', {
-            raw: prepared.mime.raw.toString('base64'), from: { address: state.envelope.from }, to: state.envelope.to.map(address => ({ address })), cc: [], bcc: [],
+        const result = await this.request(session, `/mailboxes/${prepared.mailboxId}/messages`, 'POST', new MultipartUpload(prepared.mime.raw, {
+            from: { address: state.envelope.from }, to: state.envelope.to.map(address => ({ address })), cc: [], bcc: [],
             date: state.receivedAt, draft: true, unseen: !state.flags.includes('\\Seen'), flagged: state.flags.includes('\\Flagged'), flags: state.flags, labels: state.labels,
             metaData: state.metadata, files: state.files.map(file => file['id']), ...(state.reference ? { reference: { ...state.reference, attachments: false } } : {})
-        });
+        }));
         if (!object(result['message']) || id(result['message']['mailbox']) !== prepared.mailboxId) { return fail(); }
         return { mailboxId: prepared.mailboxId, uid: uid(result['message']['id']) };
     }

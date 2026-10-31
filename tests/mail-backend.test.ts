@@ -1,5 +1,8 @@
 import { expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
+import { Readable, Writable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { Splitter, Streamer } from '@zone-eu/mailsplit';
 import { createMailBackend, type SearchDiagnostic } from '../src/mail/backend';
 import { withRequestBudget } from '../src/request-budget';
 import { MailError, MAIL_OPERATION_METADATA_KEY, type BackendMailSession, type DraftContent, type DraftPatch, type MailFailureCode, type MailOperationMarker, type AuthoredSourceDescriptor } from '../src/mail/contracts';
@@ -28,6 +31,46 @@ async function errorCode(action: Promise<unknown>, expected: MailFailureCode) {
 }
 const originalSource = Buffer.from('From: Sender <sender@example.com>\r\nTo: visible@example.com\r\nBcc: hidden@example.com\r\nReply-To: help@example.com\r\nSubject: Original\r\nMessage-ID: <original@example.com>\r\nReferences: <prior@example.com>\r\nDate: Mon, 26 Oct 2026 00:00:00 +0000\r\nX-Custom: preserve me\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 7bit\r\n\r\nOriginal body\r\n');
 const authored = (raw: Buffer = originalSource): AuthoredSourceDescriptor => ({ grade: 'mcp_authored', accountId, ...target, contentDigest: createHash('sha256').update(raw).digest('hex') });
+interface UploadedDraft {
+    raw: Buffer; from: { address: string }; to: Array<{ address: string }>;
+    metaData: Record<string, unknown>; flags: string[]; labels: string[];
+    date: string; unseen: boolean; flagged: boolean;
+    reference?: { mailbox: string; id: number; action: string };
+}
+async function uploadBody(init: RequestInit | undefined): Promise<UploadedDraft> {
+    const request = new Request('https://backend.example/upload', init);
+    if (request.headers.get('content-type')?.startsWith('application/json')) {
+        const body = await request.json();
+        // lib/fastify/validation.js binary conversion: no base64 decoding.
+        return { ...body, raw: Buffer.from(body.raw, 'utf8') };
+    }
+    expect(request.headers.get('content-type')).toStartWith('multipart/form-data; boundary=');
+    const serialized = Buffer.from(await request.clone().arrayBuffer());
+    const body: Record<string, unknown> = {};
+    // api.js uses @fastify/multipart keyValues: JSON fields are parsed and files
+    // become Buffers. Parse the serialized HTTP body, not the upload's internals.
+    for (const [name, value] of await request.formData()) {
+        if (typeof value === 'string') {
+            expect(serialized.includes(Buffer.from(`Content-Disposition: form-data; name="${name}"\r\nContent-Type: application/json\r\n\r\n`))).toBe(true);
+        }
+        body[name] = typeof value === 'string' ? JSON.parse(value) : Buffer.from(await value.arrayBuffer());
+    }
+    expect(Buffer.isBuffer(body.raw)).toBe(true);
+    return body as unknown as UploadedDraft;
+}
+async function parsedMime(source: Buffer) {
+    let subject = ''; const text: string[] = []; const html: string[] = [];
+    const splitter = new Splitter();
+    splitter.on('data', chunk => { if (chunk.type === 'node' && chunk.root && chunk.headers) { subject = chunk.headers.getFirst('subject'); } });
+    const streamer = new Streamer(node => node.contentType === 'text/plain' || node.contentType === 'text/html');
+    streamer.on('node', ({ node, decoder, done }) => {
+        const chunks: Buffer[] = [];
+        decoder.on('data', chunk => chunks.push(Buffer.from(chunk)));
+        decoder.on('end', () => { (node.contentType === 'text/plain' ? text : html).push(Buffer.concat(chunks).toString('utf8')); done(); });
+    });
+    await pipeline(Readable.from([source]), splitter, streamer, new Writable({ objectMode: true, write(_chunk, _encoding, done) { done(); } }));
+    return { subject, text: text.join('\n'), html };
+}
 function model(aliases: string[] = []) {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     let source: Buffer = originalSource;
@@ -44,8 +87,8 @@ function model(aliases: string[] = []) {
         if (path === `/mailboxes/${'d'.repeat(24)}`) { return Response.json({ success: true, id: 'd'.repeat(24), path: 'Destination' }); }
         if (init?.method === 'POST' && path.endsWith('/submit')) { return Response.json({ success: true, queueId: 'queue-accepted', message: { id: 44, mailbox: 'd'.repeat(24) } }); }
         if (init?.method === 'POST' && path === `/mailboxes/${mailboxId}/messages`) {
-            const body = JSON.parse(String(init.body)); source = Buffer.from(body.raw, 'base64');
-            raw = message({ ...raw, id: 13, idate: body.date, metaData: body.metaData, flags: body.flags, labels: body.labels, seen: !body.unseen, flagged: body.flagged,
+            const body = await uploadBody(init); source = body.raw;
+            raw = message({ ...raw, ...await parsedMime(source), id: 13, idate: body.date, metaData: body.metaData, flags: body.flags, labels: body.labels, seen: !body.unseen, flagged: body.flagged,
                 ...(body.reference ? { reference: { mailbox: body.reference.mailbox, id: body.reference.id, action: body.reference.action } } : {}) });
             return Response.json({ success: true, message: { id: 13, mailbox: mailboxId } });
         }
@@ -65,7 +108,7 @@ function model(aliases: string[] = []) {
         if (path.includes('/messages/')) { expect(parsed.search).toBe('?markAsSeen=false&replaceCidLinks=false'); return Response.json(raw); }
         throw new Error('Unexpected fake path');
     }) as typeof fetch;
-    return { backend: createMailBackend({ fetch: fetcher }), calls, patch: (update: Record<string, unknown>) => { raw = message({ ...raw, ...update }); }, setSource: (value: Buffer) => { source = value; }, current: () => raw };
+    return { backend: createMailBackend({ fetch: fetcher }), calls, patch: (update: Record<string, unknown>) => { raw = message({ ...raw, ...update }); }, setSource: (value: Buffer) => { source = value; }, source: () => source, current: () => raw };
 }
 test('mailbox listing is bounded, uses explicit user token and resolves unique special-use Drafts independent of path', async () => {
     const boxes = { success: true, results: [{ id: mailboxId, path: '[Gmail]/Drafts', name: 'Drafts', specialUse: '\\Drafts', total: 0, unseen: 0 }] };
@@ -125,9 +168,31 @@ test('staged raw upload carries marker atomically, never replaces/deletes old ma
     const verified = await f.backend.verifyPreparedDraft(session, candidate, prepared);
     expect(verified.uid).toBe(13); expect(verified.version).toHaveLength(43);
     const uploads = f.calls.filter(call => call.init.method === 'POST'); expect(uploads).toHaveLength(1);
-    const body = JSON.parse(String(uploads[0]?.init.body)); expect(body).not.toHaveProperty('replacePrevious'); expect(body.metaData[MAIL_OPERATION_METADATA_KEY]).toEqual(marker);
-    expect(Buffer.from(body.raw, 'base64').equals(prepared.mime.raw)).toBe(true); expect(body.to).toEqual([{ address: 'bcc@example.com' }]);
+    const body = await uploadBody(uploads[0]?.init); expect(body).not.toHaveProperty('replacePrevious'); expect(body.metaData[MAIL_OPERATION_METADATA_KEY]).toEqual(marker);
+    expect(body.raw.equals(prepared.mime.raw)).toBe(true); expect(body.to).toEqual([{ address: 'bcc@example.com' }]);
+    expect(f.current().subject).not.toBe(''); expect(f.current().text).toBe(content.body.text);
     expect(f.calls.some(call => call.init.method === 'DELETE')).toBe(false);
+});
+test('create uploads Unicode bodies and identity-encoded binary message attachments without changing bytes', async () => {
+    const attachment = Buffer.concat([Buffer.from('From: embedded@example.com\r\nSubject: embedded\r\n\r\n'), Buffer.from([0, 255, 200, 13, 10])]);
+    const body = { text: 'Résumé — 你好 🌍\r\nA second line', html: '<p>Résumé — 你好 🌍</p>' };
+    const f = model();
+    const prepared = await f.backend.prepareCreate(session, { ...content, subject: 'Résumé — 你好 🌍', body, attachments: [{ filename: 'original.eml', contentType: 'message/rfc822', contentBase64: attachment.toString('base64'), disposition: 'attachment' }] }, marker);
+    expect(prepared.mime.raw.includes(attachment)).toBe(true);
+    expect(Buffer.from(prepared.mime.raw.toString('utf8'), 'utf8').equals(prepared.mime.raw)).toBe(false);
+    const key = await f.backend.uploadPreparedDraft(session, prepared); await f.backend.verifyPreparedDraft(session, key, prepared);
+    expect(f.source().equals(prepared.mime.raw)).toBe(true); expect(f.source().includes(attachment)).toBe(true);
+    expect(f.current().subject).not.toBe(''); expect(f.current().text).toBe(body.text); expect(f.current().html).toEqual([body.html]);
+    expect(f.calls.filter(call => call.init.method === 'POST')).toHaveLength(1);
+});
+test('updates preserve Unicode 8bit MIME content through backend upload and verification', async () => {
+    const source = Buffer.from(originalSource.toString().replace('Content-Transfer-Encoding: 7bit', 'Content-Transfer-Encoding: 8bit').replace('Original body', 'Original café 你好 🌍'));
+    const f = model(); f.setSource(source);
+    const snapshot = await f.backend.inspectMessage(session, target);
+    const prepared = await f.backend.prepareUpdate(session, snapshot, { subject: 'Updated café 你好 🌍' }, { ...marker, tool: 'update_draft' }, authored(source));
+    const key = await f.backend.uploadPreparedDraft(session, prepared); await f.backend.verifyPreparedDraft(session, key, prepared);
+    expect(f.source().equals(prepared.mime.raw)).toBe(true); expect(f.current().subject).not.toBe(''); expect(f.current().text).toBe('Original café 你好 🌍\r\n');
+    expect(f.calls.filter(call => call.init.method === 'POST')).toHaveLength(1);
 });
 test('post-upload proof rejects changed MIME/recipients/metadata without retries or old-draft deletion', async () => {
     for (const change of ['source', 'flags', 'metadata'] as const) {
@@ -170,7 +235,7 @@ test('authored update preserves original MIME, Bcc, flags, labels and received d
     expect(prepared.mime.raw.subarray(prepared.mime.raw.indexOf('\r\n\r\n') + 4).equals(body)).toBe(true);
     for (const text of ['Bcc: hidden@example.com', 'Reply-To: help@example.com', 'References: <prior@example.com>', 'X-Custom: preserve me']) { expect(prepared.mime.raw.toString()).toContain(text); }
     const key = await f.backend.uploadPreparedDraft(session, prepared); await f.backend.verifyPreparedDraft(session, key, prepared);
-    const call = f.calls.find(item => item.init.method === 'POST'); const upload = JSON.parse(String(call?.init.body));
+    const call = f.calls.find(item => item.init.method === 'POST'); const upload = await uploadBody(call?.init);
     expect(upload.to.map((item: { address: string }) => item.address)).toEqual(['visible@example.com', 'hidden@example.com']);
     expect(upload.flags).toEqual(['\\Draft', 'KeepKeyword']); expect(upload.labels).toEqual(['KeepLabel']); expect(upload.date).toBe('2026-10-26T01:00:00.000Z'); expect(upload.metaData.untouched).toEqual({ nested: ['keep'] });
     expect(upload).not.toHaveProperty('replacePrevious');
@@ -179,7 +244,7 @@ test('recipient patch changes only requested address class when all recipients a
     const f = model(); const before = await f.backend.inspectMessage(session, target);
     const prepared = await f.backend.prepareUpdate(session, before, { to: [{ address: 'new@example.com' }] }, { ...marker, tool: 'update_draft' }, authored());
     await f.backend.uploadPreparedDraft(session, prepared);
-    const body = JSON.parse(String(f.calls.find(call => call.init.method === 'POST')?.init.body));
+    const body = await uploadBody(f.calls.find(call => call.init.method === 'POST')?.init);
     expect(body.to.map((item: { address: string }) => item.address)).toEqual(['new@example.com', 'hidden@example.com']);
     expect(prepared.mime.raw.toString()).toContain('To: new@example.com'); expect(prepared.mime.raw.toString()).toContain('Bcc: hidden@example.com');
 });
@@ -189,12 +254,12 @@ test('authored explicit recipient clearing uses exactly final MIME recipients an
         const f = model(); const snapshot = await f.backend.inspectMessage(session, target);
         const prepared = await f.backend.prepareUpdate(session, snapshot, structuredClone(patch), { ...marker, tool: 'update_draft' }, authored());
         await f.backend.uploadPreparedDraft(session, prepared);
-        expect(JSON.parse(String(f.calls.find(call => call.init.method === 'POST')?.init.body)).to.map((item: { address: string }) => item.address)).toEqual(recipients);
+        expect((await uploadBody(f.calls.find(call => call.init.method === 'POST')?.init)).to.map((item: { address: string }) => item.address)).toEqual(recipients);
     }
     const f = model(); const snapshot = await f.backend.inspectMessage(session, target);
     const prepared = await f.backend.prepareUpdate(session, snapshot, { body: { text: 'Changed only body', html: null } }, { ...marker, tool: 'update_draft' }, authored());
     await f.backend.uploadPreparedDraft(session, prepared);
-    expect(JSON.parse(String(f.calls.find(call => call.init.method === 'POST')?.init.body)).to.map((item: { address: string }) => item.address)).toEqual(['visible@example.com', 'hidden@example.com']);
+    expect((await uploadBody(f.calls.find(call => call.init.method === 'POST')?.init)).to.map((item: { address: string }) => item.address)).toEqual(['visible@example.com', 'hidden@example.com']);
 });
 test('version binds expiry, authentication results, queued submissions and forward targets independently', async () => {
     const original = (await fixture([message()]).backend.readMessage(session, target)).message.version;
@@ -296,6 +361,18 @@ test('zero-byte attachment hash binds preserved opaque MIME bytes through raw up
     expect(prepared.mime.retainedAttachments).toHaveLength(1); expect(prepared.mime.raw.toString()).toContain('filename="zero.bin"');
     const key = await f.backend.uploadPreparedDraft(session, prepared); await f.backend.verifyPreparedDraft(session, key, prepared);
 });
+test('update uploads an existing binary attachment verbatim with its encoded-body hash intact', async () => {
+    const attachment = Buffer.from([0, 255, 200, 13, 10, 1]);
+    const header = originalSource.subarray(0, originalSource.indexOf('Content-Type:'));
+    const source = Buffer.concat([header, Buffer.from('Content-Type: multipart/mixed; boundary="binary-B"\r\n\r\n--binary-B\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nBody\r\n--binary-B\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename="opaque.bin"\r\nContent-Transfer-Encoding: binary\r\n\r\n'), attachment, Buffer.from('\r\n--binary-B--\r\n')]);
+    const f = model(); f.setSource(source); f.patch({ attachments: [{ id: 'ATT00001', filename: 'opaque.bin', contentType: 'application/octet-stream', size: attachment.length, transferEncoding: 'binary', hash: createHash('sha256').update(attachment).digest('hex') }] });
+    const snapshot = await f.backend.inspectMessage(session, target);
+    const prepared = await f.backend.prepareUpdate(session, snapshot, { subject: 'Keep binary attachment' }, { ...marker, tool: 'update_draft' }, authored(source));
+    expect(prepared.mime.retainedAttachments).toHaveLength(1);
+    const key = await f.backend.uploadPreparedDraft(session, prepared); await f.backend.verifyPreparedDraft(session, key, prepared);
+    expect(f.source().equals(prepared.mime.raw)).toBe(true); expect(f.source().includes(attachment)).toBe(true);
+    expect(f.current().text).toBe('Body'); expect(f.calls.filter(call => call.init.method === 'POST')).toHaveLength(1);
+});
 test('draft updates refuse provenance or expiry fields the raw upload API cannot preserve', async () => {
     for (const update of [{ envelope: { from: 'smtp@example.com', rcpt: [{ value: 'received@example.com' }] } }, { expires: '2026-12-01T00:00:00Z' }, { verificationResults: { spf: 'pass' } }, { outbound: [{ queueId: 'existing' }] }, { forwardTargets: ['prior-target'] }]) {
         const f = model(); f.patch(update); const snapshot = await f.backend.inspectMessage(session, target);
@@ -332,7 +409,7 @@ test('sender requires exact primary or registered alias and never trusts whiteli
     }
     const f = model(['alias@example.com']); const prepared = await f.backend.prepareCreate(session, { ...content, from: { address: 'alias@example.com' } }, marker);
     await f.backend.uploadPreparedDraft(session, prepared);
-    expect(JSON.parse(String(f.calls.find(call => call.init.method === 'POST')?.init.body)).from).toEqual({ address: 'alias@example.com' });
+    expect((await uploadBody(f.calls.find(call => call.init.method === 'POST')?.init)).from).toEqual({ address: 'alias@example.com' });
     const invalid = fixture([]);
     await errorCode(invalid.backend.prepareCreate(session, { ...content, to: [{ address: 'invalid recipient' }] }, marker), 'invalid_input');
     expect(invalid.calls).toHaveLength(0);
@@ -428,6 +505,19 @@ test('reply preparation derives recipients and MIME threading without changing t
     expect(prepared?.mime.envelope.to.map(item => item.address)).toEqual(['help@example.com', 'visible@example.com']); expect(prepared?.mime.envelope.cc.map(item => item.address)).toEqual(['copy@example.com']); expect(prepared?.mime.envelope.bcc).toEqual([]);
     const mime = prepared?.mime.raw.toString() ?? ''; expect(mime).toContain('In-Reply-To: <test@example.com>'); expect(mime).toContain('References: <ancestor@example.com> <test@example.com>'); expect(mime).not.toContain('blind@example.com'); expect(mime).not.toContain('Bcc:'); expect(f.calls.every(call => call.init.method === 'GET')).toBe(true);
     const invalid = model(); invalid.patch({ messageId: null }); await errorCode(invalid.backend.prepareReply?.(session, { original: target, mode: 'reply', body: { text: 'Response', html: null }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' }) ?? Promise.resolve(), 'unsupported_content'); expect(invalid.calls.every(call => call.init.method === 'GET')).toBe(true);
+});
+test('reply draft upload stores Unicode response, quote and threading as RFC822 instead of base64 text', async () => {
+    const f = model(); f.patch({ subject: 'Original subject', from: [{ address: 'author@example.com' }], replyTo: [{ address: 'help@example.com' }], text: 'Original café 你好 🌍', html: ['<p>Original café 你好 🌍</p>'], references: ['<ancestor@example.com>'] });
+    if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
+    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response ✓ 日本語', html: '<p>Response ✓ 日本語</p>' }, quoteOriginal: true, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    const key = await f.backend.uploadPreparedDraft(session, prepared); await f.backend.verifyPreparedDraft(session, key, prepared);
+    expect(f.source().equals(prepared.mime.raw)).toBe(true);
+    expect(f.source().toString()).toContain('In-Reply-To: <test@example.com>'); expect(f.source().toString()).toContain('References: <ancestor@example.com> <test@example.com>');
+    expect(f.current().subject).not.toBe(''); expect(f.current().text).toContain('Response ✓ 日本語'); expect(f.current().text).toContain('Original café 你好 🌍');
+    expect(String(f.current().html)).toContain('<p>Response ✓ 日本語</p>');
+    const uploads = f.calls.filter(call => call.init.method === 'POST'); expect(uploads).toHaveLength(1);
+    expect((await uploadBody(uploads[0]?.init)).metaData[MAIL_OPERATION_METADATA_KEY]).toMatchObject({ tool: 'create_reply_draft' });
+    expect(f.calls.some(call => call.init.method === 'DELETE' || call.url.endsWith('/submit'))).toBe(false);
 });
 test('staged download streams only the validated attachment and returns binary-free bounded metadata', async () => {
     const calls: { url: string; init: RequestInit }[] = []; let staged = 0; let bytes = 0;
