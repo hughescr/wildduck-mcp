@@ -454,7 +454,10 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
             const mime = await createMime({ ...reply, from, attachments: data.attachments });
             const envelope = outbound(mime.envelope); if (envelope.from !== from.address) { throw new MailError('unsupported_content'); }
             const prepared: PreparedDraft = { mailboxId: mailbox.mailboxId, mime, marker };
-            this.preparations.set(prepared, { accountId: session.accountId, envelope, flags: ['\\Seen', '\\Draft'], labels: [], metadata: { [MAIL_OPERATION_METADATA_KEY]: marker }, receivedAt: new Date().toISOString(), files: [] });
+            // WildDuck marks the original Answered when submitting this reference,
+            // without changing its flags while the reply is only a draft.
+            const reference = { mailbox: data.original.mailboxId, id: data.original.uid, action: data.mode === 'reply_all' ? 'replyAll' : 'reply' };
+            this.preparations.set(prepared, { accountId: session.accountId, envelope, flags: ['\\Seen', '\\Draft'], labels: [], metadata: { [MAIL_OPERATION_METADATA_KEY]: marker }, receivedAt: new Date().toISOString(), reference, files: [] });
             return prepared;
         } catch (error) { return mimeError(error); }
     }

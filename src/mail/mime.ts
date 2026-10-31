@@ -640,7 +640,11 @@ export async function createMime(input: MimeCreate): Promise<PreparedMime> {
     if (input.threading !== undefined) { validateThreading(input.threading); }
     const generated = generatedHeaders({ From: input.from, To: input.to, Cc: input.cc, Bcc: input.bcc, Subject: input.subject, ...(input.replyTo ? { 'Reply-To': input.replyTo } : {}),
         ...(input.threading ? { 'In-Reply-To': input.threading.inReplyTo, References: input.threading.references.join(' ') } : {}) });
-    const root = builder(); root.setHeader('Date', new Date()); root.setHeader('Message-ID', `<${randomUUID()}@mcp.invalid>`); root.setHeader('MIME-Version', '1.0');
+    // Match WildDuck's UUID@sender-domain convention. From has passed the MIME
+    // address gate above; backend callers also verify ownership before creation.
+    const messageId = `<${randomUUID()}@${input.from.address.slice(input.from.address.lastIndexOf('@') + 1).toLowerCase()}>`;
+    validateMessageId(messageId);
+    const root = builder(); root.setHeader('Date', new Date()); root.setHeader('Message-ID', messageId); root.setHeader('MIME-Version', '1.0');
     const required = Buffer.from(root.buildHeaders() + '\r\n\r\n');
     const metadata = headersAt(required, 0, required.length).headers.filter(header => ['date', 'message-id', 'mime-version'].includes(header.key));
     const raw = Buffer.concat([...metadata.map(header => header.raw), ...[...generated.values()].filter((value): value is Buffer => value !== null), entity.headers, entity.body, ...(entity.body.subarray(-2).equals(Buffer.from('\r\n')) ? [] : [Buffer.from('\r\n')])]);

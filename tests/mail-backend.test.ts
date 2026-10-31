@@ -34,8 +34,8 @@ const authored = (raw: Buffer = originalSource): AuthoredSourceDescriptor => ({ 
 interface UploadedDraft {
     raw: Buffer; from: { address: string }; to: Array<{ address: string }>;
     metaData: Record<string, unknown>; flags: string[]; labels: string[];
-    date: string; unseen: boolean; flagged: boolean;
-    reference?: { mailbox: string; id: number; action: string };
+    date: string; draft: boolean; unseen: boolean; flagged: boolean;
+    reference?: { mailbox: string; id: number; action: string; attachments?: boolean };
 }
 async function uploadBody(init: RequestInit | undefined): Promise<UploadedDraft> {
     const request = new Request('https://backend.example/upload', init);
@@ -73,6 +73,7 @@ async function parsedMime(source: Buffer) {
 }
 function model(aliases: string[] = []) {
     const calls: Array<{ url: string; init: RequestInit }> = [];
+    const previous = new Map<number, ReturnType<typeof message>>(); let nextUid = 13;
     let source: Buffer = originalSource;
     let raw = message({ from: { address: 'sender@example.com', name: 'Sender' }, to: [{ address: 'visible@example.com' }], bcc: [{ address: 'hidden@example.com' }], replyTo: [{ address: 'help@example.com' }], subject: 'Original',
         metaData: { untouched: { nested: ['keep'] } }, labels: ['KeepLabel'], flags: ['\\Draft', 'KeepKeyword'] });
@@ -88,9 +89,10 @@ function model(aliases: string[] = []) {
         if (init?.method === 'POST' && path.endsWith('/submit')) { return Response.json({ success: true, queueId: 'queue-accepted', message: { id: 44, mailbox: 'd'.repeat(24) } }); }
         if (init?.method === 'POST' && path === `/mailboxes/${mailboxId}/messages`) {
             const body = await uploadBody(init); source = body.raw;
-            raw = message({ ...raw, ...await parsedMime(source), id: 13, idate: body.date, metaData: body.metaData, flags: body.flags, labels: body.labels, seen: !body.unseen, flagged: body.flagged,
+            previous.set(raw.id, raw);
+            raw = message({ ...raw, ...await parsedMime(source), id: nextUid++, idate: body.date, draft: body.draft, metaData: body.metaData, flags: body.flags, labels: body.labels, seen: !body.unseen, flagged: body.flagged,
                 ...(body.reference ? { reference: { mailbox: body.reference.mailbox, id: body.reference.id, action: body.reference.action } } : {}) });
-            return Response.json({ success: true, message: { id: 13, mailbox: mailboxId } });
+            return Response.json({ success: true, message: { id: raw.id, mailbox: mailboxId } });
         }
         if (init?.method === 'PUT') {
             const body = JSON.parse(String(init.body)); const flags = new Set(raw.flags);
@@ -105,7 +107,7 @@ function model(aliases: string[] = []) {
             expect(parsed.search).toBe('');
             return new Response(new Uint8Array(source), { headers: { 'content-type': 'message/rfc822', 'content-length': String(source.length) } });
         }
-        if (path.includes('/messages/')) { expect(parsed.search).toBe('?markAsSeen=false&replaceCidLinks=false'); return Response.json(raw); }
+        if (path.includes('/messages/')) { expect(parsed.search).toBe('?markAsSeen=false&replaceCidLinks=false'); const requested = Number(path.split('/').at(-1)); return Response.json(requested === raw.id ? raw : previous.get(requested) ?? raw); }
         throw new Error('Unexpected fake path');
     }) as typeof fetch;
     return { backend: createMailBackend({ fetch: fetcher }), calls, patch: (update: Record<string, unknown>) => { raw = message({ ...raw, ...update }); }, setSource: (value: Buffer) => { source = value; }, source: () => source, current: () => raw };
@@ -518,6 +520,52 @@ test('reply draft upload stores Unicode response, quote and threading as RFC822 
     const uploads = f.calls.filter(call => call.init.method === 'POST'); expect(uploads).toHaveLength(1);
     expect((await uploadBody(uploads[0]?.init)).metaData[MAIL_OPERATION_METADATA_KEY]).toMatchObject({ tool: 'create_reply_draft' });
     expect(f.calls.some(call => call.init.method === 'DELETE' || call.url.endsWith('/submit'))).toBe(false);
+});
+test.each([['reply', 'reply'], ['reply_all', 'replyAll']] as const)('%s attaches native %s metadata, preserves it through edits, and submits without a separate flag write', async (mode, action) => {
+    const f = model(['alias@other.example']);
+    f.patch({ draft: false, flags: ['\\Seen'], from: { address: 'author@example.com' }, to: [{ address: 'sender@example.com' }], bcc: [], text: 'Original' });
+    const original = structuredClone(f.current());
+    if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
+    const prepared = await f.backend.prepareReply(session, { original: target, mode, from: { address: 'alias@other.example' }, body: { text: 'Response', html: null }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    expect(f.current()).toEqual(original); expect(f.calls.every(call => call.init.method === 'GET')).toBe(true);
+    const candidate = await f.backend.uploadPreparedDraft(session, prepared); await f.backend.verifyPreparedDraft(session, candidate, prepared);
+    const reference = { mailbox: mailboxId, id: target.uid, action };
+    expect(f.current()).toMatchObject({ reference });
+    expect((await f.backend.readMessage(session, target)).message.flags.answered).toBe(false);
+    const id = /^Message-ID: (.+)\r$/mu.exec(f.source().toString())?.[1]; expect(id).toEndWith('@other.example>');
+    const snapshot = await f.backend.inspectMessage(session, candidate);
+    const trusted = { ...authored(f.source()), ...candidate };
+    const updated = await f.backend.prepareUpdate(session, snapshot, { from: { address: 'sender@example.com' }, body: { text: 'Edited response', html: null } }, { ...marker, operationId: 'reply-edit-operation', tool: 'update_draft' }, trusted);
+    const replacement = await f.backend.uploadPreparedDraft(session, updated); await f.backend.verifyPreparedDraft(session, replacement, updated);
+    expect(f.current()).toMatchObject({ reference });
+    expect(f.source().toString()).toContain(`Message-ID: ${id}\r\n`);
+    expect(f.source().toString()).toContain('In-Reply-To: <test@example.com>');
+    expect((await f.backend.readMessage(session, target)).message.flags.answered).toBe(false);
+    const uploads = f.calls.filter(call => call.init.method === 'POST'); expect(uploads).toHaveLength(2);
+    for (const call of uploads) { expect((await uploadBody(call.init)).reference).toEqual({ ...reference, attachments: false }); }
+    expect(await f.backend.submitDraft(session, replacement)).toEqual({ queueId: 'queue-accepted', sent: { mailboxId: 'd'.repeat(24), uid: 44 } });
+    expect(f.calls.filter(call => call.url.endsWith('/submit'))).toHaveLength(1);
+    expect(f.calls.some(call => call.init.method === 'PUT' || call.init.method === 'DELETE')).toBe(false);
+});
+test('reply activation rejects missing or changed backend reference metadata', async () => {
+    for (const reference of [undefined, { mailbox: mailboxId, id: 99, action: 'reply' }, { mailbox: mailboxId, id: target.uid, action: 'forward' }]) {
+        const f = model(); if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
+        const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response', html: null }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+        const candidate = await f.backend.uploadPreparedDraft(session, prepared); f.patch({ reference });
+        await errorCode(f.backend.verifyPreparedDraft(session, candidate, prepared), 'verification_failed');
+        expect(f.calls.some(call => call.url.endsWith('/submit') || call.init.method === 'PUT')).toBe(false);
+    }
+});
+test('ordinary creation uses the owned primary or selected alias domain without reply metadata', async () => {
+    for (const from of [undefined, { address: 'alias@other.example' }]) {
+        const f = model(['alias@other.example']);
+        const prepared = await f.backend.prepareCreate(session, { ...content, ...(from ? { from } : {}) }, marker);
+        const candidate = await f.backend.uploadPreparedDraft(session, prepared); await f.backend.verifyPreparedDraft(session, candidate, prepared);
+        expect(f.source().toString()).toMatch(from ? /^Message-ID: <[^\r\n@]+@other\.example>\r$/mu : /^Message-ID: <[^\r\n@]+@example\.com>\r$/mu);
+        expect(await uploadBody(f.calls.find(call => call.init.method === 'POST')?.init)).not.toHaveProperty('reference');
+    }
+    const denied = model(); await errorCode(denied.backend.prepareCreate(session, { ...content, from: { address: 'unowned@other.example' } }, marker), 'forbidden');
+    expect(denied.calls.every(call => call.init.method === 'GET')).toBe(true);
 });
 test('staged download streams only the validated attachment and returns binary-free bounded metadata', async () => {
     const calls: { url: string; init: RequestInit }[] = []; let staged = 0; let bytes = 0;

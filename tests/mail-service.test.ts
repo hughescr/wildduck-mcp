@@ -488,7 +488,24 @@ test('reply preparation failure settles preflight without upload and authored re
     const f = fixture(false); const reply = { original: { mailboxId, uid: 7 }, mode: 'reply' as const, body: { text: 'Reply', html: null }, quoteOriginal: false, attachments: [], operation_id };
     f.behavior.preparationError = true; expect(await f.service.create_reply_draft(context, reply)).toMatchObject({ status: 'failed', reason: 'unsupported_content' }); expect(f.calls.some(call => call.method === 'upload')).toBe(false); expect(f.operations.calls).not.toContain('dispatch');
     const good = fixture(false); const created = await good.service.create_reply_draft(context, reply); if (created.status !== 'completed') { throw new Error('expected created draft'); }
-    const sent = await good.service.send_draft(context, { uid: created.draft.uid, expected_version: created.draft.version, operation_id: 'reply-send-operation' }); expect(sent.status).toBe('queued');
+    const send = { uid: created.draft.uid, expected_version: created.draft.version, operation_id: 'reply-send-operation' };
+    const sent = await good.service.send_draft(context, send); expect(sent.status).toBe('queued');
+    const count = good.calls.length; expect(await good.service.send_draft(context, send)).toEqual(sent); expect(good.calls).toHaveLength(count);
+    expect(good.calls.filter(call => call.method === 'submit')).toHaveLength(1); expect(good.calls.some(call => call.method === 'flags')).toBe(false);
+});
+test('reply verification failure stays partial on replay and uncertain reply sends never redispatch', async () => {
+    const reply = { original: { mailboxId, uid: 7 }, mode: 'reply' as const, body: { text: 'Reply', html: null }, quoteOriginal: false, attachments: [], operation_id };
+    const partial = fixture(false); partial.behavior.verificationError = true;
+    const result = await partial.service.create_reply_draft(context, reply); expect(result).toMatchObject({ status: 'partial', candidateVerified: false, reason: 'candidate_verification_failed' });
+    const count = partial.calls.length; expect(await partial.service.create_reply_draft(context, reply)).toEqual(result); expect(partial.calls).toHaveLength(count);
+    expect(partial.calls.some(call => call.method === 'submit' || call.method === 'flags')).toBe(false);
+    const uncertain = fixture(false); const created = await uncertain.service.create_reply_draft(context, reply);
+    if (created.status !== 'completed') { throw new Error('expected created draft'); }
+    uncertain.behavior.postError = true;
+    const send = { uid: created.draft.uid, expected_version: created.draft.version, operation_id: 'reply-send-operation' };
+    const unknown = await uncertain.service.send_draft(context, send); expect(unknown).toMatchObject({ status: 'outcome_unknown', reason: 'dispatch_uncertain' });
+    const sentCalls = uncertain.calls.length; expect(await uncertain.service.send_draft(context, send)).toEqual(unknown); expect(uncertain.calls).toHaveLength(sentCalls);
+    expect(uncertain.calls.filter(call => call.method === 'submit')).toHaveLength(1); expect(uncertain.calls.some(call => call.method === 'flags')).toBe(false);
 });
 test('thread body pages reuse bounded batch reader, retaining per-item failures and limiting body page size', async () => {
     const f = fixture(false); const original = f.reader.readMessage;

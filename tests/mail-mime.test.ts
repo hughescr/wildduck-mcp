@@ -26,6 +26,26 @@ function bodyOf(raw: Buffer): Buffer { return raw.subarray(raw.indexOf('\r\n\r\n
 async function rejects(raw: Buffer | string): Promise<void> { await expect(inspectSource(Buffer.from(raw))).rejects.toBeInstanceOf(MimeError); }
 
 describe('MIME lossless supported subset', () => {
+    test('new Message-IDs are unique UUIDs at the selected From domain', async () => {
+        const ids = new Set<string>();
+        for (const domain of ['example.test', 'Aliases.Example.ORG', 'xn--bcher-kva.example']) {
+            for (let attempt = 0; attempt < 2; attempt++) {
+                const candidate = await createMime({ ...fresh, from: { address: `sender+tag@${domain}`, name: 'Display @ other.invalid' } });
+                const id = /^Message-ID: (<[^\r\n]+>)\r$/mu.exec(candidate.raw.toString())?.[1];
+                expect(id).toMatch(new RegExp(`^<[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}@${domain.toLowerCase().replaceAll('.', '\\.')}>$`, 'u'));
+                expect(ids.has(id ?? '')).toBe(false); ids.add(id ?? '');
+                expect(candidate.raw.toString()).not.toContain('@mcp.invalid');
+            }
+        }
+    });
+    test('changing sender and body preserves the original Message-ID, including historical domains', async () => {
+        for (const original of ['<original@example.test>', '<historical@mcp.invalid>']) {
+            const raw = Buffer.from(rootHeaders.replace('<original@example.test>', original) + plain());
+            const candidate = await preparePatch(await inspectSource(raw), { from: { address: 'changed@other.example' }, body: { text: 'Changed', html: null } });
+            expect(candidate.raw.toString()).toContain(`Message-ID: ${original}\r\n`);
+            expect(candidate.envelope.from[0]?.address).toBe('changed@other.example');
+        }
+    });
     test('header-only patch preserves entire body, root folding, groups, aliases and thread identity', async () => {
         const raw = rich(); const inspected = await inspectSource(raw);
         expect(inspected.attachments).toHaveLength(4);
@@ -250,6 +270,11 @@ describe('MIME rejects ambiguous or unsupported semantics before any candidate',
         for (const patch of [{ subject: 'bad\r\nBcc: evil@example.test' }, { from: { address: 'x@example.test\r\nX: bad' } }, { to: [{ address: 'x@example.test', name: 'bad\nName' }] }]) {await expect(preparePatch(source, patch)).rejects.toBeInstanceOf(MimeError);}
         for (const contentBase64 of ['AA', 'AB==', 'AA==\n', '!!!!', 'AAA=AAAA']) {await expect(createMime({ ...fresh, attachments: [{ filename: 'x', contentType: 'application/octet-stream', contentBase64, disposition: 'attachment' }] })).rejects.toBeInstanceOf(MimeError);}
         await expect(preparePatch(source, { body: { text: 'x', html: '<img src="attachment:ATT00001">' } })).rejects.toBeInstanceOf(MimeError);
+    });
+    test('unsupported From syntax fails closed instead of generating a fallback Message-ID', async () => {
+        for (const address of ['sender@example.test\r\nMessage-ID: <injected@evil.test>', 'sender@example..test', 'sender@[127.0.0.1]', 'sender@bücher.example', '"sender@quoted"@example.test']) {
+            await expect(createMime({ ...fresh, from: { address } })).rejects.toMatchObject({ code: 'invalid_mime_patch' });
+        }
     });
     test('source, decoded attachments, header, node and nesting caps', async () => {
         await rejects(Buffer.alloc(MIME_LIMITS.sourceBytes + 1));
