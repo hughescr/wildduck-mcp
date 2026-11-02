@@ -131,8 +131,23 @@ test('search maps supported structured predicates, dates and previous cursor', a
     const f = fixture([{ success: true, results: [], nextCursor: false, previousCursor: 'back' }]);
     expect(await f.backend.searchMessages(session, { mailboxId, limit: 3, from: 'a+b@example.com', to: 'person', subject: 'A & B', text: 'words', receivedSince: '2026-10-01T00:00:00Z', receivedUntil: '2026-10-26T00:00:00Z', seen: false, flagged: true, hasAttachments: true, previous: 'cursor+/=' })).toEqual({ messages: [], previous: 'back' });
     const url = new URL(f.calls[0]?.url ?? ''); expect(url.pathname).toBe(`/users/${accountId}/search`);
-    expect(Object.fromEntries(url.searchParams)).toEqual({ order: 'desc', limit: '3', metaData: 'true', mailbox: mailboxId, from: 'a+b@example.com', to: 'person', subject: 'A & B', query: 'words', datestart: '2026-10-01T00:00:00Z', dateend: '2026-10-26T00:00:00Z', flagged: 'true', attachments: 'true', previous: 'cursor+/=', unseen: 'true' });
+    expect(Object.fromEntries(url.searchParams)).toEqual({ order: 'desc', limit: '3', metaData: 'true', includeTotal: 'false', mailbox: mailboxId, from: 'a+b@example.com', to: 'person', subject: 'A & B', query: 'words', datestart: '2026-10-01T00:00:00Z', dateend: '2026-10-26T00:00:00Z', flagged: 'true', attachments: 'true', previous: 'cursor+/=', unseen: 'true' });
     const wrong = fixture([{ success: true, results: [message({ mailbox: 'd'.repeat(24) })] }]); await errorCode(wrong.backend.searchMessages(session, { mailboxId, limit: 20 }), 'temporarily_unavailable');
+});
+test('global and mailbox searches skip exact totals on initial, next and previous pages', async () => {
+    for (const scope of [{}, { mailboxId }]) {
+        for (const pagination of [{}, { next: 'forward+/=' }, { previous: 'backward+/=' }]) {
+            const f = fixture([{ success: true, results: [], total: null, nextCursor: 'next+/=', previousCursor: 'previous+/=' }]);
+            const result = await f.backend.searchMessages(session, { subject: 'A & B', limit: 3, ...scope, ...pagination });
+            expect(result).toEqual({ messages: [], next: 'next+/=', previous: 'previous+/=' });
+            expect(f.calls).toHaveLength(1);
+            const url = new URL(f.calls[0]?.url ?? '');
+            expect(url.pathname).toBe(`/users/${accountId}/search`);
+            expect(Object.fromEntries(url.searchParams)).toEqual({ order: 'desc', limit: '3', metaData: 'true', includeTotal: 'false', ...('mailboxId' in scope ? { mailbox: mailboxId } : {}), subject: 'A & B', ...pagination });
+            if ('next' in pagination) { expect(url.search).toContain('next=forward%2B%2F%3D'); }
+            if ('previous' in pagination) { expect(url.search).toContain('previous=backward%2B%2F%3D'); }
+        }
+    }
 });
 test('all adapter entry points reject missing token and invalid account before any request', async () => {
     const f = fixture([]);
@@ -421,7 +436,7 @@ test('search alone gets the longer internal deadline and preserves query semanti
     const logs: SearchDiagnostic[] = []; const urls: string[] = [];
     const backend = createMailBackend({ timeoutMs: 5, searchTimeoutMs: 60, onSearchDiagnostic: value => { logs.push(value); }, fetch: (async url => { urls.push(String(url)); await pause(15); return Response.json({ success: true, results: [] }); }) as typeof fetch });
     expect(await backend.searchMessages(session, { from: 'synthetic@example.test', receivedSince: '2026-10-20T00:00:00Z', limit: 10 })).toEqual({ messages: [] });
-    expect(Object.fromEntries(new URL(urls[0] ?? '').searchParams)).toEqual({ order: 'desc', limit: '10', metaData: 'true', from: 'synthetic@example.test', datestart: '2026-10-20T00:00:00Z' });
+    expect(Object.fromEntries(new URL(urls[0] ?? '').searchParams)).toEqual({ order: 'desc', limit: '10', metaData: 'true', includeTotal: 'false', from: 'synthetic@example.test', datestart: '2026-10-20T00:00:00Z' });
     expect(logs).toHaveLength(1); expect(logs[0]).toMatchObject({ event: 'wildduck_search', outcome: 'success', scope: 'global', timeoutMs: 60, status: 200 });
     expect(logs[0]?.headersMs).toBeGreaterThanOrEqual(10); expect(logs[0]?.durationMs).toBeGreaterThanOrEqual(logs[0]?.headersMs ?? 0); expect(logs[0]).not.toHaveProperty('category');
     await errorCode(backend.submitDraft(session, target), 'upstream_timeout'); expect(urls).toHaveLength(2);
@@ -483,10 +498,23 @@ test('thread pages search the entire account including Sent, preserve identities
     const f = fixture([message({ thread: threadId }), { success: true, results: [message({ thread: threadId, attachments: false }), message({ thread: threadId, mailbox: sent, id: 12, attachments: false })], nextCursor: 'next-thread' }]);
     const page = await f.backend.getThread(session, { message: target, limit: 2, includeBodies: false });
     expect(page.threadId).toBe(threadId); expect(page.messages.map(item => [item.mailboxId, item.uid])).toEqual([[mailboxId, 12], [sent, 12]]); expect(page.next).toBe('next-thread');
-    const query = new URL((f.calls[1]?.url ?? '')).searchParams; expect(query.get('thread')).toBe(threadId); expect(query.has('mailbox')).toBe(false); expect(query.get('order')).toBe('asc');
+    const query = new URL((f.calls[1]?.url ?? '')).searchParams; expect(query.get('thread')).toBe(threadId); expect(query.has('mailbox')).toBe(false); expect(query.get('order')).toBe('asc'); expect(query.get('includeTotal')).toBe('false');
     const mismatch = fixture([{ success: true, results: [message({ thread: 'a'.repeat(24), attachments: false })] }]);
     await errorCode(mismatch.backend.getThread(session, { threadId, limit: 20, previous: 'back', includeBodies: false }), 'verification_failed');
     expect(new URL((mismatch.calls[0]?.url ?? '')).searchParams.get('previous')).toBe('back');
+});
+test('thread lookup skips exact totals on initial, next and previous pages', async () => {
+    const threadId = 'e'.repeat(24);
+    for (const pagination of [{}, { next: 'forward+/=' }, { previous: 'backward+/=' }]) {
+        const f = fixture([{ success: true, results: [], total: null, nextCursor: 'next+/=', previousCursor: 'previous+/=' }]);
+        expect(await f.backend.getThread(session, { threadId, limit: 3, includeBodies: false, ...pagination })).toEqual({ threadId, messages: [], next: 'next+/=', previous: 'previous+/=' });
+        expect(f.calls).toHaveLength(1);
+        const url = new URL(f.calls[0]?.url ?? '');
+        expect(url.pathname).toBe(`/users/${accountId}/search`);
+        expect(Object.fromEntries(url.searchParams)).toEqual({ thread: threadId, order: 'asc', limit: '3', metaData: 'true', includeTotal: 'false', ...pagination });
+        if ('next' in pagination) { expect(url.search).toContain('next=forward%2B%2F%3D'); }
+        if ('previous' in pagination) { expect(url.search).toContain('previous=backward%2B%2F%3D'); }
+    }
 });
 test('message previews preserve explicit missing data and bound multibyte snippets', async () => {
     const f = fixture([{ success: true, results: [message({ intro: 'é'.repeat(400), thread: 'e'.repeat(24), attachments: false })] }, message()]);

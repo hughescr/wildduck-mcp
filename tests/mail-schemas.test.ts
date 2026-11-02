@@ -21,6 +21,19 @@ test('strict tools expose bounded pagination without hidden filters', () => {
     expect(mailInputSchemas.list_messages.safeParse({ mailboxId, limit: 50, next: 'x'.repeat(1024) }).success).toBe(true);
     for (const extra of [{ next: 'x'.repeat(1025) }, { next: '  ' }, { next: 'next', previous: 'previous' }, { unexpected: true }]) { expect(mailInputSchemas.list_messages.safeParse({ mailboxId, ...extra }).success).toBe(false); }
 });
+test('search and thread schemas expose cursors without exact totals or a total-count option', () => {
+    for (const name of ['search_messages', 'get_thread'] as const) {
+        const input = name === 'search_messages' ? { subject: 'search' } : { threadId: mailboxId };
+        const output = { messages: [], next: 'next', previous: 'previous', ...(name === 'get_thread' ? { threadId: mailboxId } : {}) };
+        expect(mailInputSchemas[name].safeParse({ ...input, includeTotal: true }).success).toBe(false);
+        expect(mailOutputSchemas[name].parse(output)).toEqual(output);
+        expect(mailOutputSchemas[name].safeParse({ ...output, total: null }).success).toBe(false);
+        const inputJson = mailInputSchemas[name]['~standard'].jsonSchema.input({ target: 'draft-2020-12' });
+        const outputJson = mailOutputSchemas[name]['~standard'].jsonSchema.output({ target: 'draft-2020-12' });
+        expect(inputJson).not.toHaveProperty('properties.includeTotal');
+        expect(outputJson).not.toHaveProperty('properties.total');
+    }
+});
 test('targets are explicit and downloads accept attachment IDs, never arbitrary paths or URLs', () => {
     for (const value of [{ uid: 1 }, { mailboxId, uid: 0 }, { mailboxId, uid: 4294967296 }, { mailboxId, uid: 1.1 }, { mailboxId: 'G'.repeat(24), uid: 1 }]) { expect(mailInputSchemas.read_message.safeParse(value).success).toBe(false); }
     expect(mailInputSchemas.read_message.safeParse({ mailboxId, uid: 1, markAsSeen: true }).success).toBe(false);

@@ -254,7 +254,7 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         const data = parsed.data;
         const threadId = data.threadId ?? (data.message ? (await this.readMessage(session, data.message)).message.threadId : null);
         if (!threadId) { throw new MailError('unsupported_content'); }
-        const query = new URLSearchParams({ thread: threadId, order: 'asc', limit: String(data.limit), metaData: 'true' });
+        const query = new URLSearchParams({ thread: threadId, order: 'asc', limit: String(data.limit), metaData: 'true', includeTotal: 'false' });
         if (data.next !== undefined) { query.set('next', data.next); } if (data.previous !== undefined) { query.set('previous', data.previous); }
         const timing: SearchTiming = { category: 'network' };
         const raw = json((await this.transport(session, '/search?' + query, 'GET', undefined, META_BYTES, 'json', timing)).bytes);
@@ -276,7 +276,7 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         if (data.flagged === false || data.hasAttachments === false) { throw new MailError('invalid_input'); }
         // Backend query fulltext has a 255-character limit; reject rather than silently narrow/truncate the requested search.
         if (data.text !== undefined && data.text.length > 255) { throw new MailError('invalid_input'); }
-        const query = new URLSearchParams({ order: 'desc', limit: String(data.limit), metaData: 'true' });
+        const query = new URLSearchParams({ order: 'desc', limit: String(data.limit), metaData: 'true', includeTotal: 'false' });
         const fields = { mailboxId: 'mailbox', from: 'from', to: 'to', subject: 'subject', text: 'query', receivedSince: 'datestart', receivedUntil: 'dateend', flagged: 'flagged', hasAttachments: 'attachments', next: 'next', previous: 'previous' } as const;
         for (const [key, field] of Object.entries(fields)) { const value = data[key as keyof typeof fields]; if (value !== undefined) { query.set(field, String(value)); } }
         if (data.seen !== undefined) { query.set(data.seen ? 'seen' : 'unseen', 'true'); }
