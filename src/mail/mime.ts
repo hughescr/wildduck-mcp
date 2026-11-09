@@ -583,7 +583,14 @@ export async function preparePatch(inspected: InspectedMime, patch: MimePatch): 
         let entity: Entity | undefined;
         if (part === source.core && replacement) {entity = replacement;}
         let bytes: Buffer;
-        if (entity) {bytes = Buffer.concat([mergeEntityHeaders(part, entity), entity.body]);}
+        if (entity) {
+            // WildDuck completes the last line of top-level messages on ingestion.
+            // Author that CRLF now so exact read-back verification agrees. Nested
+            // entities use their enclosing delimiter's CRLF; retained bytes and
+            // omitted bodies must remain untouched.
+            const ending = part === source.root && !entity.body.subarray(-2).equals(Buffer.from('\r\n')) ? Buffer.from('\r\n') : Buffer.alloc(0);
+            bytes = Buffer.concat([mergeEntityHeaders(part, entity), entity.body, ending]);
+        }
         else if (part.children.length) {
             const chunks: Buffer[] = [];
             let offset = part.start;

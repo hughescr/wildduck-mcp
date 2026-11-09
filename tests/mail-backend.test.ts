@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { Readable, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { Splitter, Streamer } from '@zone-eu/mailsplit';
-import { createMailBackend, type SearchDiagnostic } from '../src/mail/backend';
+import { createMailBackend, type SearchDiagnostic, type DraftVerificationDiagnostic, type MailBackendOptions } from '../src/mail/backend';
 import { withRequestBudget } from '../src/request-budget';
 import { MailError, MAIL_OPERATION_METADATA_KEY, type BackendMailSession, type DraftContent, type DraftPatch, type MailFailureCode, type MailOperationMarker, type AuthoredSourceDescriptor } from '../src/mail/contracts';
 import { mailOutputSchemas, MAX_READ_TEXT_BYTES } from '../src/mail/schemas';
@@ -71,7 +71,7 @@ async function parsedMime(source: Buffer) {
     await pipeline(Readable.from([source]), splitter, streamer, new Writable({ objectMode: true, write(_chunk, _encoding, done) { done(); } }));
     return { subject, text: text.join('\n'), html };
 }
-function model(aliases: string[] = []) {
+function model(aliases: string[] = [], options: Pick<MailBackendOptions, 'onDraftVerificationDiagnostic'> = {}) {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const previous = new Map<number, ReturnType<typeof message>>(); let nextUid = 13;
     let source: Buffer = originalSource;
@@ -88,7 +88,10 @@ function model(aliases: string[] = []) {
         if (path === `/mailboxes/${'d'.repeat(24)}`) { return Response.json({ success: true, id: 'd'.repeat(24), path: 'Destination' }); }
         if (init?.method === 'POST' && path.endsWith('/submit')) { return Response.json({ success: true, queueId: 'queue-accepted', message: { id: 44, mailbox: 'd'.repeat(24) } }); }
         if (init?.method === 'POST' && path === `/mailboxes/${mailboxId}/messages`) {
-            const body = await uploadBody(init); source = body.raw;
+            const body = await uploadBody(init);
+            // WildDuck imap-core MIMEParser completes nonembedded messages whose
+            // last line lacks LF. The source endpoint rebuilds those stored bytes.
+            source = body.raw.at(-1) === 10 ? body.raw : Buffer.concat([body.raw, Buffer.from('\r\n')]);
             previous.set(raw.id, raw);
             raw = message({ ...raw, ...await parsedMime(source), id: nextUid++, idate: body.date, draft: body.draft, metaData: body.metaData, flags: body.flags, labels: body.labels, seen: !body.unseen, flagged: body.flagged,
                 ...(body.reference ? { reference: { mailbox: body.reference.mailbox, id: body.reference.id, action: body.reference.action } } : {}) });
@@ -110,7 +113,7 @@ function model(aliases: string[] = []) {
         if (path.includes('/messages/')) { expect(parsed.search).toBe('?markAsSeen=false&replaceCidLinks=false'); const requested = Number(path.split('/').at(-1)); return Response.json(requested === raw.id ? raw : previous.get(requested) ?? raw); }
         throw new Error('Unexpected fake path');
     }) as typeof fetch;
-    return { backend: createMailBackend({ fetch: fetcher }), calls, patch: (update: Record<string, unknown>) => { raw = message({ ...raw, ...update }); }, setSource: (value: Buffer) => { source = value; }, source: () => source, current: () => raw };
+    return { backend: createMailBackend({ fetch: fetcher, ...options }), calls, patch: (update: Record<string, unknown>) => { raw = message({ ...raw, ...update }); }, setSource: (value: Buffer) => { source = value; }, source: () => source, current: () => raw };
 }
 test('mailbox listing is bounded, uses explicit user token and resolves unique special-use Drafts independent of path', async () => {
     const boxes = { success: true, results: [{ id: mailboxId, path: '[Gmail]/Drafts', name: 'Drafts', specialUse: '\\Drafts', total: 0, unseen: 0 }] };
@@ -548,6 +551,42 @@ test('reply draft upload stores Unicode response, quote and threading as RFC822 
     const uploads = f.calls.filter(call => call.init.method === 'POST'); expect(uploads).toHaveLength(1);
     expect((await uploadBody(uploads[0]?.init)).metaData[MAIL_OPERATION_METADATA_KEY]).toMatchObject({ tool: 'create_reply_draft' });
     expect(f.calls.some(call => call.init.method === 'DELETE' || call.url.endsWith('/submit'))).toBe(false);
+});
+test.each([['plain', 'Edited reply\n\nC\n'], ['empty', ''], ['wrapped Unicode', 'Edited café 你好 🌍 '.repeat(20)]])('%s reply body update verifies after WildDuck completes the uploaded final line', async (_name, text) => {
+    const f = model(); if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
+    const original = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Original reply\n\nC\n', html: null }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    const key = await f.backend.uploadPreparedDraft(session, original);
+    await f.backend.verifyPreparedDraft(session, key, original);
+    const before = await f.backend.inspectMessage(session, key);
+    const reference = structuredClone((f.current() as Record<string, unknown>).reference); const receivedAt = f.current().idate;
+    const prepared = await f.backend.prepareUpdate(session, before, { body: { text, html: null } }, { ...marker, tool: 'update_draft', operationId: 'reply-body-edit-operation' }, { grade: 'mcp_authored', accountId, ...key, contentDigest: original.mime.sha256 });
+    const candidate = await f.backend.uploadPreparedDraft(session, prepared);
+    await expect(f.backend.verifyPreparedDraft(session, candidate, prepared)).resolves.toMatchObject(candidate);
+    expect(f.source().equals(prepared.mime.raw)).toBe(true);
+    expect(f.current().text).toBe(text); expect(f.current().html).toEqual([]);
+    expect((f.current() as Record<string, unknown>).reference).toEqual(reference); expect(f.current().idate).toBe(receivedAt);
+    for (const header of ['Message-ID', 'In-Reply-To', 'References']) {
+        expect(new RegExp(`^${header}:.*$`, 'mu').exec(prepared.mime.raw.toString())?.[0]).toBe(new RegExp(`^${header}:.*$`, 'mu').exec(original.mime.raw.toString())?.[0]);
+    }
+});
+test('failed draft verification logs only the failing check and safe code, and diagnostic failures cannot change its result', async () => {
+    const cases: Array<[Record<string, unknown>, DraftVerificationDiagnostic['check']]> = [
+        [{ idate: '2026-11-09T00:00:00.000Z' }, 'received_at'], [{ metaData: { secret: 'private metadata' } }, 'metadata'],
+        [{ reference: { mailbox: 'd'.repeat(24), id: 1, action: 'reply' } }, 'reference'], [{ flags: ['\\Draft'] }, 'flags'], [{ labels: ['unexpected'] }, 'labels'],
+    ];
+    for (const [patch, check] of cases) {
+        const logs: DraftVerificationDiagnostic[] = [];
+        const f = model([], { onDraftVerificationDiagnostic: diagnostic => { logs.push(diagnostic); throw new Error('private logger error'); } });
+        const prepared = await f.backend.prepareCreate(session, content, marker); const candidate = await f.backend.uploadPreparedDraft(session, prepared); f.patch(patch);
+        await errorCode(f.backend.verifyPreparedDraft(session, candidate, prepared), 'verification_failed');
+        expect(logs).toEqual([{ event: 'wildduck_draft_verification_failed', check, code: 'verification_failed' }]);
+    }
+    const logs: DraftVerificationDiagnostic[] = [];
+    const f = model([], { onDraftVerificationDiagnostic: diagnostic => { logs.push(diagnostic); } });
+    const prepared = await f.backend.prepareCreate(session, content, marker); const candidate = await f.backend.uploadPreparedDraft(session, prepared);
+    f.setSource(Buffer.concat([f.source(), Buffer.from('private unexpected body')]));
+    await errorCode(f.backend.verifyPreparedDraft(session, candidate, prepared), 'verification_failed');
+    expect(logs).toEqual([{ event: 'wildduck_draft_verification_failed', check: 'mime', code: 'mime_verification_failed' }]);
 });
 test.each([['reply', 'reply'], ['reply_all', 'replyAll']] as const)('%s attaches native %s metadata, preserves it through edits, and submits without a separate flag write', async (mode, action) => {
     const f = model(['alias@other.example']);

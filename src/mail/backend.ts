@@ -32,8 +32,10 @@ class MultipartUpload {
 }
 type SearchCategory = import('./contracts').SearchFailureCause;
 export interface SearchDiagnostic { requestId?: string; event: 'wildduck_search'; outcome: 'success' | 'failure'; scope: 'global' | 'mailbox'; category?: SearchCategory; durationMs: number; headersMs?: number; bodyMs?: number; validationMs?: number; status?: number; timeoutMs?: number }
+type DraftVerificationCheck = 'target' | 'message' | 'mime' | 'draft_state' | 'envelope' | 'metadata' | 'received_at' | 'reference' | 'files' | 'flags' | 'labels';
+export interface DraftVerificationDiagnostic { requestId?: string; event: 'wildduck_draft_verification_failed'; check: DraftVerificationCheck; code: 'mime_verification_failed' | 'verification_failed' | 'upstream_failure' }
 interface SearchTiming { category: SearchCategory; headersMs?: number; bodyMs?: number; status?: number; timeoutMs?: number }
-export interface MailBackendOptions { fetch?: typeof globalThis.fetch; timeoutMs?: number; searchTimeoutMs?: number; downloadStager?: AttachmentDownloadStager; onSearchDiagnostic?: (diagnostic: SearchDiagnostic) => void }
+export interface MailBackendOptions { fetch?: typeof globalThis.fetch; timeoutMs?: number; searchTimeoutMs?: number; downloadStager?: AttachmentDownloadStager; onSearchDiagnostic?: (diagnostic: SearchDiagnostic) => void; onDraftVerificationDiagnostic?: (diagnostic: DraftVerificationDiagnostic) => void }
 const fail = (): never => { throw new MailError('temporarily_unavailable'); };
 function object(value: unknown): value is Json { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 function string(value: unknown): string { return typeof value === 'string' ? value : fail(); }
@@ -160,6 +162,7 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
     private readonly timeoutMs: number;
     private readonly searchTimeoutMs: number;
     private readonly onSearchDiagnostic: (diagnostic: SearchDiagnostic) => void;
+    private readonly onDraftVerificationDiagnostic: (diagnostic: DraftVerificationDiagnostic) => void;
     private readonly snapshots = new WeakMap<MessageSnapshot, SnapshotState>();
     private readonly preparations = new WeakMap<PreparedDraft, PreparationState>();
     constructor(options: MailBackendOptions) {
@@ -169,6 +172,10 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         this.onSearchDiagnostic = options.onSearchDiagnostic ?? (diagnostic => {
             // eslint-disable-next-line no-console -- Deliberate structured, privacy-allowlisted operational diagnostic.
             if (diagnostic.outcome === 'success') { console.info(JSON.stringify(diagnostic)); } else { console.warn(JSON.stringify(diagnostic)); }
+        });
+        this.onDraftVerificationDiagnostic = options.onDraftVerificationDiagnostic ?? (diagnostic => {
+            // eslint-disable-next-line no-console -- Deliberate structured, privacy-allowlisted operational diagnostic.
+            console.warn(JSON.stringify(diagnostic));
         });
         if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs < 1 || this.timeoutMs > 30_000) { throw new MailError('invalid_input'); }
         if (!Number.isSafeInteger(this.searchTimeoutMs) || this.searchTimeoutMs < 1 || this.searchTimeoutMs > 120_000) { throw new MailError('invalid_input'); }
@@ -530,17 +537,32 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
     }
     async verifyPreparedDraft(session: BackendMailSession, target: MessageKey, prepared: PreparedDraft): Promise<MessageRef> {
         const state = this.preparedState(session, prepared); targetValid(target);
-        if (target.mailboxId !== prepared.mailboxId) { throw new MailError('verification_failed'); }
-        const { raw, version: digest } = await this.rawMessage(session, target);
-        try { verifyCandidate(prepared.mime, await this.source(session, target)); } catch (error) { return mimeError(error); }
-        if (!bool(raw['draft']) || !supportedDraftState(raw)) { throw new MailError('verification_failed'); }
-        assertSame(raw['envelope'], { from: '', rcpt: [] });
-        // The existing API does not expose its private submission envelope. The upload
-        // uses exactly the validated final-MIME envelope; do not claim a read-back proof.
-        assertSame(metadata(raw), state.metadata); assertSame(date(raw['idate']), state.receivedAt);
-        assertSame(raw['reference'], state.reference); assertSame(raw['files'] ?? [], state.files);
-        setSame(strings(raw['flags']), state.flags); setSame(strings(raw['labels']), state.labels);
-        return { ...target, version: digest };
+        let check: DraftVerificationCheck = 'target';
+        try {
+            if (target.mailboxId !== prepared.mailboxId) { throw new MailError('verification_failed'); }
+            check = 'message'; const { raw, version: digest } = await this.rawMessage(session, target);
+            check = 'mime'; verifyCandidate(prepared.mime, await this.source(session, target));
+            check = 'draft_state'; if (!bool(raw['draft']) || !supportedDraftState(raw)) { throw new MailError('verification_failed'); }
+            check = 'envelope'; assertSame(raw['envelope'], { from: '', rcpt: [] });
+            // The existing API does not expose its private submission envelope. The upload
+            // uses exactly the validated final-MIME envelope; do not claim a read-back proof.
+            check = 'metadata'; assertSame(metadata(raw), state.metadata);
+            check = 'received_at'; assertSame(date(raw['idate']), state.receivedAt);
+            check = 'reference'; assertSame(raw['reference'], state.reference);
+            check = 'files'; assertSame(raw['files'] ?? [], state.files);
+            check = 'flags'; setSame(strings(raw['flags']), state.flags);
+            check = 'labels'; setSame(strings(raw['labels']), state.labels);
+            return { ...target, version: digest };
+        } catch (error) {
+            // Check names and codes are fixed literals: never log source, metadata,
+            // account/operation identifiers, expected values, or upstream errors.
+            try {
+                const requestId = currentRequestId();
+                this.onDraftVerificationDiagnostic({ event: 'wildduck_draft_verification_failed', ...(requestId ? { requestId } : {}), check,
+                    code: error instanceof MimeError && error.code === 'mime_verification_failed' ? 'mime_verification_failed' : error instanceof MailError && error.code === 'verification_failed' ? 'verification_failed' : 'upstream_failure' });
+            } catch { /* Diagnostics must not alter verification or its receipt. */ }
+            return mimeError(error);
+        }
     }
     async deleteDraft(session: BackendMailSession, target: MessageKey): Promise<void> {
         sessionValid(session); targetValid(target);
