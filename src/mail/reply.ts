@@ -17,6 +17,7 @@ export interface ReplyRecipients { readonly to: readonly MimeAddress[]; readonly
 export interface ReplyInput {
     readonly original: ReplyOriginal;
     readonly ownedAddresses: readonly string[];
+    readonly isOwnedAddress?: (address: string) => boolean;
     readonly mode: 'reply' | 'reply_all';
     readonly body: MimeBody;
     readonly quoteOriginal?: boolean | undefined;
@@ -61,8 +62,8 @@ export function deriveReply(input: ReplyInput): DerivedReply {
         cc = input.mode === 'reply_all' ? original.cc : [];
     }
     validateMimeAddresses(to); validateMimeAddresses(cc);
-    // Lowercase keys deliberately prevent duplicate delivery across differently
-    // cased mailbox spellings. Never infer alias equivalence from plus/dot syntax.
+    // Lowercase keys prevent duplicate delivery. Additional ownership equivalence
+    // comes only from the backend's administrator-configured resolver policy.
     const excluded = new Set<string>();
     if (input.recipients === undefined) {
         const identities = [...new Set(input.ownedAddresses.map(address => address.toLowerCase()))];
@@ -76,7 +77,7 @@ export function deriveReply(input: ReplyInput): DerivedReply {
     }
     const select = (values: readonly MimeAddress[]) => values.filter(value => {
         const key = addressKey(value);
-        if (excluded.has(key)) { return false; }
+        if (excluded.has(key) || input.recipients === undefined && input.isOwnedAddress?.(value.address)) { return false; }
         excluded.add(key); return true;
     }).map(value => ({ ...value }));
     const recipients = { to: select(to), cc: select(cc) };

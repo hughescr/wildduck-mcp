@@ -7,6 +7,7 @@ import { MailError, MAIL_OPERATION_METADATA_KEY, type BackendMailSession, type M
 import { draftContentSchema, mailboxIdSchema, messageKeySchema, mailInputSchemas, mailOutputSchemas, canonicalReadMessageOutputSchema, attachmentDownloadLinkSchema, mailOperationMarkerSchema, addFlagSchema, labelSchema, MAX_READ_TEXT_BYTES, MAX_HTML_BYTES, MAX_ATTACHMENT_BYTES, MAX_SNIPPET_BYTES } from './schemas';
 import { MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS, type AttachmentDownloadStager } from './downloads';
 import { deriveReply } from './reply';
+import { ownedIdentityMatcher, validAddressTagPolicy, type AddressTagPolicy } from './identities';
 import { createMime, inspectSource, preparePatch, verifyCandidate, MimeError, MIME_LIMITS, type MimeEnvelope } from './mime';
 
 const META_BYTES = 512 * 1024;
@@ -35,7 +36,7 @@ export interface SearchDiagnostic { requestId?: string; event: 'wildduck_search'
 type DraftVerificationCheck = 'target' | 'message' | 'mime' | 'draft_state' | 'envelope' | 'metadata' | 'received_at' | 'reference' | 'files' | 'flags' | 'labels';
 export interface DraftVerificationDiagnostic { requestId?: string; event: 'wildduck_draft_verification_failed'; check: DraftVerificationCheck; code: 'mime_verification_failed' | 'verification_failed' | 'upstream_failure' }
 interface SearchTiming { category: SearchCategory; headersMs?: number; bodyMs?: number; status?: number; timeoutMs?: number }
-export interface MailBackendOptions { fetch?: typeof globalThis.fetch; timeoutMs?: number; searchTimeoutMs?: number; downloadStager?: AttachmentDownloadStager; onSearchDiagnostic?: (diagnostic: SearchDiagnostic) => void; onDraftVerificationDiagnostic?: (diagnostic: DraftVerificationDiagnostic) => void }
+export interface MailBackendOptions { fetch?: typeof globalThis.fetch; timeoutMs?: number; searchTimeoutMs?: number; addressTagPolicy?: AddressTagPolicy; downloadStager?: AttachmentDownloadStager; onSearchDiagnostic?: (diagnostic: SearchDiagnostic) => void; onDraftVerificationDiagnostic?: (diagnostic: DraftVerificationDiagnostic) => void }
 const fail = (): never => { throw new MailError('temporarily_unavailable'); };
 function object(value: unknown): value is Json { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 function string(value: unknown): string { return typeof value === 'string' ? value : fail(); }
@@ -161,6 +162,7 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
     private readonly fetcher: typeof globalThis.fetch;
     private readonly timeoutMs: number;
     private readonly searchTimeoutMs: number;
+    private readonly addressTagPolicy: AddressTagPolicy;
     private readonly onSearchDiagnostic: (diagnostic: SearchDiagnostic) => void;
     private readonly onDraftVerificationDiagnostic: (diagnostic: DraftVerificationDiagnostic) => void;
     private readonly snapshots = new WeakMap<MessageSnapshot, SnapshotState>();
@@ -169,6 +171,8 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         this.downloadStager = options.downloadStager;
         this.fetcher = options.fetch ?? globalThis.fetch; this.timeoutMs = options.timeoutMs ?? 10_000;
         this.searchTimeoutMs = options.searchTimeoutMs ?? options.timeoutMs ?? 45_000;
+        this.addressTagPolicy = options.addressTagPolicy ?? 'exact';
+        if (!validAddressTagPolicy(this.addressTagPolicy)) { throw new MailError('invalid_input'); }
         this.onSearchDiagnostic = options.onSearchDiagnostic ?? (diagnostic => {
             // eslint-disable-next-line no-console -- Deliberate structured, privacy-allowlisted operational diagnostic.
             if (diagnostic.outcome === 'success') { console.info(JSON.stringify(diagnostic)); } else { console.warn(JSON.stringify(diagnostic)); }
@@ -330,7 +334,10 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         return { raw, version: version(session, target, raw) };
     }
     async readMessage(session: BackendMailSession, input: MessageKey) {
-        const snapshot = await this.rawMessage(session, input); const raw = snapshot.raw;
+        return this.projectMessage(await this.rawMessage(session, input), input);
+    }
+    private projectMessage(snapshot: { raw: Json; version: string }, input: MessageKey) {
+        const raw = snapshot.raw;
         // The API caps stored text in UTF-16 characters and HTML in UTF-8 bytes.
         // Reaching its ceiling is conservatively incomplete, even below our own cap.
         const html: string[] = []; let remaining = MAX_HTML_BYTES; let htmlTruncated = ((raw['html'] ?? []) as string[]).reduce((total, item) => total + Buffer.byteLength(item), 0) >= 640 * 1024;
@@ -443,27 +450,36 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         if (!mailOperationMarkerSchema.safeParse(marker).success || marker.accountId !== session.accountId) { throw new MailError('invalid_input'); }
     }
     private marked(raw: Json, marker: MailOperationMarker): Json { return { ...metadata(raw), [MAIL_OPERATION_METADATA_KEY]: marker }; }
-    private async ownedFrom(session: BackendMailSession, desired?: { address: string; name?: string | undefined }): Promise<{ address: string; name?: string | undefined }> {
-        if (desired && !isEmailValid(desired.address, API_EMAIL_OPTIONS)) { throw new MailError('invalid_input'); }
-        const user = await this.request(session, '', 'GET');
+    private async ownedIdentities(session: BackendMailSession) {
+        const [user, aliases] = await Promise.all([this.request(session, '', 'GET'), this.request(session, '/addresses', 'GET')]);
         if (id(user['id']) !== session.accountId || typeof user['address'] !== 'string' || !isEmailValid(user['address'], API_EMAIL_OPTIONS)) { return fail(); }
-        const address = desired?.address ?? user['address'];
-        if (address !== user['address']) {
-            const aliases = await this.request(session, '/addresses', 'GET');
-            if (address.includes('*') || !Array.isArray(aliases['results']) || aliases['results'].length > 1000 || !aliases['results'].some(item => object(item) && item['address'] === address && !String(item['address']).includes('*'))) { throw new MailError('forbidden'); }
-        }
-        return desired ?? { address, ...(typeof user['name'] === 'string' && user['name'] ? { name: user['name'] } : {}) };
+        if (!Array.isArray(aliases['results']) || aliases['results'].length > 1000 || aliases['results'].some(item => !object(item) || typeof item['address'] !== 'string')) { return fail(); }
+        const ownedAddresses = [user['address'], ...(aliases['results'] as Json[]).map(item => string(item['address'])).filter(address => !address.includes('*'))];
+        const match = ownedIdentityMatcher(ownedAddresses, this.addressTagPolicy);
+        return { primary: user['address'], ownedAddresses, match, ...(typeof user['name'] === 'string' && user['name'] ? { name: user['name'] } : {}) };
+    }
+    private selectFrom(identities: Awaited<ReturnType<MailBackend['ownedIdentities']>>, desired?: { address: string; name?: string | undefined }) {
+        if (desired && !isEmailValid(desired.address, API_EMAIL_OPTIONS)) { throw new MailError('invalid_input'); }
+        if (desired && !identities.match(desired.address)) { throw new MailError('forbidden'); }
+        return desired ?? { address: identities.primary, ...(identities.name ? { name: identities.name } : {}) };
+    }
+    private async ownedFrom(session: BackendMailSession, desired?: { address: string; name?: string | undefined }) {
+        return this.selectFrom(await this.ownedIdentities(session), desired);
     }
     async prepareReply(session: BackendMailSession, input: MailInput<'create_reply_draft'>, marker: MailOperationMarker): Promise<PreparedDraft> {
         sessionValid(session); this.checkMarker(session, marker);
         const parsed = mailInputSchemas.create_reply_draft.safeParse(input); if (!parsed.success) { throw new MailError('invalid_input'); }
         const data = parsed.data;
         try {
-            const [original, defaultFrom, aliases, mailbox] = await Promise.all([this.readMessage(session, data.original), this.ownedFrom(session), this.request(session, '/addresses', 'GET'), this.resolveDraftMailbox(session)]);
-            if (!Array.isArray(aliases['results']) || aliases['results'].length > 1000 || aliases['results'].some(item => !object(item) || typeof item['address'] !== 'string')) { return fail(); }
-            const ownedAddresses = [defaultFrom.address, ...(aliases['results'] as Json[]).map(item => string(item['address'])).filter(address => !address.includes('*'))];
-            const from = data.from ?? defaultFrom; if (!ownedAddresses.includes(from.address) || from.address.includes('*')) { throw new MailError('forbidden'); }
-            const reply = deriveReply({ original: original.message, ownedAddresses, mode: data.mode, body: data.body, quoteOriginal: data.quoteOriginal, ...(data.to === undefined && data.cc === undefined ? {} : { recipients: { to: data.to ?? [], cc: data.cc ?? [] } }) });
+            const [snapshot, identities, mailbox] = await Promise.all([this.rawMessage(session, data.original), this.ownedIdentities(session), this.resolveDraftMailbox(session)]);
+            const original = this.projectMessage(snapshot, data.original);
+            // SMTP recipient evidence handles Bcc delivery and takes precedence
+            // over untrusted visible recipients. None of it is copied to output.
+            const delivered = (snapshot.raw['envelope'] as Json)['rcpt'] as Json[];
+            const candidates = [...delivered.map(item => string(item['value'])), ...original.message.to.map(item => item.address), ...original.message.cc.map(item => item.address)];
+            const selected = candidates.find(address => identities.match(address));
+            const from = this.selectFrom(identities, data.from ?? (selected ? { address: selected, ...(identities.name ? { name: identities.name } : {}) } : undefined));
+            const reply = deriveReply({ original: original.message, ownedAddresses: identities.ownedAddresses, isOwnedAddress: address => identities.match(address) !== undefined, mode: data.mode, body: data.body, quoteOriginal: data.quoteOriginal, ...(data.to === undefined && data.cc === undefined ? {} : { recipients: { to: data.to ?? [], cc: data.cc ?? [] } }) });
             const mime = await createMime({ ...reply, from, attachments: data.attachments });
             const envelope = outbound(mime.envelope); if (envelope.from !== from.address) { throw new MailError('unsupported_content'); }
             const prepared: PreparedDraft = { mailboxId: mailbox.mailboxId, mime, marker };
