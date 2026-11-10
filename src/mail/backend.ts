@@ -7,7 +7,7 @@ import { MailError, MAIL_OPERATION_METADATA_KEY, type BackendMailSession, type M
 import { draftContentSchema, mailboxIdSchema, messageKeySchema, mailInputSchemas, mailOutputSchemas, canonicalReadMessageOutputSchema, attachmentDownloadLinkSchema, mailOperationMarkerSchema, addFlagSchema, labelSchema, MAX_READ_TEXT_BYTES, MAX_HTML_BYTES, MAX_ATTACHMENT_BYTES, MAX_SNIPPET_BYTES } from './schemas';
 import { MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS, type AttachmentDownloadStager } from './downloads';
 import { deriveReply } from './reply';
-import { ownedIdentityMatcher, validAddressTagPolicy, type AddressTagPolicy } from './identities';
+import { ownedIdentityMatcher } from './identities';
 import { createMime, inspectSource, preparePatch, verifyCandidate, MimeError, MIME_LIMITS, type MimeEnvelope } from './mime';
 
 const META_BYTES = 512 * 1024;
@@ -36,7 +36,7 @@ export interface SearchDiagnostic { requestId?: string; event: 'wildduck_search'
 type DraftVerificationCheck = 'target' | 'message' | 'mime' | 'draft_state' | 'envelope' | 'metadata' | 'received_at' | 'reference' | 'files' | 'flags' | 'labels';
 export interface DraftVerificationDiagnostic { requestId?: string; event: 'wildduck_draft_verification_failed'; check: DraftVerificationCheck; code: 'mime_verification_failed' | 'verification_failed' | 'upstream_failure' }
 interface SearchTiming { category: SearchCategory; headersMs?: number; bodyMs?: number; status?: number; timeoutMs?: number }
-export interface MailBackendOptions { fetch?: typeof globalThis.fetch; timeoutMs?: number; searchTimeoutMs?: number; addressTagPolicy?: AddressTagPolicy; downloadStager?: AttachmentDownloadStager; onSearchDiagnostic?: (diagnostic: SearchDiagnostic) => void; onDraftVerificationDiagnostic?: (diagnostic: DraftVerificationDiagnostic) => void }
+export interface MailBackendOptions { fetch?: typeof globalThis.fetch; timeoutMs?: number; searchTimeoutMs?: number; dotAsPlus?: boolean; stripReplySuffix?: boolean; downloadStager?: AttachmentDownloadStager; onSearchDiagnostic?: (diagnostic: SearchDiagnostic) => void; onDraftVerificationDiagnostic?: (diagnostic: DraftVerificationDiagnostic) => void }
 const fail = (): never => { throw new MailError('temporarily_unavailable'); };
 function object(value: unknown): value is Json { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 function string(value: unknown): string { return typeof value === 'string' ? value : fail(); }
@@ -162,7 +162,8 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
     private readonly fetcher: typeof globalThis.fetch;
     private readonly timeoutMs: number;
     private readonly searchTimeoutMs: number;
-    private readonly addressTagPolicy: AddressTagPolicy;
+    private readonly dotAsPlus: boolean;
+    private readonly stripReplySuffix: boolean;
     private readonly onSearchDiagnostic: (diagnostic: SearchDiagnostic) => void;
     private readonly onDraftVerificationDiagnostic: (diagnostic: DraftVerificationDiagnostic) => void;
     private readonly snapshots = new WeakMap<MessageSnapshot, SnapshotState>();
@@ -171,8 +172,9 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         this.downloadStager = options.downloadStager;
         this.fetcher = options.fetch ?? globalThis.fetch; this.timeoutMs = options.timeoutMs ?? 10_000;
         this.searchTimeoutMs = options.searchTimeoutMs ?? options.timeoutMs ?? 45_000;
-        this.addressTagPolicy = options.addressTagPolicy ?? 'exact';
-        if (!validAddressTagPolicy(this.addressTagPolicy)) { throw new MailError('invalid_input'); }
+        this.dotAsPlus = options.dotAsPlus ?? false;
+        this.stripReplySuffix = options.stripReplySuffix ?? true;
+        if (typeof this.dotAsPlus !== 'boolean' || typeof this.stripReplySuffix !== 'boolean') { throw new MailError('invalid_input'); }
         this.onSearchDiagnostic = options.onSearchDiagnostic ?? (diagnostic => {
             // eslint-disable-next-line no-console -- Deliberate structured, privacy-allowlisted operational diagnostic.
             if (diagnostic.outcome === 'success') { console.info(JSON.stringify(diagnostic)); } else { console.warn(JSON.stringify(diagnostic)); }
@@ -455,7 +457,7 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         if (id(user['id']) !== session.accountId || typeof user['address'] !== 'string' || !isEmailValid(user['address'], API_EMAIL_OPTIONS)) { return fail(); }
         if (!Array.isArray(aliases['results']) || aliases['results'].length > 1000 || aliases['results'].some(item => !object(item) || typeof item['address'] !== 'string')) { return fail(); }
         const ownedAddresses = [user['address'], ...(aliases['results'] as Json[]).map(item => string(item['address'])).filter(address => !address.includes('*'))];
-        const match = ownedIdentityMatcher(ownedAddresses, this.addressTagPolicy, user['address']);
+        const match = ownedIdentityMatcher(ownedAddresses, this.dotAsPlus, user['address']);
         return { primary: user['address'], ownedAddresses, match, ...(typeof user['name'] === 'string' && user['name'] ? { name: user['name'] } : {}) };
     }
     private selectFrom(identities: Awaited<ReturnType<MailBackend['ownedIdentities']>>, desired?: { address: string; name?: string | undefined }) {
@@ -477,12 +479,13 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
             // over untrusted visible recipients. None of it is copied to output.
             const delivered = (snapshot.raw['envelope'] as Json)['rcpt'] as Json[];
             const candidates = [...delivered.map(item => string(item['value'])), ...original.message.to.map(item => item.address), ...original.message.cc.map(item => item.address)];
-            // The matcher returns the registered identity behind a routed tag.
-            // Use that base address by default; callers can explicitly retain a
-            // supported tag with From. Never strip a registered alias itself.
-            // Some resolvers accept tags of a dotted alias's lookup key but do
-            // not accept the registered spelling as a sender. Skip those bases.
-            const selected = candidates.map(address => identities.match(address)).find(address => address !== undefined && identities.match(address) === address);
+            // Routing recognition and reply identity are independent. Stripping
+            // selects the registered identity behind the tag, never a guessed
+            // substring. Skip bases that the resolver cannot use as a sender.
+            const selected = candidates.map(address => {
+                const owned = identities.match(address);
+                return owned === undefined ? undefined : this.stripReplySuffix ? owned : address;
+            }).find(address => address !== undefined && identities.match(address) !== undefined);
             const from = this.selectFrom(identities, data.from ?? (selected ? { address: selected, ...(identities.name ? { name: identities.name } : {}) } : undefined));
             const reply = deriveReply({ original: original.message, ownedAddresses: identities.ownedAddresses, isOwnedAddress: address => identities.match(address) !== undefined, mode: data.mode, body: data.body, quoteOriginal: data.quoteOriginal, ...(data.to === undefined && data.cc === undefined ? {} : { recipients: { to: data.to ?? [], cc: data.cc ?? [] } }) });
             const mime = await createMime({ ...reply, from, attachments: data.attachments });

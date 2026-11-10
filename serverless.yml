@@ -21,7 +21,8 @@ provider:
     PUBLIC_BASE_URL:
       Fn::ImportValue: wildduck-mcp-prod-public-origin
     AUTH_KEYRING_PARAMETER: ${env:AUTH_KEYRING_PARAMETER, ''}
-    WILDDUCK_ADDRESS_TAG_POLICY: ${env:WILDDUCK_ADDRESS_TAG_POLICY, 'exact'}
+    WILDDUCK_DOT_AS_PLUS: ${env:WILDDUCK_DOT_AS_PLUS, 'false'}
+    WILDDUCK_STRIP_REPLY_SUFFIX: ${env:WILDDUCK_STRIP_REPLY_SUFFIX, 'true'}
     DOWNLOAD_BUCKET_NAME:
       Fn::ImportValue: wildduck-mcp-prod-download-bucket
     CREDENTIAL_TABLE_NAME:

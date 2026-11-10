@@ -1,10 +1,7 @@
 import { toUnicode } from 'nodemailer/lib/punycode';
 import { isEmailValid } from '@hapi/address';
 
-/** Administrator assertion about the configured WildDuck address resolver. */
-export type AddressTagPolicy = 'exact' | 'plus' | 'dot-plus';
 const emailOptions = { tlds: false } as unknown as Parameters<typeof isEmailValid>[1];
-export function validAddressTagPolicy(value: unknown): value is AddressTagPolicy { return value === 'exact' || value === 'plus' || value === 'dot-plus'; }
 function parts(address: string): { local: string; domain: string } | undefined {
     if (address.includes('*') || !isEmailValid(address, emailOptions)) { return undefined; }
     const at = address.lastIndexOf('@');
@@ -23,12 +20,12 @@ function parts(address: string): { local: string; domain: string } | undefined {
 /** Bounded account-owned identities, with WildDuck's asymmetric candidate and
  * registered-address keys. Never strip labels from registered aliases: owning
  * alice.smith does not establish ownership of alice.tag. */
-export function ownedIdentityMatcher(ownedAddresses: readonly string[], policy: AddressTagPolicy, primaryAddress?: string): (candidate: string) => string | undefined {
+export function ownedIdentityMatcher(ownedAddresses: readonly string[], dotAsPlus: boolean, primaryAddress?: string): (candidate: string) => string | undefined {
     const primary = primaryAddress === undefined ? undefined : parts(primaryAddress);
     const registered = new Map<string, string>();
     for (const address of ownedAddresses) {
         const value = parts(address); if (!value) { continue; }
-        const key = `${policy === 'exact' ? value.local : value.local.replace(/\./gu, '')}@${value.domain}`;
+        const key = `${value.local.replace(/\./gu, '')}@${value.domain}`;
         registered.set(key, registered.get(key) ?? address);
     }
     return candidate => {
@@ -36,7 +33,7 @@ export function ownedIdentityMatcher(ownedAddresses: readonly string[], policy: 
         // WildDuck explicitly accepts its configured primary sender before
         // resolving labels. This exception does not extend to dotted aliases.
         if (primary && value.local === primary.local && value.domain === primary.domain) { return primaryAddress; }
-        const local = policy === 'exact' ? value.local : value.local.replace(policy === 'plus' ? /\+.*$/u : /[.+].*$/u, '').replace(/\./gu, '');
+        const local = value.local.replace(dotAsPlus ? /[.+].*$/u : /\+.*$/u, '').replace(/\./gu, '');
         return local ? registered.get(`${local}@${value.domain}`) : undefined;
     };
 }

@@ -71,7 +71,7 @@ async function parsedMime(source: Buffer) {
     await pipeline(Readable.from([source]), splitter, streamer, new Writable({ objectMode: true, write(_chunk, _encoding, done) { done(); } }));
     return { subject, text: text.join('\n'), html };
 }
-function model(aliases: string[] = [], options: Pick<MailBackendOptions, 'onDraftVerificationDiagnostic' | 'addressTagPolicy'> = {}, primary = 'sender@example.com') {
+function model(aliases: string[] = [], options: Pick<MailBackendOptions, 'onDraftVerificationDiagnostic' | 'dotAsPlus' | 'stripReplySuffix'> = {}, primary = 'sender@example.com') {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const previous = new Map<number, ReturnType<typeof message>>(); let nextUid = 13;
     let source: Buffer = originalSource;
@@ -565,7 +565,7 @@ test.each([
     expect(prepared.mime.envelope.from).toEqual([{ address: expected, name: 'Sender' }]);
 });
 test.each(['sender+service@example.com', 'sender.service@example.com'])('configured reply defaults %s to its owned base, excludes tagged self recipients and permits later edits', async address => {
-    const f = model([], { addressTagPolicy: 'dot-plus' });
+    const f = model([], { dotAsPlus: true });
     f.patch({ envelope: { from: 'author@example.net', rcpt: [{ value: address }] }, to: [{ address }, { address: 'reader@example.net' }], cc: [{ address: 'sender.other@example.com' }] });
     if (!f.backend.prepareReply) { throw new Error("Missing reply implementation"); }
     const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply_all', body: { text: 'Response', html: null }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
@@ -579,15 +579,39 @@ test.each(['sender+service@example.com', 'sender.service@example.com'])('configu
     const replacement = await f.backend.uploadPreparedDraft(session, edited); await f.backend.verifyPreparedDraft(session, replacement, edited);
 });
 test.each([
-    ['dot-plus', 'alias.service@example.com', true, 'alias@example.com'],
-    ['dot-plus', 'alias+service@example.com', false, 'alias@example.com'],
-    ['plus', 'real.alias+service@example.com', true, 'real.alias@example.com'],
-    ['exact', 'real.alias@example.com', false, 'real.alias@example.com'],
-    ['dot-plus', 'alice.tag@example.com', true, 'sender@example.com'],
-    ['dot-plus', 'alicesmith.tag@example.com', true, 'sender@example.com'],
-    ['dot-plus', 'sender.primary@example.com', true, 'sender.primary@example.com']
-] as const)('%s reply maps owned recipient %s to its registered identity without stripping aliases', async (addressTagPolicy, address, blind, expected) => {
-    const f = model(['alias@example.com', 'real.alias@example.com', 'alice.smith@example.com'], { addressTagPolicy }, expected === 'sender.primary@example.com' ? expected : undefined);
+    [false, false, 'alias+service@example.com', 'alias+service@example.com'],
+    [false, true, 'alias+service@example.com', 'alias@example.com'],
+    [true, false, 'alias+service@example.com', 'alias+service@example.com'],
+    [true, true, 'alias+service@example.com', 'alias@example.com'],
+    [false, false, 'alias.service@example.com', 'sender@example.com'],
+    [false, true, 'alias.service@example.com', 'sender@example.com'],
+    [true, false, 'alias.service@example.com', 'alias.service@example.com'],
+    [true, true, 'alias.service@example.com', 'alias@example.com'],
+] as const)('dotAsPlus=%s stripReplySuffix=%s independently select reply From for %s', async (dotAsPlus, stripReplySuffix, address, expected) => {
+    const f = model(['alias@example.com'], { dotAsPlus, stripReplySuffix });
+    f.patch({ envelope: { from: '', rcpt: [{ value: address }] }, to: [{ address: 'reader@example.net' }], cc: [], bcc: [{ address }] });
+    if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
+    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response', html: null }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    expect(prepared.mime.envelope.from).toEqual([{ address: expected, name: 'Sender' }]);
+    expect(prepared.mime.envelope.bcc).toEqual([]);
+});
+test('retaining a tag can use a routed dotted alias whose registered spelling cannot be selected', async () => {
+    const f = model(['alice.smith@example.com'], { dotAsPlus: true, stripReplySuffix: false });
+    f.patch({ envelope: { from: '', rcpt: [{ value: 'alicesmith.service@example.com' }] }, to: [], cc: [] });
+    if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
+    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response', html: null }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    expect(prepared.mime.envelope.from).toEqual([{ address: 'alicesmith.service@example.com', name: 'Sender' }]);
+});
+test.each([
+    [true, 'alias.service@example.com', true, 'alias@example.com'],
+    [true, 'alias+service@example.com', false, 'alias@example.com'],
+    [false, 'real.alias+service@example.com', true, 'real.alias@example.com'],
+    [false, 'real.alias@example.com', false, 'real.alias@example.com'],
+    [true, 'alice.tag@example.com', true, 'sender@example.com'],
+    [true, 'alicesmith.tag@example.com', true, 'sender@example.com'],
+    [true, 'sender.primary@example.com', true, 'sender.primary@example.com']
+] as const)('%s reply maps owned recipient %s to its registered identity without stripping aliases', async (dotAsPlus, address, blind, expected) => {
+    const f = model(['alias@example.com', 'real.alias@example.com', 'alice.smith@example.com'], { dotAsPlus }, expected === 'sender.primary@example.com' ? expected : undefined);
     f.patch({ envelope: { from: 'author@example.net', rcpt: blind ? [{ value: address }] : [] }, to: blind ? [{ address: 'reader@example.net' }] : [{ address }], cc: [], bcc: blind ? [{ address }] : [] });
     if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
     const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response', html: null }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
@@ -595,14 +619,14 @@ test.each([
     expect(prepared.mime.envelope.bcc).toEqual([]);
 });
 test('an unselectable dotted alias base does not prevent a later owned recipient from being chosen', async () => {
-    const f = model(['alice.smith@example.com', 'alias@example.com'], { addressTagPolicy: 'dot-plus' });
+    const f = model(['alice.smith@example.com', 'alias@example.com'], { dotAsPlus: true });
     f.patch({ envelope: { from: '', rcpt: [{ value: 'alicesmith.tag@example.com' }] }, to: [{ address: 'alias.service@example.com' }], cc: [] });
     if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
     const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response', html: null }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
     expect(prepared.mime.envelope.from).toEqual([{ address: 'alias@example.com', name: 'Sender' }]);
 });
 test.each(['alias+chosen@example.com', 'alias.chosen@example.com'])('explicit sender %s and recipient overrides win, remain editable, and unsupported tagged senders fail before upload', async address => {
-    const f = model(['alias@example.com'], { addressTagPolicy: 'dot-plus' }); f.patch({ envelope: { from: '', rcpt: [{ value: 'sender.service@example.com' }] } });
+    const f = model(['alias@example.com'], { dotAsPlus: true }); f.patch({ envelope: { from: '', rcpt: [{ value: 'sender.service@example.com' }] } });
     if (!f.backend.prepareReply) { throw new Error("Missing reply implementation"); }
     const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply_all', from: { address, name: 'Chosen' }, to: [{ address: 'sender.service@example.com' }], cc: [], body: { text: 'Response', html: null }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
     expect(prepared.mime.envelope.from).toEqual([{ address, name: 'Chosen' }]);
@@ -612,18 +636,18 @@ test.each(['alias+chosen@example.com', 'alias.chosen@example.com'])('explicit se
     const edited = await f.backend.prepareUpdate(session, snapshot, { body: { text: 'Edited explicit tagged reply', html: null } }, { ...marker, tool: 'update_draft', operationId: 'explicit-tagged-reply-edit' }, { grade: 'mcp_authored', accountId, ...candidate, contentDigest: prepared.mime.sha256 });
     expect(edited.mime.envelope.from).toEqual(prepared.mime.envelope.from);
     const replacement = await f.backend.uploadPreparedDraft(session, edited); await f.backend.verifyPreparedDraft(session, replacement, edited);
-    for (const options of [{}, { addressTagPolicy: 'plus' as const }]) {
+    for (const options of [{}, { dotAsPlus: false }]) {
         const denied = model([], options);
         await errorCode(denied.backend.prepareCreate(session, { ...content, from: { address: 'sender.service@example.com' } }, marker), 'forbidden');
         expect(denied.calls.every(call => call.init.method === 'GET')).toBe(true);
     }
-    const collision = model(['alice.smith@example.com'], { addressTagPolicy: 'dot-plus' });
+    const collision = model(['alice.smith@example.com'], { dotAsPlus: true });
     await errorCode(collision.backend.prepareCreate(session, { ...content, from: { address: 'alice.tag@example.com' } }, marker), 'forbidden');
 });
-test('dot-plus policy preserves a dotted primary through ordinary creation, explicit selection and later edits', async () => {
+test('dot-as-plus preserves a dotted primary through ordinary creation, explicit selection and later edits', async () => {
     const primary = 'sender.primary@example.com';
     for (const from of [undefined, { address: primary }]) {
-        const f = model([], { addressTagPolicy: 'dot-plus' }, primary);
+        const f = model([], { dotAsPlus: true }, primary);
         const prepared = await f.backend.prepareCreate(session, { ...content, ...(from ? { from } : {}) }, marker);
         expect(prepared.mime.envelope.from[0]?.address).toBe(primary);
         const candidate = await f.backend.uploadPreparedDraft(session, prepared); await f.backend.verifyPreparedDraft(session, candidate, prepared);
@@ -634,7 +658,7 @@ test('dot-plus policy preserves a dotted primary through ordinary creation, expl
     }
 });
 test('reply does not select URL-equivalent Unicode domains that WildDuck resolves separately', async () => {
-    const f = model([], { addressTagPolicy: 'dot-plus' });
+    const f = model([], { dotAsPlus: true });
     f.patch({ envelope: { from: '', rcpt: [{ value: 'sender.service@ｅxample.com' }] }, to: [{ address: 'reader@example.net' }], cc: [] });
     if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
     const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response', html: null }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
