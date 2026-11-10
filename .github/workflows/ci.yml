@@ -89,8 +89,12 @@ jobs:
           AWS_EXECUTION_ROLE_ARN: ${{ vars.AWS_EXECUTION_ROLE_ARN }}
           AUTH_KEYRING_PARAMETER: ${{ vars.AUTH_KEYRING_PARAMETER }}
           SERVERLESS_ACCESS_KEY: ${{ secrets.SERVERLESS_ACCESS_KEY }}
+          WILDDUCK_DOT_AS_PLUS: ${{ vars.WILDDUCK_DOT_AS_PLUS || 'false' }}
+          WILDDUCK_STRIP_REPLY_SUFFIX: ${{ vars.WILDDUCK_STRIP_REPLY_SUFFIX || 'true' }}
       - name: Verify live OAuth readiness
         run: node scripts/verify-deployment.mjs
         env:
           STACK_NAME: wildduck-mcp-prod
           AWS_REGION: us-west-2
+          WILDDUCK_DOT_AS_PLUS: ${{ vars.WILDDUCK_DOT_AS_PLUS || 'false' }}
+          WILDDUCK_STRIP_REPLY_SUFFIX: ${{ vars.WILDDUCK_STRIP_REPLY_SUFFIX || 'true' }}

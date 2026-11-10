@@ -6,6 +6,10 @@ import assert from 'node:assert/strict';
 const { version } = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
 const stack = JSON.parse(execFileSync('aws', ['cloudformation', 'describe-stacks', '--stack-name', process.env.STACK_NAME ?? 'wildduck-mcp-prod', '--output', 'json'], { encoding: 'utf8', timeout: 30_000 }));
 const outputs = stack.Stacks[0].Outputs;
+const deployed = JSON.parse(execFileSync('aws', ['lambda', 'get-function-configuration', '--function-name', 'wildduck-mcp-prod-api', '--output', 'json'], { encoding: 'utf8', timeout: 30_000 }));
+for (const setting of ['WILDDUCK_DOT_AS_PLUS', 'WILDDUCK_STRIP_REPLY_SUFFIX']) {
+    if (process.env[setting] !== undefined) { assert.equal(deployed.Environment?.Variables?.[setting], process.env[setting], `Live Lambda must use the requested ${setting} setting`); }
+}
 const base = outputs.find(entry => entry.OutputKey === 'PublicBaseUrl')?.OutputValue;
 assert.ok(base, 'Canonical CloudFront origin must be a stack output');
 const issuer = new URL(base).origin;
