@@ -26,4 +26,14 @@ test('ownership keys normalize Unicode and IDN domains without crossing domains'
     const match = ownedIdentityMatcher(['café@bücher.example'], 'dot-plus');
     expect(match('cafe\u0301.tag@xn--bcher-kva.example')).toBe('café@bücher.example');
     expect(match('café.tag@bucher.example')).toBeUndefined();
+    const ascii = ownedIdentityMatcher(['craig@rungie.com'], 'dot-plus');
+    expect(ascii('craig.tag@ｒungie.com')).toBeUndefined();
+    expect(ascii('craig.tag@rungie。com')).toBeUndefined();
+});
+test('configured primary is an exact normalized exception, without authorizing its label prefix', () => {
+    const match = ownedIdentityMatcher(['alice.smith@example.com', 'other.alias@example.com'], 'dot-plus', 'alice.smith@example.com');
+    expect(match('ALICE.SMITH@example.com')).toBe('alice.smith@example.com');
+    expect(match('alice.tag@example.com')).toBeUndefined();
+    expect(match('alice.smith+tag@example.com')).toBeUndefined();
+    expect(match('other.alias@example.com')).toBeUndefined();
 });

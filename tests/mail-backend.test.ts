@@ -71,7 +71,7 @@ async function parsedMime(source: Buffer) {
     await pipeline(Readable.from([source]), splitter, streamer, new Writable({ objectMode: true, write(_chunk, _encoding, done) { done(); } }));
     return { subject, text: text.join('\n'), html };
 }
-function model(aliases: string[] = [], options: Pick<MailBackendOptions, 'onDraftVerificationDiagnostic' | 'addressTagPolicy'> = {}) {
+function model(aliases: string[] = [], options: Pick<MailBackendOptions, 'onDraftVerificationDiagnostic' | 'addressTagPolicy'> = {}, primary = 'sender@example.com') {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const previous = new Map<number, ReturnType<typeof message>>(); let nextUid = 13;
     let source: Buffer = originalSource;
@@ -82,7 +82,7 @@ function model(aliases: string[] = [], options: Pick<MailBackendOptions, 'onDraf
         expect(parsed.origin).toBe(WILDDUCK_ORIGIN); expect(new Headers(init?.headers).get('X-Access-Token')).toBe(token); expect(init?.redirect).toBe('error');
         const prefix = `/users/${accountId}`; const path = parsed.pathname.slice(prefix.length);
         expect(parsed.pathname.startsWith(prefix)).toBe(true);
-        if (path === '') { return Response.json({ success: true, id: accountId, address: 'sender@example.com', name: 'Sender', fromWhitelist: ['alias@example.com'] }); }
+        if (path === '') { return Response.json({ success: true, id: accountId, address: primary, name: 'Sender', fromWhitelist: ['alias@example.com'] }); }
         if (path === '/addresses') { return Response.json({ success: true, results: aliases.map(address => ({ id: 'e'.repeat(24), address })) }); }
         if (path === '/mailboxes') { return Response.json({ success: true, results: [{ id: mailboxId, path: 'Server-specific Drafts', specialUse: '\\Drafts' }] }); }
         if (path === `/mailboxes/${'d'.repeat(24)}`) { return Response.json({ success: true, id: 'd'.repeat(24), path: 'Destination' }); }
@@ -591,6 +591,26 @@ test('explicit sender/recipient overrides win and unsupported tagged senders fai
     }
     const collision = model(['alice.smith@example.com'], { addressTagPolicy: 'dot-plus' });
     await errorCode(collision.backend.prepareCreate(session, { ...content, from: { address: 'alice.tag@example.com' } }, marker), 'forbidden');
+});
+test('dot-plus policy preserves a dotted primary through ordinary creation, explicit selection and later edits', async () => {
+    const primary = 'sender.primary@example.com';
+    for (const from of [undefined, { address: primary }]) {
+        const f = model([], { addressTagPolicy: 'dot-plus' }, primary);
+        const prepared = await f.backend.prepareCreate(session, { ...content, ...(from ? { from } : {}) }, marker);
+        expect(prepared.mime.envelope.from[0]?.address).toBe(primary);
+        const candidate = await f.backend.uploadPreparedDraft(session, prepared); await f.backend.verifyPreparedDraft(session, candidate, prepared);
+        const snapshot = await f.backend.inspectMessage(session, candidate);
+        const edited = await f.backend.prepareUpdate(session, snapshot, { body: { text: 'Edited dotted-primary draft', html: null } }, { ...marker, tool: 'update_draft', operationId: 'dotted-primary-edit' }, { grade: 'mcp_authored', accountId, ...candidate, contentDigest: prepared.mime.sha256 });
+        expect(edited.mime.envelope.from[0]?.address).toBe(primary);
+        const replacement = await f.backend.uploadPreparedDraft(session, edited); await f.backend.verifyPreparedDraft(session, replacement, edited);
+    }
+});
+test('reply does not select URL-equivalent Unicode domains that WildDuck resolves separately', async () => {
+    const f = model([], { addressTagPolicy: 'dot-plus' });
+    f.patch({ envelope: { from: '', rcpt: [{ value: 'sender.service@ｅxample.com' }] }, to: [{ address: 'reader@example.net' }], cc: [] });
+    if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
+    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response', html: null }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    expect(prepared.mime.envelope.from[0]?.address).toBe('sender@example.com');
 });
 test('reply draft upload stores Unicode response, quote and threading as RFC822 instead of base64 text', async () => {
     const f = model(); f.patch({ subject: 'Original subject', from: [{ address: 'author@example.com' }], replyTo: [{ address: 'help@example.com' }], text: 'Original café 你好 🌍', html: ['<p>Original café 你好 🌍</p>'], references: ['<ancestor@example.com>'] });

@@ -455,7 +455,7 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         if (id(user['id']) !== session.accountId || typeof user['address'] !== 'string' || !isEmailValid(user['address'], API_EMAIL_OPTIONS)) { return fail(); }
         if (!Array.isArray(aliases['results']) || aliases['results'].length > 1000 || aliases['results'].some(item => !object(item) || typeof item['address'] !== 'string')) { return fail(); }
         const ownedAddresses = [user['address'], ...(aliases['results'] as Json[]).map(item => string(item['address'])).filter(address => !address.includes('*'))];
-        const match = ownedIdentityMatcher(ownedAddresses, this.addressTagPolicy);
+        const match = ownedIdentityMatcher(ownedAddresses, this.addressTagPolicy, user['address']);
         return { primary: user['address'], ownedAddresses, match, ...(typeof user['name'] === 'string' && user['name'] ? { name: user['name'] } : {}) };
     }
     private selectFrom(identities: Awaited<ReturnType<MailBackend['ownedIdentities']>>, desired?: { address: string; name?: string | undefined }) {
