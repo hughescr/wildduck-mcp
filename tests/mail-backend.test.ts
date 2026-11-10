@@ -545,7 +545,7 @@ test('reply defaults to owned SMTP recipient before visible To/Cc and retains on
         from: { address: 'author@example.net' }, to: [{ address: 'sender@example.com', name: 'Attacker name' }], cc: [{ address: 'second@example.com' }], bcc: [] });
     if (!f.backend.prepareReply) { throw new Error("Missing reply implementation"); }
     const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply_all', body: { text: 'Response', html: null }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
-    expect(prepared.mime.envelope.from).toEqual([{ address: 'ALIAS@example.com', name: 'Sender' }]);
+    expect(prepared.mime.envelope.from).toEqual([{ address: 'alias@example.com', name: 'Sender' }]);
     expect(prepared.mime.envelope.to.map(item => item.address)).toEqual(['help@example.com']);
     expect(prepared.mime.envelope.cc).toEqual([]); expect(prepared.mime.envelope.bcc).toEqual([]);
     expect(f.calls.filter(call => call.url.includes('/messages/12'))).toHaveLength(1);
@@ -554,7 +554,7 @@ test('reply defaults to owned SMTP recipient before visible To/Cc and retains on
     expect(prepared.mime.raw.toString()).not.toContain('Attacker name');
 });
 test.each([
-    [[], [{ address: 'ALIAS@example.com', name: 'Untrusted' }], [{ address: 'second@example.com' }], 'ALIAS@example.com'],
+    [[], [{ address: 'ALIAS@example.com', name: 'Untrusted' }], [{ address: 'second@example.com' }], 'alias@example.com'],
     [[{ value: 'sender.unconfigured@example.com' }], [{ address: 'alias@example.com' }], [], 'alias@example.com'],
     [[], [{ address: 'external@example.net' }], [{ address: 'second@example.com' }], 'second@example.com'],
     [[], [{ address: 'external@example.net' }], [], 'sender@example.com']
@@ -564,12 +564,12 @@ test.each([
     const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response', html: null }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
     expect(prepared.mime.envelope.from).toEqual([{ address: expected, name: 'Sender' }]);
 });
-test.each(['sender+service@example.com', 'sender.service@example.com'])('configured reply preserves %s, excludes tagged self recipients and permits later edits', async address => {
+test.each(['sender+service@example.com', 'sender.service@example.com'])('configured reply defaults %s to its owned base, excludes tagged self recipients and permits later edits', async address => {
     const f = model([], { addressTagPolicy: 'dot-plus' });
     f.patch({ envelope: { from: 'author@example.net', rcpt: [{ value: address }] }, to: [{ address }, { address: 'reader@example.net' }], cc: [{ address: 'sender.other@example.com' }] });
     if (!f.backend.prepareReply) { throw new Error("Missing reply implementation"); }
     const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply_all', body: { text: 'Response', html: null }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
-    expect(prepared.mime.envelope.from).toEqual([{ address, name: 'Sender' }]);
+    expect(prepared.mime.envelope.from).toEqual([{ address: 'sender@example.com', name: 'Sender' }]);
     expect(prepared.mime.envelope.to.map(item => item.address)).toEqual(['help@example.com', 'reader@example.net']);
     expect(prepared.mime.envelope.cc).toEqual([]);
     const candidate = await f.backend.uploadPreparedDraft(session, prepared); await f.backend.verifyPreparedDraft(session, candidate, prepared);
@@ -578,12 +578,40 @@ test.each(['sender+service@example.com', 'sender.service@example.com'])('configu
     expect(edited.mime.envelope.from).toEqual(prepared.mime.envelope.from);
     const replacement = await f.backend.uploadPreparedDraft(session, edited); await f.backend.verifyPreparedDraft(session, replacement, edited);
 });
-test('explicit sender/recipient overrides win and unsupported tagged senders fail before upload', async () => {
+test.each([
+    ['dot-plus', 'alias.service@example.com', true, 'alias@example.com'],
+    ['dot-plus', 'alias+service@example.com', false, 'alias@example.com'],
+    ['plus', 'real.alias+service@example.com', true, 'real.alias@example.com'],
+    ['exact', 'real.alias@example.com', false, 'real.alias@example.com'],
+    ['dot-plus', 'alice.tag@example.com', true, 'sender@example.com'],
+    ['dot-plus', 'alicesmith.tag@example.com', true, 'sender@example.com'],
+    ['dot-plus', 'sender.primary@example.com', true, 'sender.primary@example.com']
+] as const)('%s reply maps owned recipient %s to its registered identity without stripping aliases', async (addressTagPolicy, address, blind, expected) => {
+    const f = model(['alias@example.com', 'real.alias@example.com', 'alice.smith@example.com'], { addressTagPolicy }, expected === 'sender.primary@example.com' ? expected : undefined);
+    f.patch({ envelope: { from: 'author@example.net', rcpt: blind ? [{ value: address }] : [] }, to: blind ? [{ address: 'reader@example.net' }] : [{ address }], cc: [], bcc: blind ? [{ address }] : [] });
+    if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
+    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response', html: null }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    expect(prepared.mime.envelope.from).toEqual([{ address: expected, name: 'Sender' }]);
+    expect(prepared.mime.envelope.bcc).toEqual([]);
+});
+test('an unselectable dotted alias base does not prevent a later owned recipient from being chosen', async () => {
+    const f = model(['alice.smith@example.com', 'alias@example.com'], { addressTagPolicy: 'dot-plus' });
+    f.patch({ envelope: { from: '', rcpt: [{ value: 'alicesmith.tag@example.com' }] }, to: [{ address: 'alias.service@example.com' }], cc: [] });
+    if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
+    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response', html: null }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    expect(prepared.mime.envelope.from).toEqual([{ address: 'alias@example.com', name: 'Sender' }]);
+});
+test.each(['alias+chosen@example.com', 'alias.chosen@example.com'])('explicit sender %s and recipient overrides win, remain editable, and unsupported tagged senders fail before upload', async address => {
     const f = model(['alias@example.com'], { addressTagPolicy: 'dot-plus' }); f.patch({ envelope: { from: '', rcpt: [{ value: 'sender.service@example.com' }] } });
     if (!f.backend.prepareReply) { throw new Error("Missing reply implementation"); }
-    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply_all', from: { address: 'alias+chosen@example.com', name: 'Chosen' }, to: [{ address: 'sender.service@example.com' }], cc: [], body: { text: 'Response', html: null }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
-    expect(prepared.mime.envelope.from).toEqual([{ address: 'alias+chosen@example.com', name: 'Chosen' }]);
+    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply_all', from: { address, name: 'Chosen' }, to: [{ address: 'sender.service@example.com' }], cc: [], body: { text: 'Response', html: null }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    expect(prepared.mime.envelope.from).toEqual([{ address, name: 'Chosen' }]);
     expect(prepared.mime.envelope.to).toEqual([{ address: 'sender.service@example.com' }]);
+    const candidate = await f.backend.uploadPreparedDraft(session, prepared); await f.backend.verifyPreparedDraft(session, candidate, prepared);
+    const snapshot = await f.backend.inspectMessage(session, candidate);
+    const edited = await f.backend.prepareUpdate(session, snapshot, { body: { text: 'Edited explicit tagged reply', html: null } }, { ...marker, tool: 'update_draft', operationId: 'explicit-tagged-reply-edit' }, { grade: 'mcp_authored', accountId, ...candidate, contentDigest: prepared.mime.sha256 });
+    expect(edited.mime.envelope.from).toEqual(prepared.mime.envelope.from);
+    const replacement = await f.backend.uploadPreparedDraft(session, edited); await f.backend.verifyPreparedDraft(session, replacement, edited);
     for (const options of [{}, { addressTagPolicy: 'plus' as const }]) {
         const denied = model([], options);
         await errorCode(denied.backend.prepareCreate(session, { ...content, from: { address: 'sender.service@example.com' } }, marker), 'forbidden');

@@ -477,7 +477,12 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
             // over untrusted visible recipients. None of it is copied to output.
             const delivered = (snapshot.raw['envelope'] as Json)['rcpt'] as Json[];
             const candidates = [...delivered.map(item => string(item['value'])), ...original.message.to.map(item => item.address), ...original.message.cc.map(item => item.address)];
-            const selected = candidates.find(address => identities.match(address));
+            // The matcher returns the registered identity behind a routed tag.
+            // Use that base address by default; callers can explicitly retain a
+            // supported tag with From. Never strip a registered alias itself.
+            // Some resolvers accept tags of a dotted alias's lookup key but do
+            // not accept the registered spelling as a sender. Skip those bases.
+            const selected = candidates.map(address => identities.match(address)).find(address => address !== undefined && identities.match(address) === address);
             const from = this.selectFrom(identities, data.from ?? (selected ? { address: selected, ...(identities.name ? { name: identities.name } : {}) } : undefined));
             const reply = deriveReply({ original: original.message, ownedAddresses: identities.ownedAddresses, isOwnedAddress: address => identities.match(address) !== undefined, mode: data.mode, body: data.body, quoteOriginal: data.quoteOriginal, ...(data.to === undefined && data.cc === undefined ? {} : { recipients: { to: data.to ?? [], cc: data.cc ?? [] } }) });
             const mime = await createMime({ ...reply, from, attachments: data.attachments });
