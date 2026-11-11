@@ -70,7 +70,7 @@ function fixture(authored = true) {
         getThread: async (_bound, input) => ({ threadId: input.threadId ?? mailboxId, messages: [message] }),
         listMailboxes: async (...args) => { record('listMailboxes', ...args); return { mailboxes: [mailbox] }; },
         listMessages: async (...args) => { record('listMessages', ...args); return { messages: [message] }; },
-        searchMessages: async (...args) => { record('searchMessages', ...args); return { messages: [message] }; },
+        searchMessages: async (...args) => { record('searchMessages', ...args); return { messages: [message], search: { mode: 'fast', strategy: 'fulltext', complete: true, verified: false } }; },
         readMessage: async (...args) => {
             record('readMessage', ...args); const stored = find(args[1]);
             return { message: { ...message, ...stored.message, replyTo: [], cc: [], bcc: [], messageId: null, references: [], text: 'text', textTruncated: false, html: ['<p>html</p>'], htmlTruncated: false, htmlRepresentation: 'wildduck_normalized', attachments: [] }, ...(stored.marker ? { marker: stored.marker } : {}) };

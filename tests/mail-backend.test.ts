@@ -12,6 +12,8 @@ const accountId = 'a'.repeat(24); const mailboxId = 'b'.repeat(24); const token 
 const session: BackendMailSession = { accountId, accessToken: token }; const target = { mailboxId, uid: 12 };
 const content: DraftContent = { to: [], cc: [], bcc: [{ address: 'bcc@example.com' }], subject: 'A draft', body: { text: 'Body', html: null }, attachments: [] };
 const marker: MailOperationMarker = { accountId, clientIdHash: 'x'.repeat(43), payloadDigest: 'y'.repeat(43), operationId: 'operation-1234567', tool: 'create_draft' };
+const fastSearch = { mode: 'fast', strategy: 'fulltext_prefilter', complete: false, verified: true, retryWith: { searchMode: 'exhaustive' } } as const;
+const exhaustiveSearch = { mode: 'exhaustive', strategy: 'structured', complete: true, verified: false } as const;
 function message(extra: Record<string, unknown> = {}) {
     return { success: true, user: accountId, id: 12, mailbox: mailboxId, subject: '', from: { address: 'invalid MIME address', name: 'Sender' }, to: [], cc: [], bcc: [], replyTo: [],
         date: '2026-10-26T00:00:00.000Z', idate: '2026-10-26T01:00:00.000Z', seen: false, flagged: false, draft: true, answered: false, deleted: false, forwarded: false, labels: [] as string[], metaData: {},
@@ -130,23 +132,125 @@ test('list uses one fixed descending page, encoded opaque cursor and no unseen o
     expect(f.calls[0]?.url).toBe(`${WILDDUCK_ORIGIN}/users/${accountId}/mailboxes/${mailboxId}/messages?order=desc&limit=2&metaData=true&next=opaque%2B%2F%3D`);
     expect(mailOutputSchemas.list_messages.safeParse(result).success).toBe(true);
 });
-test('search maps supported structured predicates, dates and previous cursor', async () => {
+test('exhaustive search sends the unchanged structured and full-text predicates, dates and previous cursor', async () => {
     const f = fixture([{ success: true, results: [], nextCursor: false, previousCursor: 'back' }]);
-    expect(await f.backend.searchMessages(session, { mailboxId, limit: 3, from: 'a+b@example.com', to: 'person', subject: 'A & B', text: 'words', receivedSince: '2026-10-01T00:00:00Z', receivedUntil: '2026-10-26T00:00:00Z', seen: false, flagged: true, hasAttachments: true, previous: 'cursor+/=' })).toEqual({ messages: [], previous: 'back' });
+    expect(await f.backend.searchMessages(session, { mailboxId, limit: 3, searchMode: 'exhaustive', from: ' a+b@example.com ', to: 'person', subject: 'A & B', text: 'words', receivedSince: '2026-10-01T00:00:00Z', receivedUntil: '2026-10-26T00:00:00Z', seen: false, flagged: true, hasAttachments: true, previous: 'cursor+/=' })).toEqual({ messages: [], previous: 'back', search: exhaustiveSearch });
     const url = new URL(f.calls[0]?.url ?? ''); expect(url.pathname).toBe(`/users/${accountId}/search`);
-    expect(Object.fromEntries(url.searchParams)).toEqual({ order: 'desc', limit: '3', metaData: 'true', includeTotal: 'false', mailbox: mailboxId, from: 'a+b@example.com', to: 'person', subject: 'A & B', query: 'words', datestart: '2026-10-01T00:00:00Z', dateend: '2026-10-26T00:00:00Z', flagged: 'true', attachments: 'true', previous: 'cursor+/=', unseen: 'true' });
+    expect(Object.fromEntries(url.searchParams)).toEqual({ order: 'desc', limit: '3', metaData: 'true', includeTotal: 'false', mailbox: mailboxId, from: ' a+b@example.com ', to: 'person', subject: 'A & B', query: 'words', datestart: '2026-10-01T00:00:00Z', dateend: '2026-10-26T00:00:00Z', flagged: 'true', attachments: 'true', previous: 'cursor+/=', unseen: 'true' });
     const wrong = fixture([{ success: true, results: [message({ mailbox: 'd'.repeat(24) })] }]); await errorCode(wrong.backend.searchMessages(session, { mailboxId, limit: 20 }), 'temporarily_unavailable');
+});
+test('default fast From uses the index and verifies the actual parsed header by name or address', async () => {
+    const byName = { address: 'first@example.com', name: 'A.cME Sales' };
+    const byAddress = { address: 'A.Cme@example.com', name: 'Second' };
+    const notLiteral = { address: 'third@example.com', name: 'ABcme Sales' };
+    const f = fixture([{ success: true, results: [
+        message({ id: 1, from: byName, headers: { from: [byName], 'x-private': 'header-only' } }),
+        message({ id: 2, from: byAddress, headers: { from: [byAddress] } }),
+        message({ id: 3, from: notLiteral, headers: { from: [notLiteral] }, intro: 'A.CME only in the body' }),
+        message({ id: 4, from: byAddress, headers: { sender: [byAddress] } }),
+        message({ id: 5, from: byAddress }),
+        message({ id: 6, from: byAddress, headers: { from: 'A.Cme@example.com' } }),
+    ] }]);
+    const result = await f.backend.searchMessages(session, { from: '  a.CME  ' });
+    expect(result.messages.map(row => row.uid)).toEqual([1, 2]); expect(result.search).toEqual(fastSearch);
+    expect(result.messages[0]).not.toHaveProperty('headers'); expect(JSON.stringify(result)).not.toContain('header-only');
+    expect(f.calls).toHaveLength(1);
+    expect(Object.fromEntries(new URL(f.calls[0]?.url ?? '').searchParams)).toEqual({ order: 'desc', limit: '20', metaData: 'true', includeTotal: 'false', query: 'a.CME', includeHeaders: 'true' });
+});
+test('fast To verifies parsed To or Cc names and addresses without Bcc or other fields', async () => {
+    const byName = { address: 'user@example.com', name: 'TeAM Name' };
+    const byAddress = { address: 'tEaM@example.com' };
+    const f = fixture([{ success: true, results: [
+        message({ id: 1, to: [byName] }),
+        message({ id: 2, cc: [{ name: 'Group', group: [byAddress] }] }),
+        message({ id: 3, bcc: [byName] }),
+        message({ id: 4, from: byName, subject: 'TEAM' }),
+        message({ id: 5, cc: [byName] }),
+        message({ id: 6, to: [byAddress] }),
+        message({ id: 7, cc: 'team@example.com' }),
+    ] }]);
+    const result = await f.backend.searchMessages(session, { to: 'TEAM' });
+    expect(result.messages.map(row => row.uid)).toEqual([1, 2, 5, 6]); expect(result.messages[1]).not.toHaveProperty('cc');
+    expect(Object.fromEntries(new URL(f.calls[0]?.url ?? '').searchParams)).toEqual({ order: 'desc', limit: '20', metaData: 'true', includeTotal: 'false', query: 'TEAM' });
+});
+test('fast Subject checks the actual decoded header substring and respects the indexed length', async () => {
+    const f = fixture([{ success: true, results: [
+        message({ id: 1, subject: 'Résumé today', headers: { subject: 'Status: =?UTF-8?Q?R=C3=A9sum=C3=A9?= today' } }),
+        message({ id: 2, subject: 'Résumé today', headers: { subject: 'Résumé  today' } }),
+        message({ id: 3, subject: 'Résumé today', headers: { subject: `${'x'.repeat(880)} Résumé today` } }),
+        message({ id: 4, subject: 'Latest', headers: { subject: ['Earlier Résumé today', 'Latest'] } }),
+        message({ id: 5, subject: 'Résumé today' }),
+        message({ id: 6, subject: 'Other', headers: { subject: 'Other' }, intro: 'Résumé today in the body only' }),
+    ] }]);
+    const result = await f.backend.searchMessages(session, { subject: ' rÉSUMÉ TODAY ' });
+    expect(result.messages.map(row => row.uid)).toEqual([1, 4]);
+    expect(Object.fromEntries(new URL(f.calls[0]?.url ?? '').searchParams)).toEqual({ order: 'desc', limit: '20', metaData: 'true', includeTotal: 'false', query: 'rÉSUMÉ TODAY', includeHeaders: 'true' });
+});
+test('fast search ANDs supplied headers locally and sends explicit text unchanged as the candidate query', async () => {
+    const from = { address: 'alex@example.com' }; const cc = [{ address: 'team@example.com' }];
+    const headers = { from: [from], subject: 'Weekly report' };
+    const otherFilters = { seen: true, flagged: true, attachments: true };
+    const f = fixture([{ success: true, results: [
+        message({ ...otherFilters, id: 1, from, cc, subject: 'Weekly report', headers }),
+        message({ ...otherFilters, id: 2, from, subject: 'Weekly report', headers }),
+        message({ ...otherFilters, id: 3, cc, subject: 'Weekly report', headers: { subject: headers.subject } }),
+        message({ ...otherFilters, id: 4, from, cc, subject: 'Other', headers: { from: headers.from, subject: 'Other' } }),
+    ], nextCursor: 'next+/=' }]);
+    const text = ' "budget update" -draft ';
+    const result = await f.backend.searchMessages(session, { mailboxId, from: 'Alex', to: 'Team', subject: 'Report', text, seen: true, flagged: true, hasAttachments: true, receivedSince: '2026-10-01T00:00:00Z', limit: 4 });
+    expect(result.messages.map(row => row.uid)).toEqual([1]); expect(result.next).toBe('next+/='); expect(result.search).toEqual(fastSearch);
+    expect(Object.fromEntries(new URL(f.calls[0]?.url ?? '').searchParams)).toEqual({ order: 'desc', limit: '4', metaData: 'true', includeTotal: 'false', mailbox: mailboxId, query: text, datestart: '2026-10-01T00:00:00Z', flagged: 'true', attachments: 'true', includeHeaders: 'true', seen: 'true' });
+});
+test('header-only candidate generation joins all values and treats MongoDB query syntax as separators', async () => {
+    const f = fixture([{ success: true, results: [] }]);
+    const result = await f.backend.searchMessages(session, { from: 'a+b@example.com', to: '-team', subject: '"report"' });
+    expect(result.search).toEqual(fastSearch);
+    expect(new URL(f.calls[0]?.url ?? '').searchParams.get('query')?.split(/\s+/u)).toEqual(['a+b@example.com', 'team', 'report']);
+});
+test('plain text search is complete in either mode and structured-only filters need no prefilter', async () => {
+    for (const searchMode of ['fast', 'exhaustive'] as const) {
+        const f = fixture([{ success: true, results: [message()] }, { success: true, results: [message()] }]);
+        const result = await f.backend.searchMessages(session, { searchMode, text: 'plain words' });
+        expect(result.messages).toHaveLength(1);
+        expect(result.search).toEqual({ mode: searchMode, strategy: 'fulltext', complete: true, verified: false });
+        expect(Object.fromEntries(new URL(f.calls[0]?.url ?? '').searchParams)).toEqual({ order: 'desc', limit: '20', metaData: 'true', includeTotal: 'false', query: 'plain words' });
+        expect((await f.backend.searchMessages(session, { searchMode, mailboxId })).search).toEqual({ mode: searchMode, strategy: 'structured', complete: true, verified: false });
+    }
+});
+test('candidate overflow or lack of searchable terms falls back without truncation, while explicit text can prefilter long headers', async () => {
+    for (const filters of [{ subject: 'x'.repeat(256) }, { from: 'a'.repeat(127), to: 'b'.repeat(128) }, { subject: '"---"' }]) {
+        const f = fixture([{ success: true, results: [message()] }]);
+        const result = await f.backend.searchMessages(session, filters);
+        expect(result.search).toEqual(exhaustiveSearch); expect(result.messages).toHaveLength(1);
+        expect(f.calls).toHaveLength(1);
+        expect(Object.fromEntries(new URL(f.calls[0]?.url ?? '').searchParams)).toEqual({ order: 'desc', limit: '20', metaData: 'true', includeTotal: 'false', ...filters });
+    }
+    const f = fixture([{ success: true, results: [] }, { success: true, results: [] }]);
+    const subject = 'é'.repeat(255);
+    expect((await f.backend.searchMessages(session, { subject })).search).toEqual(fastSearch);
+    expect(new URL(f.calls[0]?.url ?? '').searchParams.get('query')).toBe(subject);
+    expect((await f.backend.searchMessages(session, { text: 'candidate', subject: 'x'.repeat(256) })).search).toEqual(fastSearch);
+    expect(new URL(f.calls[1]?.url ?? '').searchParams.get('query')).toBe('candidate');
+});
+test('fast filtering cannot hide invalid candidate-page identities, markers, or mailbox scope', async () => {
+    const wrongMailbox = message({ mailbox: 'd'.repeat(24) });
+    const mismatch = fixture([{ success: true, results: [wrongMailbox] }]);
+    await expect(mismatch.backend.searchMessages(session, { mailboxId, from: 'different' })).rejects.toMatchObject({ searchCause: 'mailbox_scope_mismatch' });
+    const duplicate = fixture([{ success: true, results: [message(), message()] }]);
+    await errorCode(duplicate.backend.searchMessages(session, { mailboxId, subject: 'different' }), 'temporarily_unavailable');
+    const wrongMarker = fixture([{ success: true, results: [message({ metaData: { [MAIL_OPERATION_METADATA_KEY]: { ...marker, accountId: 'd'.repeat(24) } } })] }]);
+    await errorCode(wrongMarker.backend.searchMessages(session, { mailboxId, to: 'different' }), 'verification_failed');
 });
 test('global and mailbox searches skip exact totals on initial, next and previous pages', async () => {
     for (const scope of [{}, { mailboxId }]) {
         for (const pagination of [{}, { next: 'forward+/=' }, { previous: 'backward+/=' }]) {
-            const f = fixture([{ success: true, results: [], total: null, nextCursor: 'next+/=', previousCursor: 'previous+/=' }]);
+            const f = fixture([{ success: true, results: [message()], total: null, nextCursor: 'next+/=', previousCursor: 'previous+/=' }]);
             const result = await f.backend.searchMessages(session, { subject: 'A & B', limit: 3, ...scope, ...pagination });
-            expect(result).toEqual({ messages: [], next: 'next+/=', previous: 'previous+/=' });
+            expect(result).toEqual({ messages: [], next: 'next+/=', previous: 'previous+/=', search: fastSearch });
             expect(f.calls).toHaveLength(1);
             const url = new URL(f.calls[0]?.url ?? '');
             expect(url.pathname).toBe(`/users/${accountId}/search`);
-            expect(Object.fromEntries(url.searchParams)).toEqual({ order: 'desc', limit: '3', metaData: 'true', includeTotal: 'false', ...('mailboxId' in scope ? { mailbox: mailboxId } : {}), subject: 'A & B', ...pagination });
+            expect(Object.fromEntries(url.searchParams)).toEqual({ order: 'desc', limit: '3', metaData: 'true', includeTotal: 'false', ...('mailboxId' in scope ? { mailbox: mailboxId } : {}), query: 'A & B', includeHeaders: 'true', ...pagination });
             if ('next' in pagination) { expect(url.search).toContain('next=forward%2B%2F%3D'); }
             if ('previous' in pagination) { expect(url.search).toContain('previous=backward%2B%2F%3D'); }
         }
@@ -438,7 +542,7 @@ const pause = async (ms: number) => { await new Promise(resolve => setTimeout(re
 test('search alone gets the longer internal deadline and preserves query semantics', async () => {
     const logs: SearchDiagnostic[] = []; const urls: string[] = [];
     const backend = createMailBackend({ timeoutMs: 5, searchTimeoutMs: 60, onSearchDiagnostic: value => { logs.push(value); }, fetch: (async url => { urls.push(String(url)); await pause(15); return Response.json({ success: true, results: [] }); }) as typeof fetch });
-    expect(await backend.searchMessages(session, { from: 'synthetic@example.test', receivedSince: '2026-10-20T00:00:00Z', limit: 10 })).toEqual({ messages: [] });
+    expect(await backend.searchMessages(session, { from: 'synthetic@example.test', receivedSince: '2026-10-20T00:00:00Z', limit: 10, searchMode: 'exhaustive' })).toEqual({ messages: [], search: exhaustiveSearch });
     expect(Object.fromEntries(new URL(urls[0] ?? '').searchParams)).toEqual({ order: 'desc', limit: '10', metaData: 'true', includeTotal: 'false', from: 'synthetic@example.test', datestart: '2026-10-20T00:00:00Z' });
     expect(logs).toHaveLength(1); expect(logs[0]).toMatchObject({ event: 'wildduck_search', outcome: 'success', scope: 'global', timeoutMs: 60, status: 200 });
     expect(logs[0]?.headersMs).toBeGreaterThanOrEqual(10); expect(logs[0]?.durationMs).toBeGreaterThanOrEqual(logs[0]?.headersMs ?? 0); expect(logs[0]).not.toHaveProperty('category');
@@ -479,7 +583,7 @@ test('one sanitized diagnostic distinguishes deadline, network, HTTP, JSON, shap
 test('body and validation timings are retained and throwing logger or late fetch cannot change results or log twice', async () => {
     const logs: SearchDiagnostic[] = [];
     const backend = createMailBackend({ timeoutMs: 100, onSearchDiagnostic: value => { logs.push(value); throw new Error('logger failure'); }, fetch: (async _url => new Response(new ReadableStream({ async start(controller) { await pause(8); controller.enqueue(new TextEncoder().encode('{"success":true,"results":[]}')); controller.close(); } }), { headers: { 'content-type': 'application/json' } })) as typeof fetch });
-    expect(await backend.searchMessages(session, { subject: 'synthetic', limit: 1 })).toEqual({ messages: [] });
+    expect(await backend.searchMessages(session, { subject: 'synthetic', limit: 1 })).toEqual({ messages: [], search: fastSearch });
     expect(logs[0]?.bodyMs).toBeGreaterThanOrEqual(5); expect(logs[0]?.validationMs).toBeGreaterThanOrEqual(0);
     const late: SearchDiagnostic[] = [];
     const slow = createMailBackend({ timeoutMs: 5, onSearchDiagnostic: value => { late.push(value); }, fetch: (async _url => { await pause(20); return Response.json({ success: true, results: [] }); }) as typeof fetch });

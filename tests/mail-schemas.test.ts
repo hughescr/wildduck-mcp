@@ -24,15 +24,32 @@ test('strict tools expose bounded pagination without hidden filters', () => {
 test('search and thread schemas expose cursors without exact totals or a total-count option', () => {
     for (const name of ['search_messages', 'get_thread'] as const) {
         const input = name === 'search_messages' ? { subject: 'search' } : { threadId: mailboxId };
-        const output = { messages: [], next: 'next', previous: 'previous', ...(name === 'get_thread' ? { threadId: mailboxId } : {}) };
+        const output = { messages: [], next: 'next', previous: 'previous', ...(name === 'get_thread' ? { threadId: mailboxId } : { search: { mode: 'fast', strategy: 'structured', complete: true, verified: false } }) };
         expect(mailInputSchemas[name].safeParse({ ...input, includeTotal: true }).success).toBe(false);
-        expect(mailOutputSchemas[name].parse(output)).toEqual(output);
+        expect(mailOutputSchemas[name].parse(output)).toMatchObject(output);
         expect(mailOutputSchemas[name].safeParse({ ...output, total: null }).success).toBe(false);
         const inputJson = mailInputSchemas[name]['~standard'].jsonSchema.input({ target: 'draft-2020-12' });
         const outputJson = mailOutputSchemas[name]['~standard'].jsonSchema.output({ target: 'draft-2020-12' });
         expect(inputJson).not.toHaveProperty('properties.includeTotal');
         expect(outputJson).not.toHaveProperty('properties.total');
     }
+});
+test('search mode defaults to fast and completeness agrees with verification and retry metadata', () => {
+    const input = mailInputSchemas.search_messages;
+    expect(input.parse({ from: 'name' }).searchMode).toBe('fast');
+    expect(input.parse({ from: 'name', searchMode: 'exhaustive' }).searchMode).toBe('exhaustive');
+    expect(input.safeParse({ searchMode: 'exhaustive' }).success).toBe(false);
+    expect(input.safeParse({ from: 'name', searchMode: 'other' }).success).toBe(false);
+    const output = mailOutputSchemas.search_messages;
+    const search = { mode: 'fast', strategy: 'fulltext_prefilter', complete: false, verified: true, retryWith: { searchMode: 'exhaustive' } };
+    expect(output.safeParse({ messages: [], search }).success).toBe(true);
+    for (const invalid of [{ ...search, mode: 'exhaustive' }, { ...search, complete: true }, { ...search, verified: false }, { ...search, retryWith: undefined }, { ...search, strategy: 'fulltext' }]) {
+        expect(output.safeParse({ messages: [], search: invalid }).success).toBe(false);
+    }
+    const complete = { mode: 'exhaustive', strategy: 'structured', complete: true, verified: false };
+    expect(output.safeParse({ messages: [], search: complete }).success).toBe(true);
+    expect(output.safeParse({ messages: [], search: { ...complete, retryWith: search.retryWith } }).success).toBe(false);
+    expect(output.safeParse({ messages: [] }).success).toBe(false);
 });
 test('targets are explicit and downloads accept attachment IDs, never arbitrary paths or URLs', () => {
     for (const value of [{ uid: 1 }, { mailboxId, uid: 0 }, { mailboxId, uid: 4294967296 }, { mailboxId, uid: 1.1 }, { mailboxId: 'G'.repeat(24), uid: 1 }]) { expect(mailInputSchemas.read_message.safeParse(value).success).toBe(false); }

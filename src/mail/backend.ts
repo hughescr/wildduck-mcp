@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { isEmailValid } from '@hapi/address';
+import libmime from 'libmime';
 import { WILDDUCK_ORIGIN } from '../wildduck';
 import { remainingRequestTimeMs, withRequestBudget } from '../request-budget';
 import { currentRequestId } from '../request-id';
-import { MailError, MAIL_OPERATION_METADATA_KEY, type BackendMailSession, type MailBackendReader, type MailBackendWriter, type Mailbox, type MailInput, type MailOutput, type MessageKey, type DraftContent, type DraftPatch, type MessageSnapshot, type PreparedDraft, type MailOperationMarker, type MessageRef, type MessageSummary, type MailAddress, type AttachmentMetadata, type AttachmentDownload, type AttachmentDownloadLink, type VerifiedMessageMutation, type AuthoredSourceDescriptor } from './contracts';
-import { draftContentSchema, mailboxIdSchema, messageKeySchema, mailInputSchemas, mailOutputSchemas, canonicalReadMessageOutputSchema, attachmentDownloadLinkSchema, mailOperationMarkerSchema, addFlagSchema, labelSchema, MAX_READ_TEXT_BYTES, MAX_HTML_BYTES, MAX_ATTACHMENT_BYTES, MAX_SNIPPET_BYTES } from './schemas';
+import { MailError, MAIL_OPERATION_METADATA_KEY, type BackendMailSession, type MailBackendReader, type MailBackendWriter, type Mailbox, type MailInput, type MailInputRaw, type MailOutput, type MessageKey, type DraftContent, type DraftPatch, type MessageSnapshot, type PreparedDraft, type MailOperationMarker, type MessageRef, type MessageSummary, type MailAddress, type AttachmentMetadata, type AttachmentDownload, type AttachmentDownloadLink, type VerifiedMessageMutation, type AuthoredSourceDescriptor } from './contracts';
+import { draftContentSchema, mailboxIdSchema, messageKeySchema, mailInputSchemas, mailOutputSchemas, canonicalReadMessageOutputSchema, attachmentDownloadLinkSchema, mailOperationMarkerSchema, addFlagSchema, labelSchema, MAX_READ_TEXT_BYTES, MAX_HTML_BYTES, MAX_ATTACHMENT_BYTES, MAX_SNIPPET_BYTES, MAX_SEARCH_TEXT_CHARACTERS } from './schemas';
 import { MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS, type AttachmentDownloadStager } from './downloads';
 import { deriveReply } from './reply';
 import { ownedIdentityMatcher } from './identities';
@@ -94,6 +95,49 @@ function addresses(value: unknown, depth = 0): MailAddress[] {
         if (!object(item) || typeof item['address'] !== 'string' || item['name'] !== undefined && typeof item['name'] !== 'string') { return fail(); }
         return [{ address: item['address'], ...(typeof item['name'] === 'string' ? { name: item['name'] } : {}) }];
     });
+}
+const headerFilterKeys = ['from', 'to', 'subject'] as const;
+type HeaderFilters = Pick<MailInput<'search_messages'>, typeof headerFilterKeys[number]>;
+function headerCandidateQuery(terms: readonly string[]): string | undefined {
+    const joined = terms.map(term => term.trim()).join(' ');
+    if (joined.length > MAX_SEARCH_TEXT_CHARACTERS || !joined.isWellFormed()) { return undefined; }
+    // Structured filters treat quotes and leading hyphens as literals. Do not
+    // let them turn a candidate query into a MongoDB phrase or negation.
+    const query = joined.replaceAll('"', ' ').replace(/(^|\s)-+/gu, '$1 ').trim();
+    return /[\p{L}\p{N}]/u.test(query) ? query : undefined;
+}
+function addressHeaderMatches(value: unknown, filter: RegExp, depth = 0): boolean {
+    if (!Array.isArray(value) || depth > 8) { return false; }
+    return value.some(item => {
+        if (!object(item)) { return false; }
+        if (Array.isArray(item['group']) && item['address'] === undefined) { return addressHeaderMatches(item['group'], filter, depth + 1); }
+        return typeof item['address'] === 'string' && (filter.test(item['address']) || typeof item['name'] === 'string' && filter.test(item['name']));
+    });
+}
+function subjectHeaderMatches(value: unknown, filter: RegExp): boolean {
+    const values = Array.isArray(value) ? value : [value];
+    return values.some(item => {
+        if (typeof item !== 'string') { return false; }
+        // Match the header as indexed by WildDuck's generateIndexedHeaders.
+        // The top-level summary collapses whitespace and uses the last Subject.
+        let subject = item.trim().replace(/(?<!\s)\s*\n\s*/gu, ' ');
+        try { subject = libmime.decodeWords(subject); } catch { /* WildDuck keeps the undecoded value on decoder failure. */ }
+        subject = subject.toLowerCase();
+        const indexed = Buffer.from(subject);
+        if (indexed.length >= 880) { subject = indexed.subarray(0, 880).toString().slice(0, -4); }
+        return filter.test(subject);
+    });
+}
+function headerMatcher(filters: HeaderFilters): (row: Json) => boolean {
+    const literal = (value: string | undefined) => value === undefined ? undefined : new RegExp(RegExp.escape(value.trim()), 'iu');
+    const from = literal(filters.from); const to = literal(filters.to); const subject = literal(filters.subject);
+    return row => {
+        const headers = object(row['headers']) ? row['headers'] : undefined;
+        // WildDuck's summary From falls back to Sender or the SMTP envelope.
+        return (from === undefined || addressHeaderMatches(headers?.['from'], from)) &&
+            (to === undefined || addressHeaderMatches(row['to'], to) || addressHeaderMatches(row['cc'], to)) &&
+            (subject === undefined || subjectHeaderMatches(headers?.['subject'], subject));
+    };
 }
 function date(value: unknown): string | null {
     if (value === undefined || value === null) { return null; }
@@ -284,15 +328,28 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         if (parsed.data.next !== undefined) { query.set('next', parsed.data.next); } if (parsed.data.previous !== undefined) { query.set('previous', parsed.data.previous); }
         return this.page(await this.request(session, `/mailboxes/${parsed.data.mailboxId}/messages?${query}`, 'GET'), parsed.data.limit, session.accountId, parsed.data.mailboxId);
     }
-    async searchMessages(session: BackendMailSession, input: MailInput<'search_messages'>): Promise<MailOutput<'search_messages'>> {
+    async searchMessages(session: BackendMailSession, input: MailInputRaw<'search_messages'>): Promise<MailOutput<'search_messages'>> {
         sessionValid(session); const parsed = mailInputSchemas.search_messages.safeParse(input); if (!parsed.success) { throw new MailError('invalid_input'); }
         const data = parsed.data;
         if (data.flagged === false || data.hasAttachments === false) { throw new MailError('invalid_input'); }
         // Backend query fulltext has a 255-character limit; reject rather than silently narrow/truncate the requested search.
-        if (data.text !== undefined && data.text.length > 255) { throw new MailError('invalid_input'); }
+        if (data.text !== undefined && data.text.length > MAX_SEARCH_TEXT_CHARACTERS) { throw new MailError('invalid_input'); }
+        const headerTerms = headerFilterKeys.flatMap(key => data[key] === undefined ? [] : [data[key]]);
+        const wantsPrefilter = data.searchMode === 'fast' && headerTerms.length > 0;
+        const candidateQuery = wantsPrefilter ? data.text ?? headerCandidateQuery(headerTerms) : undefined;
+        const search: MailOutput<'search_messages'>['search'] = candidateQuery !== undefined
+            ? { mode: 'fast', strategy: 'fulltext_prefilter', complete: false, verified: true, retryWith: { searchMode: 'exhaustive' } }
+            : { mode: wantsPrefilter ? 'exhaustive' : data.searchMode, strategy: data.text !== undefined && headerTerms.length === 0 ? 'fulltext' : 'structured', complete: true, verified: false };
         const query = new URLSearchParams({ order: 'desc', limit: String(data.limit), metaData: 'true', includeTotal: 'false' });
         const fields = { mailboxId: 'mailbox', from: 'from', to: 'to', subject: 'subject', text: 'query', receivedSince: 'datestart', receivedUntil: 'dateend', flagged: 'flagged', hasAttachments: 'attachments', next: 'next', previous: 'previous' } as const;
-        for (const [key, field] of Object.entries(fields)) { const value = data[key as keyof typeof fields]; if (value !== undefined) { query.set(field, String(value)); } }
+        for (const [key, field] of Object.entries(fields)) {
+            if (candidateQuery !== undefined && (key === 'from' || key === 'to' || key === 'subject')) { continue; }
+            const value = data[key as keyof typeof fields]; if (value !== undefined) { query.set(field, String(value)); }
+        }
+        if (candidateQuery !== undefined) {
+            query.set('query', candidateQuery);
+            if (data.from !== undefined || data.subject !== undefined) { query.set('includeHeaders', 'true'); }
+        }
         if (data.seen !== undefined) { query.set(data.seen ? 'seen' : 'unseen', 'true'); }
         const started = performance.now(); const timing: SearchTiming = { category: 'network' }; let validationStarted: number | undefined; let outcome: 'success' | 'failure' = 'failure';
         try {
@@ -302,8 +359,18 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
             if (raw['success'] !== true || raw['error'] !== undefined || raw['code'] !== undefined) { return fail(); }
             // A mismatch proves the response violates the requested mailbox, not why.
             if (data.mailboxId !== undefined && Array.isArray(raw['results']) && raw['results'].some(row => object(row) && typeof row['mailbox'] === 'string' && ACCOUNT.test(row['mailbox']) && row['mailbox'] !== data.mailboxId)) { timing.category = 'mailbox_scope_mismatch'; return fail(); }
-            const result = this.page(raw, data.limit, session.accountId, data.mailboxId);
+            const result = { ...this.page(raw, data.limit, session.accountId, data.mailboxId), search };
             if (!mailOutputSchemas.search_messages.safeParse(result).success) { return fail(); }
+            // Verify only after checking the entire candidate page. Filtering
+            // cannot hide malformed rows or change the upstream cursor bounds.
+            const rows = raw['results'];
+            if (candidateQuery !== undefined && Array.isArray(rows)) {
+                const matches = headerMatcher(data);
+                result.messages = result.messages.filter((_, index) => {
+                    const row: unknown = rows[index];
+                    return object(row) && matches(row);
+                });
+            }
             outcome = 'success'; return result;
         } catch (error) {
             if (error instanceof MailError && (error.code === 'temporarily_unavailable' || error.code === 'upstream_timeout' || error.code === 'too_large')) { throw new MailError(error.code, error.retryAfter, { cause: timing.category, status: timing.status }); }

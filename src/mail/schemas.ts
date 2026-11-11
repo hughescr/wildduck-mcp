@@ -50,8 +50,20 @@ export const draftContentSchema = z.strictObject(draftFields).refine(value => va
 const writeTargetShape = { uid: uidSchema, expected_version: versionSchema, operation_id: operationIdSchema };
 export const listMailboxesInputSchema = z.strictObject({});
 export const listMessagesInputSchema = z.strictObject({ mailboxId: mailboxIdSchema, ...paginationShape }).refine(singleDirection, 'Specify one cursor direction.');
-const searchFilters = { mailboxId: mailboxIdSchema.optional(), from: headerText(320).refine(nonblank).optional(), to: headerText(320).refine(nonblank).optional(), subject: headerText(MAX_SUBJECT_BYTES).refine(nonblank).optional(), text: z.string().max(MAX_SEARCH_TEXT_CHARACTERS).refine(utf8(4 * MAX_SEARCH_TEXT_CHARACTERS)).refine(nonblank).optional(), receivedSince: z.iso.datetime({ offset: true }).optional(), receivedUntil: z.iso.datetime({ offset: true }).optional(), seen: z.boolean().optional(), flagged: z.boolean().optional(), hasAttachments: z.boolean().optional() };
-export const searchMessagesInputSchema = z.strictObject({ ...searchFilters, ...paginationShape }).refine(singleDirection, 'Specify one cursor direction.').refine(value => Object.keys(searchFilters).some(key => value[key as keyof typeof searchFilters] !== undefined), 'At least one meaningful filter is required.').refine(value => value.receivedSince === undefined || value.receivedUntil === undefined || Date.parse(value.receivedSince) <= Date.parse(value.receivedUntil), 'receivedSince must not follow receivedUntil.');
+const searchModeSchema = z.enum(['fast', 'exhaustive']);
+const searchFilters = {
+    mailboxId: mailboxIdSchema.optional(),
+    from: headerText(320).refine(nonblank).optional().describe('Case-insensitive From filter. Fast mode verifies the parsed From display name or address.'),
+    to: headerText(320).refine(nonblank).optional().describe('Case-insensitive To or Cc filter, excluding Bcc. Fast mode verifies parsed display names and addresses.'),
+    subject: headerText(MAX_SUBJECT_BYTES).refine(nonblank).optional().describe('Case-insensitive subject substring.'),
+    text: z.string().max(MAX_SEARCH_TEXT_CHARACTERS).refine(utf8(4 * MAX_SEARCH_TEXT_CHARACTERS)).refine(nonblank).optional().describe('Indexed full-text query. With header filters in fast mode, this is the candidate query.'),
+    receivedSince: z.iso.datetime({ offset: true }).optional(), receivedUntil: z.iso.datetime({ offset: true }).optional(),
+    seen: z.boolean().optional(), flagged: z.boolean().optional(), hasAttachments: z.boolean().optional(),
+};
+export const searchMessagesInputSchema = z.strictObject({
+    ...searchFilters, ...paginationShape,
+    searchMode: searchModeSchema.default('fast').describe('Fast is the default. With header filters, fast uses indexed candidates and returns only verified matches, which may be incomplete. Use exhaustive for complete structured-header matching, which may be slower.'),
+}).refine(singleDirection, 'Specify one cursor direction.').refine(value => Object.keys(searchFilters).some(key => value[key as keyof typeof searchFilters] !== undefined), 'At least one meaningful filter is required.').refine(value => value.receivedSince === undefined || value.receivedUntil === undefined || Date.parse(value.receivedSince) <= Date.parse(value.receivedUntil), 'receivedSince must not follow receivedUntil.');
 export const threadIdSchema = mailboxIdSchema;
 export const getThreadInputSchema = z.strictObject({ message: messageKeySchema.optional(), threadId: threadIdSchema.optional(), ...paginationShape, limit: z.number().int().min(1).max(MAX_PAGE_SIZE).default(10), includeBodies: z.boolean().default(false) }).refine(value => !value.includeBodies || value.limit <= MAX_BATCH_MESSAGES, 'Body pages are capped at 10 messages.').refine(singleDirection, 'Specify one cursor direction.').refine(value => (value.message === undefined) !== (value.threadId === undefined), 'Specify exactly one message reference or threadId.');
 export const readMessagesInputSchema = z.strictObject({ includeHtml: z.boolean().default(true), messages: z.array(messageKeySchema).min(1).max(MAX_BATCH_MESSAGES).refine(values => unique(values.map(value => value.mailboxId + ':' + value.uid)), 'Duplicate message references are forbidden.') });
@@ -97,7 +109,11 @@ export const attachmentDownloadLinkSchema = z.strictObject({ metadata: getAttach
 const pageOutput = { messages: z.array(messageSummarySchema).max(MAX_PAGE_SIZE), next: cursorSchema.optional(), previous: cursorSchema.optional() };
 export const listMailboxesOutputSchema = z.strictObject({ mailboxes: z.array(mailboxSchema) });
 export const listMessagesOutputSchema = z.strictObject(pageOutput);
-export const searchMessagesOutputSchema = z.strictObject(pageOutput);
+const searchMetadataSchema = z.union([
+    z.strictObject({ mode: z.literal('fast'), strategy: z.literal('fulltext_prefilter'), complete: z.literal(false), verified: z.literal(true), retryWith: z.strictObject({ searchMode: z.literal('exhaustive') }) }),
+    z.strictObject({ mode: searchModeSchema, strategy: z.enum(['fulltext', 'structured']), complete: z.literal(true), verified: z.literal(false) }),
+]).describe('Executed mode and strategy. Complete describes the matching strategy, not whether more pages exist. Verified indicates local header verification. For incomplete searches, next and previous page through candidates and retryWith requests a complete search from the first page.');
+export const searchMessagesOutputSchema = z.strictObject({ ...pageOutput, search: searchMetadataSchema });
 export const mailWriteToolSchema = z.enum(['create_draft', 'create_reply_draft', 'update_draft', 'delete_draft', 'send_draft', 'move_message', 'update_message_flags']);
 export const mailOperationMarkerSchema = z.strictObject({ accountId: mailboxIdSchema, clientIdHash: digestSchema, operationId: operationIdSchema, payloadDigest: digestSchema, tool: mailWriteToolSchema });
 export const sourceGradeSchema = z.enum(['mcp_authored', 'observed']);

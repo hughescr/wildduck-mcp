@@ -108,7 +108,7 @@ export function createMailService({ reader, writer, operations }: Dependencies):
         const result = read.marker ? { ...message, managedOperation: { operationId: mailOperationMarkerSchema.parse(read.marker).operationId, verification: (await provenance(bound, message, read.marker)).verification } } : message;
         return canonicalReadMessageOutputSchema.parse(result);
     }
-    async function read<Name extends ReadTool>(tool: Name, context: MailContext, raw: MailInput<Name>): Promise<MailOutput<Name>> {
+    async function read<Name extends ReadTool>(tool: Name, context: MailContext, raw: unknown): Promise<MailOutput<Name>> {
         const bound = session(context, 'mail:read'); const parsed = input(tool, raw);
         try {
             let result: unknown;

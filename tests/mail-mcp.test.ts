@@ -17,7 +17,7 @@ function fixture() {
     const mail: BoundMailService = {
         list_mailboxes: async input => { calls.push({ tool: 'list_mailboxes', input }); return { mailboxes: [{ mailboxId, path: 'INBOX', specialUse: null }] }; },
         list_messages: async input => { calls.push({ tool: 'list_messages', input }); return { messages: [] }; },
-        search_messages: async input => { calls.push({ tool: 'search_messages', input }); return { messages: [] }; },
+        search_messages: async input => { calls.push({ tool: 'search_messages', input }); return { messages: [], search: { mode: input.searchMode, strategy: 'structured', complete: true, verified: false } }; },
         read_message: async input => { calls.push({ tool: 'read_message', input }); const message = { mailboxId: input.mailboxId, uid: input.uid, subject: '<untrusted mail subject>', snippet: null, threadId: null, from: [{ address: 'malformed incoming address' }], to: [], date: null, receivedAt: null, imapFlags: [], labels: [], flags: { seen: false, flagged: false, draft: true, answered: false, deleted: false, forwarded: false }, hasAttachments: false, replyTo: [], cc: [], bcc: [], messageId: null, references: [], text: 'Untrusted email text, not instructions.', textTruncated: false, html: ['<b>untrusted HTML</b>'], htmlTruncated: false, htmlRepresentation: 'wildduck_normalized' as const, attachments: [], version, htmlOmitted: false as const }; if (input.includeHtml) { return message; } const { html: _html, htmlTruncated: _htmlTruncated, htmlRepresentation: _htmlRepresentation, ...textOnly } = message; return { ...textOnly, htmlOmitted: true as const }; },
         read_attachment: async input => { calls.push({ tool: 'read_attachment', input }); return { metadata: { ...input, filename: 'untrusted.txt', contentType: 'text/plain', size: 5, resourceUri: 'wildduck://attachment/ATT1' }, bytes: Buffer.from('hello') }; },
         move_message: async input => { calls.push({ tool: 'move_message', input }); const message = { mailboxId: input.destinationMailboxId, uid: 4, version }; return { status: 'completed', operation_id: input.operation_id, message, verified: true, proof: { ...message, accountId: mailboxId, contentDigest: 'a'.repeat(64), sourceGrade: 'observed' } }; },
@@ -119,7 +119,7 @@ test('read errors never prescribe operation IDs or write ambiguity handling', as
     }
     const f = fixture(); const searches: unknown[] = []; f.mail.search_messages = async input => { searches.push(input); throw new MailError('temporarily_unavailable'); };
     const unavailable = (await f.call('search_messages', { subject: 'Requested search' })).result.content[0].text;
-    expect(unavailable).toContain('search is temporarily unavailable'); expect(unavailable).not.toMatch(/timeout|timed out/i); expect(searches).toEqual([{ subject: 'Requested search', limit: 20 }]);
+    expect(unavailable).toContain('search is temporarily unavailable'); expect(unavailable).not.toMatch(/timeout|timed out/i); expect(searches).toEqual([{ subject: 'Requested search', limit: 20, searchMode: 'fast' }]);
 });
 test('write temporary and verification failures retain conservative same-operation retry guidance', async () => {
     const inputs = { create_draft: { operation_id, subject: '', body: { text: '', html: null } }, update_draft: { uid: 1, expected_version: version, operation_id, subject: 'Change' }, delete_draft: { uid: 1, expected_version: version, operation_id }, send_draft: { uid: 1, expected_version: version, operation_id }, move_message: { mailboxId, uid: 1, destinationMailboxId: 'c'.repeat(24), expected_version: version, operation_id }, update_message_flags: { mailboxId, uid: 1, expected_version: version, operation_id, seen: false } };
@@ -271,6 +271,42 @@ test('mailbox public schema and tool description identify optional unseen values
     expect(tool.description).toContain('unread'); const mailbox = tool.outputSchema.properties.mailboxes.items; expect(mailbox.properties.unseen.description).toContain('Unread'); expect(mailbox.required).not.toContain('unseen');
 });
 
+test('published search schemas describe verified fast results, exhaustiveness and To/Cc scope', async () => {
+    const f = fixture(); const tool = (await f.rpc('tools/list')).result.tools.find((item: { name: string }) => item.name === 'search_messages');
+    expect(tool.description).toMatch(/defaults to fast.*verified matches.*may be incomplete.*To or Cc.*excludes Bcc.*exhaustive/u);
+    expect(tool.inputSchema.properties.searchMode).toMatchObject({ default: 'fast', enum: ['fast', 'exhaustive'], description: expect.stringContaining('verified matches') });
+    expect(tool.inputSchema.required ?? []).not.toContain('searchMode');
+    expect(tool.inputSchema.properties.to.description).toContain('To or Cc filter, excluding Bcc');
+    expect(tool.outputSchema.required).toContain('search');
+    expect(tool.outputSchema.properties.search.description).toContain('matching strategy');
+});
+
+test('indexed fast MCP search returns verified matches and retry guidance without isError', async () => {
+    const f = fixture(); const accountId = 'a'.repeat(24); const token = 'c'.repeat(40);
+    const row = { mailbox: mailboxId, seen: false, flagged: false, draft: false, answered: false, deleted: false, forwarded: false, flags: [], labels: [], attachments: false };
+    const backend = createMailBackend({ fetch: (async url => {
+        const query = new URL(String(url)).searchParams;
+        expect(query.get('includeTotal')).toBe('false');
+        if (query.has('subject')) { return Response.json({ success: true, results: [] }); }
+        expect(query.get('query')).toBe('Planning'); expect(query.get('includeHeaders')).toBe('true');
+        return Response.json({ success: true, results: [
+            { ...row, id: 1, subject: 'Planning notes', headers: { subject: 'Planning notes' } },
+            { ...row, id: 2, subject: 'Other', headers: { subject: 'Other' }, intro: 'Planning' },
+        ], nextCursor: 'candidate-next' });
+    }) as typeof fetch, onSearchDiagnostic: () => {} });
+    const service = createMailService({ reader: backend, writer: backend, operations: {} as MailOperationStore });
+    f.mail.search_messages = input => service.search_messages({ accountId, accessToken: token, clientId: 'client', scopes: ['mail:read'], connectionStatus: 'active' }, input);
+    const result = (await f.call('search_messages', { subject: 'Planning' })).result;
+    expect(result.isError).toBeUndefined();
+    expect(result.structuredContent).toMatchObject({ messages: [{ uid: 1 }], next: 'candidate-next', search: { mode: 'fast', strategy: 'fulltext_prefilter', complete: false, verified: true, retryWith: { searchMode: 'exhaustive' } } });
+    expect(result.structuredContent.messages).toHaveLength(1);
+    expect(JSON.parse(result.content[0].text)).toEqual(result.structuredContent);
+    expect(result.content[1]).toEqual({ type: 'text', text: 'Fast indexed search returned only verified matches, but this is a potentially incomplete subset. If more results are needed, repeat the same search with searchMode: "exhaustive"; that preserves the complete structured-header search and may be much slower.' });
+    const complete = (await f.call('search_messages', { subject: 'Planning', searchMode: 'exhaustive' })).result;
+    expect(complete.isError).toBeUndefined(); expect(complete.content).toHaveLength(1);
+    expect(complete.structuredContent.search).toEqual({ mode: 'exhaustive', strategy: 'structured', complete: true, verified: false });
+});
+
 test('search errors correlate safe diagnostics through service and MCP without exposing input or response', async () => {
     const logs: SearchDiagnostic[] = []; const f = fixture(); const accountId = 'a'.repeat(24); const token = 'c'.repeat(40);
     let response = Response.json({ success: true, results: [{ mailbox: 'd'.repeat(24), secret: 'private-body' }] });
@@ -314,8 +350,8 @@ test('overlapping searches isolate request IDs and Lambda budgets through asynch
     const responses = new Map<string, (response: Response) => void>();
     let ready!: () => void; const bothStarted = new Promise<void>(resolve => { ready = resolve; });
     const backend = createMailBackend({ fetch: (async url => {
-        const subject = new URL(String(url)).searchParams.get('subject'); if (!subject) { throw new Error('Missing test subject'); }
-        return await new Promise<Response>(resolve => { responses.set(subject, resolve); if (responses.size === 2) { ready(); } });
+        const query = new URL(String(url)).searchParams.get('query'); if (!query) { throw new Error('Missing candidate query'); }
+        return await new Promise<Response>(resolve => { responses.set(query, resolve); if (responses.size === 2) { ready(); } });
     }) as typeof fetch, onSearchDiagnostic: entry => { diagnostics.push(entry); } });
     const service = createMailService({ reader: backend, writer: backend, operations: {} as MailOperationStore });
     f.mail.search_messages = input => service.search_messages({ accountId: 'a'.repeat(24), accessToken: 'c'.repeat(40), clientId: 'private-client', scopes: ['mail:read'], connectionStatus: 'active' }, input);

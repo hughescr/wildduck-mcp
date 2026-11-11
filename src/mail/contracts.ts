@@ -1,6 +1,6 @@
 import type { ConnectionStatus } from '../auth/contracts';
 import type { PreparedMime } from './mime';
-import type { CanonicalReadMessage, ConfirmedReceipt, DraftContent, DraftPatch, FailedReceipt, MailFailureCode, Mailbox, MailInput, MailOperationMarker, MailOutput, MailReceipt, MailToolName, MailWriteTool, MessageKey, MessageRef, SourceGrade, UnknownReceipt } from './schemas';
+import type { CanonicalReadMessage, ConfirmedReceipt, DraftContent, DraftPatch, FailedReceipt, MailFailureCode, Mailbox, MailInput, MailInputRaw, MailOperationMarker, MailOutput, MailReceipt, MailToolName, MailWriteTool, MessageKey, MessageRef, SourceGrade, UnknownReceipt } from './schemas';
 export type { ActivationProof, AttachmentMetadata, CanonicalReadMessage, CompletedReceipt, ConfirmedReceipt, DraftAddress, DraftContent, DraftPatch, DraftRef, FailedReceipt, MailAddress, Mailbox, MailFailureCode, MailInput, MailInputRaw, MailOperationMarker, MailOutput, MailReceipt, MailToolName, MailWriteTool, MessageFlags, MessageKey, MessageRef, MessageSummary, NewAttachment, PartialReceipt, SourceGrade, UnknownReceipt } from './schemas';
 
 export const searchFailureCauses = ['deadline', 'network', 'http_status', 'invalid_json', 'invalid_shape', 'mailbox_scope_mismatch', 'too_large'] as const;
@@ -28,7 +28,7 @@ export interface MailBackendReader {
     listMailboxes(session: BackendMailSession): Promise<MailOutput<'list_mailboxes'>>;
     listMessages(session: BackendMailSession, input: MailInput<'list_messages'>): Promise<MailOutput<'list_messages'>>;
     getThread(session: BackendMailSession, input: MailInput<'get_thread'>): Promise<MailOutput<'get_thread'>>;
-    searchMessages(session: BackendMailSession, input: MailInput<'search_messages'>): Promise<MailOutput<'search_messages'>>;
+    searchMessages(session: BackendMailSession, input: MailInputRaw<'search_messages'>): Promise<MailOutput<'search_messages'>>;
     /** No mark-as-seen mutation. HTML and incoming MIME fields are untrusted data.
      * Include private marker in this same GET so service can check one operation,
      * without a second backend GET or N+1 operation lookups on list pages. */
@@ -166,7 +166,7 @@ export interface MailOperationStore {
  * except its own staged verification. Unactivated candidates never become sendable.
  * Public writes always pass this coordinator; no raw writer reaches MCP. */
 export type MailResult<Name extends MailToolName> = Name extends 'read_attachment' ? AttachmentDownload : Name extends 'get_attachment_download' ? AttachmentDownloadLink : MailOutput<Name>;
-export type MailService = { [Name in MailToolName]: (context: MailContext, input: MailInput<Name>) => Promise<MailResult<Name>> };
+export type MailService = { [Name in MailToolName]: (context: MailContext, input: Name extends 'search_messages' ? MailInputRaw<Name> : MailInput<Name>) => Promise<MailResult<Name>> };
 export type BoundMailService = { [Name in MailToolName]: (input: MailInput<Name>) => Promise<MailResult<Name>> };
 export type MailWriteCoordinator = Pick<MailService, MailWriteTool>;
 export type MailReadService = Omit<MailService, MailWriteTool>;
