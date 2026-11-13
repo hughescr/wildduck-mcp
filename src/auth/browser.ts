@@ -4,6 +4,7 @@ import { AUTH_FIELDS, authorization, form, required, unique, type Authorization 
 import { connectionAAD, digest, equal, randomId } from './crypto';
 import { OAuthError, type Sealed, type UpstreamCredentials } from './contracts';
 import { WildduckError, type PendingTotp } from '../wildduck';
+import { PAGE_STYLE, PAGE_STYLE_SOURCE } from './page-style';
 const COOKIE = '__Host-wildduck-flow';
 interface Flow { deadline: number; csrf: string; flowId: string; binding: string; pending?: PendingTotp; credentials?: UpstreamCredentials }
 const now = () => Math.floor(Date.now() / 1000);
@@ -25,22 +26,35 @@ function read(context: Context, runtime: AuthRuntime): Flow {
     } catch { throw new OAuthError('invalid_request'); }
 }
 function page(context: Context, title: string, body: string, callbackOrigin?: string) {
-    context.header('Content-Security-Policy', `default-src 'none'; form-action 'self'${callbackOrigin ? ` ${callbackOrigin}` : ''}; frame-ancestors 'none'; base-uri 'none'`);
+    context.header('Content-Security-Policy', `default-src 'none'; style-src ${PAGE_STYLE_SOURCE}; form-action 'self'${callbackOrigin ? ` ${callbackOrigin}` : ''}; frame-ancestors 'none'; base-uri 'none'`);
     context.header('Referrer-Policy', 'same-origin');
-    return context.html(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>${escape(title)}</title><main><h1>${escape(title)}</h1>${body}</main></html>`);
+    return context.html(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(title)} · wildduck-mcp</title><style>${PAGE_STYLE}</style></head><body><main><header><div class="brand">wildduck-mcp</div><h1>${escape(title)}</h1></header>${body}</main></body></html>`);
 }
+/** Terminal pages are static text: they never echo a submitted field, so they cannot reflect a password. */
+const FAILURE_HEADING = { 400: 'Sign-in could not continue', 503: 'Temporary failure · 503' } as const;
+function failure(context: Context, status: 400 | 503, message: string) {
+    context.status(status);
+    return page(context, 'Connection not completed', `<section class="terminal" aria-labelledby="result"><h2 id="result">${FAILURE_HEADING[status]}</h2><p>${escape(message)}</p></section>`);
+}
+/** One consent row per requested scope, in request order: the id is shown with a plain-language label. */
+const SCOPE_LABELS: Record<string, string> = { profile: 'Identify your mail account', 'mail:read': 'Read your mail', 'mail:modify': 'Move mail and change flags and labels', 'mail:draft': 'Create, edit and delete drafts', 'mail:send': 'Send mail' };
+const permission = (scope: string) => `<li class="permission"><span>${escape(SCOPE_LABELS[scope] ?? scope)}<small>${escape(scope)}</small></span></li>`;
 function render(context: Context, runtime: AuthRuntime, auth: Authorization, flow: Flow) {
     cookie(context, runtime, flow);
     const hidden = [...Object.entries(auth.fields), ['csrf', flow.csrf]].map(([key, value]) => `<input type="hidden" name="${escape(key ?? '')}" value="${escape(value ?? '')}">`).join('');
     const start = (path: string) => `<form method="post" action="${path}">${hidden}`;
-    const cancel = '<button name="decision" value="cancel" formnovalidate>Cancel</button></form>';
-    if (flow.pending) { return page(context, 'Verify your account', `${start('/auth/mfa')}<label>Authenticator code <input name="totp" autocomplete="one-time-code" inputmode="numeric" pattern="[0-9]{6}" required></label><button>Verify</button>${cancel}`, new URL(auth.redirectUri).origin); }
+    const destination = `<small>Redirect destination · <span class="host">${escape(new URL(auth.redirectUri).hostname)}</span></small>`;
+    // The primary button is first in DOM order so Enter submits it, never Cancel.
+    const actions = (primary: string) => `<div class="actions">${primary}<button class="secondary" name="decision" value="cancel" formnovalidate>Cancel</button></div></form>`;
+    const origin = new URL(auth.redirectUri).origin;
+    if (flow.pending) { return page(context, 'Verify your account', `${start('/auth/mfa')}<section class="section"><h2>Two-step verification</h2><label class="field">Authenticator code <input name="totp" autocomplete="one-time-code" inputmode="numeric" pattern="[0-9]{6}" required></label></section>${actions('<button class="primary">Verify</button>')}`, origin); }
     if (flow.credentials) {
         const profile = flow.credentials.profile;
         const identity = auth.client.clientId.startsWith('https://') ? new URL(auth.client.clientId).hostname : 'Registered OAuth client';
-        return page(context, 'Authorize connection', `<p>${escape(auth.client.name)} (${escape(identity)}) requests account ${escape(profile.name ?? profile.id)}.</p><p>Redirect destination: ${escape(new URL(auth.redirectUri).hostname)}</p><p>Keep this connection for up to 180 days. Your mail service may require reconnection sooner.</p>${start('/auth/consent')}<ul>${auth.scopes.map(scope => `<li>${escape(scope)}</li>`).join('')}</ul>${auth.scopes.includes('mail:send') ? '<label><input type="checkbox" name="allow_send" value="yes" required> Allow sending mail</label>' : ''}<button name="decision" value="allow">Allow connection</button>${cancel}`, new URL(auth.redirectUri).origin);
+        const send = auth.scopes.includes('mail:send') ? '<label class="permission"><input type="checkbox" name="allow_send" value="yes" required><span>Allow sending mail</span></label>' : '';
+        return page(context, 'Authorize connection', `<div class="request"><strong>${escape(auth.client.name)}</strong> (${escape(identity)}) requests account ${escape(profile.name ?? profile.id)}${destination}</div>${start('/auth/consent')}<section class="permissions"><h2>Requested permissions</h2><div class="rows"><ul>${auth.scopes.map(permission).join('')}</ul>${send}</div></section><p class="help">Keep this connection for up to 180 days. Your mail service may require reconnection sooner.</p>${actions('<button class="primary" name="decision" value="allow">Allow connection</button>')}`, origin);
     }
-    return page(context, 'Connect your mail account', `<p>Sign in to continue to ${escape(auth.client.name)}. TOTP authenticator codes are supported. Passkey-only accounts must use webmail; this origin cannot use existing webmail passkeys.</p>${start('/auth/login')}<label>Username <input name="username" autocomplete="username" required maxlength="254"></label><label>Password <input type="password" name="password" autocomplete="current-password" required maxlength="256"></label><button>Sign in</button>${cancel}`, new URL(auth.redirectUri).origin);
+    return page(context, 'Connect your mail account', `<div class="request">Sign in to continue to ${escape(auth.client.name)}${destination}</div>${start('/auth/login')}<section class="section"><h2>Sign in</h2><label class="field">Username <input name="username" autocomplete="username" required maxlength="254"></label><label class="field">Password <input type="password" name="password" autocomplete="current-password" required maxlength="256"></label><p class="help">TOTP authenticator codes are supported. Passkey-only accounts must use webmail; this origin cannot use existing webmail passkeys.</p></section>${actions('<button class="primary">Sign in</button>')}`, origin);
 }
 function redirect(context: Context, runtime: AuthRuntime, auth: Authorization, values: Record<string, string>) {
     context.header('Referrer-Policy', 'no-referrer');
@@ -101,7 +115,6 @@ export async function postBrowser(context: Context, runtime: AuthRuntime) {
         if (!(error instanceof WildduckError)) { throw error; }
         const message = error.code === 'unsupported_mfa' ? 'This account requires an unsupported passkey method. Use webmail; MFA cannot be bypassed.' : error.code === 'action_required' ? 'Complete your account security setup in webmail, then reconnect.' : error.code === 'temporary' ? 'Mail authentication is temporarily unavailable. Try again later.' : 'Sign-in failed. Start the connection again.';
         cookie(context, runtime);
-        context.status(error.code === 'temporary' ? 503 : 400);
-        return page(context, 'Connection not completed', `<p>${escape(message)}</p>`);
+        return failure(context, error.code === 'temporary' ? 503 : 400, message);
     }
 }

@@ -10,9 +10,9 @@ import { MailError, type MailService } from '../src/mail/contracts';
 import type { AuthRuntime } from '../src/auth/runtime';
 import type { UpstreamCredentials } from '../src/auth/contracts';
 import { lambdaEvent } from './app.test';
-const issuer = 'https://service.example';
+export const issuer = 'https://service.example';
 const credentials: UpstreamCredentials = { accessToken: 'a'.repeat(40), profile: { id: 'a'.repeat(24), name: '<Account>' }, issuedAt: Math.floor(Date.now() / 1000) };
-function setup(totp = false, authMethod: 'none' | 'client_secret_basic' = 'none') {
+export function setup(totp = false, authMethod: 'none' | 'client_secret_basic' = 'none') {
     const crypto = new AuthCrypto({ activeKeyId: 'v1', keys: { v1: new Uint8Array(32).fill(3) } });
     const store = new MemoryStore();
     let state: 'valid' | 'expired' | 'temporary' = 'valid';
@@ -35,12 +35,12 @@ function setup(totp = false, authMethod: 'none' | 'client_secret_basic' = 'none'
     const params = new URLSearchParams({ response_type: 'code', client_id: registration.client_id, redirect_uri: 'http://127.0.0.1:5678/callback', resource: `${issuer}/mcp`, scope: 'profile mail:read', code_challenge_method: 'S256', code_challenge: digest(verifier), state: 'original-state' });
     return { app, runtime, params, verifier, registration, setState: (value: typeof state) => { state = value; }, loginCalls: () => loginCalls };
 }
-function page(response: Response, html: string) {
+export function page(response: Response, html: string) {
     const fields = new URLSearchParams();
     for (const match of html.matchAll(/type="hidden" name="([^"]+)" value="([^"]*)"/g)) { fields.set(match[1] ?? '', (match[2] ?? '').replaceAll('&amp;', '&').replaceAll('&quot;', '"').replaceAll('&#39;', "'").replaceAll('&lt;', '<').replaceAll('&gt;', '>')); }
     return { fields, cookie: (response.headers.get('set-cookie') ?? '').split(';')[0] ?? '' };
 }
-async function post(app: ReturnType<typeof createApp>, path: string, fields: URLSearchParams, cookie?: string, origin = issuer) {
+export async function post(app:ReturnType<typeof createApp>, path: string, fields: URLSearchParams, cookie?: string, origin = issuer) {
     return app.request(path, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', origin, ...(cookie ? { cookie } : {}) }, body: fields.toString() });
 }
 async function connect(env: ReturnType<typeof setup>, duplicate = false) {
