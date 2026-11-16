@@ -117,4 +117,21 @@ describe('reply derivation', () => {
         expect(patched.raw.toString()).toContain('References: <first@example.test> <prior@example.test>\r\n <original@example.test>\r\n');
         expect((await inspectSource(patched.raw)).attachments).toHaveLength(1);
     });
+    test('quoted replies reach the stored MIME with CRLF-only text and HTML, whatever line endings were supplied', async () => {
+        const decode = (raw: Buffer, type: string) => [...raw.toString('latin1').matchAll(new RegExp(`Content-Type: ${type.replace('/', '\\/')}; charset=utf-8\\r\\nContent-Transfer-Encoding: base64\\r\\n\\r\\n([A-Za-z0-9+/=\\r\\n]*)`, 'gu'))]
+            .map(match => Buffer.from((match[1] ?? '').replaceAll('\r\n', ''), 'base64').toString('utf8'));
+        const mixedOriginal = { ...original, text: 'first\r\nsecond\nthird\rfourth' };
+        for (const body of [{ text: 'My\nresponse', html: '<p>My\nresponse</p>' }, { text: 'My\r\nresponse', html: '<p>My\rresponse</p>' }]) {
+            const reply = deriveReply({ ...input, original: mixedOriginal, body, quoteOriginal: true });
+            const created = await createMime({ from: { address: 'me@example.test' }, ...reply });
+            expect(decode(created.raw, 'text/plain')).toEqual(['My\r\nresponse\r\n\r\n> first\r\n> second\r\n> third\r\n> fourth']);
+            expect(decode(created.raw, 'text/html')).toEqual([`<p>My\r\nresponse</p><blockquote><pre>first\r\nsecond\r\nthird\r\nfourth</pre></blockquote>`]);
+        }
+        const unquoted = await createMime({ from: { address: 'me@example.test' }, ...deriveReply({ ...input, body: { text: 'a\nb', html: '<p>a\nb</p>' } }) });
+        expect(decode(unquoted.raw, 'text/plain')).toEqual(['a\r\nb']); expect(decode(unquoted.raw, 'text/html')).toEqual(['<p>a\r\nb</p>']);
+    });
+    test('a trailing bare CR in the reply text cannot fuse with the separator before the quote', () => {
+        const result = deriveReply({ ...input, body: { text: 'My response\r', html: null }, quoteOriginal: true });
+        expect(result.body.text).toBe('My response\n\n\n> Original <script>alert("x")</script> & text\n> Second line');
+    });
 });

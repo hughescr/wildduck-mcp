@@ -5,7 +5,8 @@ import { pipeline } from 'node:stream/promises';
 import { Splitter, Streamer } from '@zone-eu/mailsplit';
 import { createMailBackend, type SearchDiagnostic, type DraftVerificationDiagnostic, type MailBackendOptions } from '../src/mail/backend';
 import { withRequestBudget } from '../src/request-budget';
-import { MailError, MAIL_OPERATION_METADATA_KEY, type BackendMailSession, type DraftContent, type DraftPatch, type MailFailureCode, type MailOperationMarker, type AuthoredSourceDescriptor } from '../src/mail/contracts';
+import { createMailService } from '../src/mail/service';
+import { MailError, MAIL_OPERATION_METADATA_KEY, type BackendMailSession, type DraftContent, type DraftPatch, type MailFailureCode, type MailOperationMarker, type MailOperationRecord, type MailOperationStore, type OperationKey, type AuthoredSourceDescriptor } from '../src/mail/contracts';
 import { mailOutputSchemas, MAX_READ_TEXT_BYTES } from '../src/mail/schemas';
 import { WILDDUCK_ORIGIN } from '../src/wildduck';
 const accountId = 'a'.repeat(24); const mailboxId = 'b'.repeat(24); const token = 'c'.repeat(40);
@@ -792,11 +793,82 @@ test.each([['plain', 'Edited reply\n\nC\n'], ['empty', ''], ['wrapped Unicode', 
     const candidate = await f.backend.uploadPreparedDraft(session, prepared);
     await expect(f.backend.verifyPreparedDraft(session, candidate, prepared)).resolves.toMatchObject(candidate);
     expect(f.source().equals(prepared.mime.raw)).toBe(true);
-    expect(f.current().text).toBe(text); expect(f.current().html).toEqual([]);
+    expect(f.current().text).toBe(text.replace(/\r\n|\r|\n/gu, '\r\n')); expect(f.current().html).toEqual([]);
     expect((f.current() as Record<string, unknown>).reference).toEqual(reference); expect(f.current().idate).toBe(receivedAt);
     for (const header of ['Message-ID', 'In-Reply-To', 'References']) {
         expect(new RegExp(`^${header}:.*$`, 'mu').exec(prepared.mime.raw.toString())?.[0]).toBe(new RegExp(`^${header}:.*$`, 'mu').exec(original.mime.raw.toString())?.[0]);
     }
+});
+const lineEndingVariants = [['LF', 'one\ntwo\n\nthree\n', '<p>one\ntwo\n\nthree</p>\n'], ['CRLF', 'one\r\ntwo\r\n\r\nthree\r\n', '<p>one\r\ntwo\r\n\r\nthree</p>\r\n'], ['bare CR', 'one\rtwo\r\rthree\r', '<p>one\rtwo\r\rthree</p>\r'], ['mixed', 'one\ntwo\r\n\rthree\r\n', '<p>one\r\ntwo\n\rthree</p>\n']] as const;
+const canonicalText = 'one\r\ntwo\r\n\r\nthree\r\n'; const canonicalHtml = '<p>one\r\ntwo\r\n\r\nthree</p>\r\n';
+const crlfOnly = (value: string) => !/\r(?!\n)|(?<!\r)\n/u.test(value);
+test.each(lineEndingVariants)('create_draft with %s text and HTML stores identical CRLF-only decoded parts and verifies after upload', async (_name, text, html) => {
+    const f = model(); const prepared = await f.backend.prepareCreate(session, { ...content, body: { text, html } }, marker);
+    const mime = await parsedMime(prepared.mime.raw); expect(mime.text).toBe(canonicalText); expect(mime.html).toEqual([canonicalHtml]);
+    const key = await f.backend.uploadPreparedDraft(session, prepared); await f.backend.verifyPreparedDraft(session, key, prepared);
+    expect(f.source().equals(prepared.mime.raw)).toBe(true);
+    const stored = await parsedMime(f.source()); expect(stored.text).toBe(canonicalText); expect(stored.html).toEqual([canonicalHtml]);
+    expect(f.current().text).toBe(canonicalText); expect(f.current().html).toEqual([canonicalHtml]);
+    expect(crlfOnly(stored.text) && stored.html.every(crlfOnly)).toBe(true);
+    const plain = await f.backend.prepareCreate(session, { ...content, body: { text, html: null } }, marker); expect((await parsedMime(plain.mime.raw)).text).toBe(canonicalText);
+});
+test.each([[false], [true]])('create_reply_draft CRLF canonicalisation with quoteOriginal=%p covers response, text quote and HTML quote', async quoteOriginal => {
+    const f = model(); f.patch({ text: 'first\r\nsecond\nthird\rfourth', html: ['<p>ignored</p>'], from: [{ address: 'author@example.com' }], replyTo: [{ address: 'help@example.com' }] });
+    if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
+    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response\nline two\r', html: '<p>Response\nline two</p>' }, quoteOriginal, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    const key = await f.backend.uploadPreparedDraft(session, prepared); await f.backend.verifyPreparedDraft(session, key, prepared);
+    const stored = await parsedMime(f.source()); expect(f.source().equals(prepared.mime.raw)).toBe(true);
+    expect(stored.text).toBe(quoteOriginal ? 'Response\r\nline two\r\n\r\n\r\n> first\r\n> second\r\n> third\r\n> fourth' : 'Response\r\nline two\r\n');
+    expect(stored.html).toEqual([quoteOriginal ? '<p>Response\r\nline two</p><blockquote><pre>first\r\nsecond\r\nthird\r\nfourth</pre></blockquote>' : '<p>Response\r\nline two</p>']);
+    expect(crlfOnly(stored.text) && stored.html.every(crlfOnly)).toBe(true);
+});
+test.each(lineEndingVariants)('update_draft body patch with %s input is CRLF-only and passes verification after the WildDuck round trip', async (_name, text, html) => {
+    const f = model(); if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
+    const original = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Original reply\n', html: null }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    const key = await f.backend.uploadPreparedDraft(session, original); await f.backend.verifyPreparedDraft(session, key, original);
+    const before = await f.backend.inspectMessage(session, key);
+    for (const body of [{ text, html }, { text, html: null }]) {
+        const prepared = await f.backend.prepareUpdate(session, before, { body }, { ...marker, tool: 'update_draft', operationId: 'crlf-body-edit-operation' }, { grade: 'mcp_authored', accountId, ...key, contentDigest: original.mime.sha256 });
+        const candidate = await f.backend.uploadPreparedDraft(session, prepared);
+        await expect(f.backend.verifyPreparedDraft(session, candidate, prepared)).resolves.toMatchObject(candidate);
+        const stored = await parsedMime(f.source()); expect(f.source().equals(prepared.mime.raw)).toBe(true);
+        expect(stored.text).toBe(canonicalText); expect(stored.html).toEqual(body.html === null ? [] : [canonicalHtml]);
+    }
+});
+test('text attachment bytes stay identical on create and on body update while the body becomes CRLF', async () => {
+    const bytes = Buffer.from('attachment\nbare LF\rbare CR\r\nCRLF\n'); const wrapped = bytes.toString('base64').match(/.{1,76}/gu)?.join('\r\n') ?? '';
+    const f = model(); const prepared = await f.backend.prepareCreate(session, { ...content, body: { text: 'a\nb', html: null }, attachments: [{ filename: 'notes.txt', contentType: 'text/plain', contentBase64: bytes.toString('base64'), disposition: 'attachment' }] }, marker);
+    const key = await f.backend.uploadPreparedDraft(session, prepared); await f.backend.verifyPreparedDraft(session, key, prepared);
+    expect(f.source().includes(Buffer.from(wrapped))).toBe(true);
+    const before = await f.backend.inspectMessage(session, key);
+    const update = await f.backend.prepareUpdate(session, before, { body: { text: 'c\nd', html: null } }, { ...marker, tool: 'update_draft', operationId: 'attachment-body-edit-1' }, { grade: 'mcp_authored', accountId, ...key, contentDigest: prepared.mime.sha256 });
+    const candidate = await f.backend.uploadPreparedDraft(session, update); await f.backend.verifyPreparedDraft(session, candidate, update);
+    expect(f.source().includes(Buffer.from(wrapped))).toBe(true);
+    expect(Buffer.from(f.source().toString('latin1').match(/Content-Type: text\/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n([A-Za-z0-9+/=\r\n]+)/u)?.[1]?.replaceAll('\r\n', '') ?? '', 'base64').toString()).toBe('c\r\nd');
+});
+test('identical LF-input retry through the service replays the settled result without another upload', async () => {
+    const f = model(); const records = new Map<string, MailOperationRecord>();
+    const keyOf = (key: OperationKey) => JSON.stringify([key.accountId, key.clientIdHash, key.operationId]);
+    const operations: MailOperationStore = {
+        getOperation: async key => { const record = records.get(keyOf(key)); return record && structuredClone(record); },
+        reserve: async (intent, ownerToken) => {
+            const existing = records.get(keyOf(intent)); if (existing) { return JSON.stringify(existing.intent) === JSON.stringify(intent) ? { kind: 'replay', record: structuredClone(existing) } : { kind: 'conflict', reason: 'operation_conflict' }; }
+            const key = { accountId: intent.accountId, clientIdHash: intent.clientIdHash, operationId: intent.operationId }; records.set(keyOf(key), { key, intent, ownerToken, revision: 0, state: 'reserved' });
+            return { kind: 'acquired', claim: { key, ownerToken, revision: 0, state: 'reserved' } };
+        },
+        markDispatched: async claim => { const record = records.get(keyOf(claim.key)); if (!record) { throw new Error('missing'); } records.set(keyOf(claim.key), { ...record, state: 'dispatched', revision: record.revision + 1 }); return { ...claim, state: 'dispatched', revision: record.revision + 1 }; },
+        failPreflight: async (claim, receipt) => { const record = records.get(keyOf(claim.key)); if (!record) { throw new Error('missing'); } records.set(keyOf(claim.key), { ...record, state: 'settled', revision: record.revision + 1, receipt }); },
+        complete: async (claim, receipt) => { const record = records.get(keyOf(claim.key)); if (!record) { throw new Error('missing'); } records.set(keyOf(claim.key), { ...record, state: 'settled', revision: record.revision + 1, receipt }); },
+        markOutcomeUnknown: async (claim, receipt) => { const record = records.get(keyOf(claim.key)); if (!record) { throw new Error('missing'); } records.set(keyOf(claim.key), { ...record, state: 'settled', revision: record.revision + 1, receipt }); },
+    };
+    const service = createMailService({ reader: f.backend, writer: f.backend, operations });
+    const context = { ...session, clientId: 'client-one', scopes: ['mail:read', 'mail:draft'], connectionStatus: 'active' } as const;
+    const request = { to: [{ address: 'to@example.com' }], cc: [], bcc: [], subject: 'LF retry', body: { text: 'one\ntwo\n', html: '<p>one\ntwo</p>' }, attachments: [], operation_id: 'lf-retry-operation-01' };
+    const first = await service.create_draft(context, request); expect(first.status).toBe('completed');
+    const stored = await parsedMime(f.source()); expect(stored.text).toBe('one\r\ntwo\r\n'); expect(stored.html).toEqual(['<p>one\r\ntwo</p>']);
+    const second = await service.create_draft(context, structuredClone(request));
+    expect(second).toEqual(first); expect(f.calls.filter(call => call.init.method === 'POST')).toHaveLength(1);
+    expect((await service.create_draft(context, { ...request, body: { ...request.body, text: 'one\r\ntwo\r\n' } })).status).toBe('conflict');
 });
 test('failed draft verification logs only the failing check and safe code, and diagnostic failures cannot change its result', async () => {
     const cases: Array<[Record<string, unknown>, DraftVerificationDiagnostic['check']]> = [

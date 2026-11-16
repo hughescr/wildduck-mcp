@@ -422,8 +422,13 @@ function newBoundary(chunks: readonly Buffer[]): string {
 }
 interface Entity { headers: Buffer; body: Buffer; type: string }
 function serialize(entity: Entity): Buffer { return Buffer.concat([entity.headers, entity.body]); }
+/** Single choke point for every authored text/plain and text/html part (create,
+ * reply with or without quote, and update body patches all pass through here).
+ * RFC 2046 section 4.1.1 makes CRLF the canonical line break of text/* before
+ * transfer encoding, so LF, CR, CRLF and mixed input all decode as CRLF. Size
+ * limits were already enforced on the caller's string by validateMimeBody. */
 function textEntity(type: 'text/plain' | 'text/html', text: string): Entity {
-    return { headers: Buffer.from(`Content-Type: ${type}; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n`), body: encoded(Buffer.from(text)), type };
+    return { headers: Buffer.from(`Content-Type: ${type}; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n`), body: encoded(Buffer.from(text.replace(/\r\n|\r|\n/gu, '\r\n'))), type };
 }
 function multipart(type: 'multipart/alternative' | 'multipart/mixed' | 'multipart/related', children: readonly Buffer[]): Entity {
     requireMime(children.length > 0);

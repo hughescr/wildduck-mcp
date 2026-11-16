@@ -336,3 +336,82 @@ describe('MIME address-parser security regressions', () => {
         }
     });
 });
+
+/** Decode every text/plain or text/html part the library authored (base64, UTF-8). */
+function authoredText(raw: Buffer, type: 'text/plain' | 'text/html'): string[] {
+    const pattern = new RegExp(`Content-Type: ${type.replace('/', '\\/')}; charset=utf-8\\r\\nContent-Transfer-Encoding: base64\\r\\n\\r\\n([A-Za-z0-9+/=\\r\\n]*)`, 'gu');
+    return [...raw.toString('latin1').matchAll(pattern)].map(match => Buffer.from((match[1] ?? '').replaceAll('\r\n', ''), 'base64').toString('utf8'));
+}
+const bareBreak = /\r(?!\n)|(?<!\r)\n/u;
+
+describe('authored text parts use canonical CRLF line breaks', () => {
+    const variants: ReadonlyArray<readonly [string, string, string]> = [
+        ['LF', 'one\ntwo\n\nthree\n', '<p>one\ntwo\n\nthree</p>\n'],
+        ['CRLF', 'one\r\ntwo\r\n\r\nthree\r\n', '<p>one\r\ntwo\r\n\r\nthree</p>\r\n'],
+        ['bare CR', 'one\rtwo\r\rthree\r', '<p>one\rtwo\r\rthree</p>\r'],
+        ['mixed', 'one\ntwo\r\n\rthree\r\n', '<p>one\r\ntwo\n\rthree</p>\n'],
+    ];
+    const canonicalText = 'one\r\ntwo\r\n\r\nthree\r\n', canonicalHtml = '<p>one\r\ntwo\r\n\r\nthree</p>\r\n';
+    test.each(variants)('createMime stores %s input as CRLF-only text and HTML with identical decoded bytes', async (_name, text, htmlText) => {
+        const alternative = await createMime({ ...fresh, body: { text, html: htmlText } });
+        const altText = authoredText(alternative.raw, 'text/plain'), altHtml = authoredText(alternative.raw, 'text/html');
+        expect(altText).toEqual([canonicalText]);
+        expect(altHtml).toEqual([canonicalHtml]);
+        const plainOnly = await createMime({ ...fresh, body: { text, html: null } });
+        const plainText = authoredText(plainOnly.raw, 'text/plain');
+        expect(plainText).toEqual([canonicalText]);
+        for (const decoded of [...altText, ...altHtml, ...plainText]) { expect(bareBreak.test(decoded)).toBe(false); }
+        verifyCandidate(alternative, alternative.raw);
+    });
+    test.each(variants)('preparePatch stores %s body replacement as CRLF-only and keeps the top-level final CRLF', async (_name, text, htmlText) => {
+        for (const raw of [Buffer.from(rootHeaders + plain()), rich()]) {
+            const patched = await preparePatch(await inspectSource(raw), { body: { text, html: htmlText } });
+            expect(authoredText(patched.raw, 'text/plain')).toEqual([canonicalText]);
+            expect(authoredText(patched.raw, 'text/html')).toEqual([canonicalHtml]);
+            verifyCandidate(patched, patched.raw);
+        }
+        const bare = await preparePatch(await inspectSource(Buffer.from(rootHeaders + plain())), { body: { text, html: null } });
+        expect(authoredText(bare.raw, 'text/plain')).toEqual([canonicalText]);
+        expect(bare.raw.subarray(-2).equals(Buffer.from('\r\n'))).toBe(true);
+    });
+    test('body without final newline still gains the top-level CRLF after conversion', async () => {
+        const created = await createMime({ ...fresh, body: { text: 'a\nb', html: null } });
+        expect(authoredText(created.raw, 'text/plain')).toEqual(['a\r\nb']);
+        expect(created.raw.subarray(-2).equals(Buffer.from('\r\n'))).toBe(true);
+        const patched = await preparePatch(await inspectSource(Buffer.from(rootHeaders + plain())), { body: { text: 'a\nb', html: null } });
+        expect(patched.raw.subarray(-2).equals(Buffer.from('\r\n'))).toBe(true);
+    });
+    test('size limits apply to caller input before conversion', async () => {
+        const text = '\n'.repeat(128 * 1024), htmlText = '\n'.repeat(256 * 1024);
+        const created = await createMime({ ...fresh, body: { text, html: htmlText } });
+        expect(authoredText(created.raw, 'text/plain')[0]?.length).toBe(256 * 1024);
+        expect(authoredText(created.raw, 'text/html')[0]?.length).toBe(512 * 1024);
+        await expect(createMime({ ...fresh, body: { text: text + '\n', html: null } })).rejects.toBeInstanceOf(MimeError);
+        await expect(createMime({ ...fresh, body: { text: 'x', html: htmlText + '\n' } })).rejects.toBeInstanceOf(MimeError);
+    });
+    test('maximal LF-only body plus maximal attachments stays inside the MIME source limit', async () => {
+        const attachment = Buffer.alloc(MIME_LIMITS.attachmentBytes, 0x0a);
+        const created = await createMime({ ...fresh, body: { text: '\n'.repeat(128 * 1024), html: '\n'.repeat(256 * 1024) }, attachments: [{ filename: 'big.bin', contentType: 'application/octet-stream', contentBase64: attachment.toString('base64'), disposition: 'attachment' }] });
+        expect(created.raw.length).toBeLessThan(MIME_LIMITS.sourceBytes);
+    });
+    test('attachments, including text attachments with bare LF or CR, keep their exact bytes', async () => {
+        const bytes = Buffer.from('line one\nline two\rline three\r\nlast\n');
+        const wrapped = bytes.toString('base64').match(/.{1,76}/gu)?.join('\r\n') ?? '';
+        const created = await createMime({ ...fresh, body: { text: 'x\ny', html: null }, attachments: [{ filename: 'notes.txt', contentType: 'text/plain', contentBase64: bytes.toString('base64'), disposition: 'attachment' }] });
+        expect(created.raw.includes(Buffer.from(wrapped))).toBe(true);
+        expect(authoredText(created.raw, 'text/plain').filter(text => text === 'x\r\ny')).toHaveLength(1);
+        const stored = await inspectSource(created.raw);
+        expect(stored.attachments).toHaveLength(1);
+    });
+    test('retained text attachments with bare LF stay byte-identical when the body is replaced', async () => {
+        const attachmentBody = Buffer.from('keep\nbare\nLF\rand CR\n').toString('base64');
+        const textAttachment = `Content-Type: text/plain; charset=utf-8\r\nContent-Disposition: attachment; filename="notes.txt"\r\nContent-Transfer-Encoding: base64\r\n\r\n${attachmentBody}`;
+        const raw = Buffer.concat([Buffer.from(rootHeaders), multi('mixed', 'mixed-B', [plain(), textAttachment])]);
+        const source = await inspectSource(raw);
+        const patched = await preparePatch(source, { body: { text: 'new\nbody', html: '<p>new\nbody</p>' } });
+        expect(patched.raw.includes(Buffer.from(textAttachment))).toBe(true);
+        expect(patched.retainedAttachments).toEqual(source.attachments);
+        expect(authoredText(patched.raw, 'text/plain')).toEqual(['new\r\nbody']);
+        expect(authoredText(patched.raw, 'text/html')).toEqual(['<p>new\r\nbody</p>']);
+    });
+});

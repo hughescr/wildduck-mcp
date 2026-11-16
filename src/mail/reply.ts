@@ -93,9 +93,12 @@ export function deriveReply(input: ReplyInput): DerivedReply {
     let body = { ...input.body };
     if (input.quoteOriginal) {
         if (original.textTruncated !== false || typeof original.text !== 'string' || !original.text.isWellFormed()) { invalid(); }
+        // Line endings are canonicalised to CRLF later, where each text entity is
+        // authored (mime.ts textEntity). Work in LF here, including the caller's
+        // text, so a trailing bare CR cannot fuse with the separator's LF.
         const normalized = original.text.replace(/\r\n|\r/gu, '\n');
         const quote = normalized.split('\n').map(line => '> ' + line).join('\n');
-        body = { text: body.text + '\n\n' + quote, html: body.html === null ? null : body.html + '<blockquote><pre>' + escapeHtml(normalized) + '</pre></blockquote>' };
+        body = { text: body.text.replace(/\r\n|\r/gu, '\n') + '\n\n' + quote, html: body.html === null ? null : body.html + '<blockquote><pre>' + escapeHtml(normalized) + '</pre></blockquote>' };
         validateMimeBody(body);
     }
     return { ...recipients, bcc: [], subject, body, threading };
