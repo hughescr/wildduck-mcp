@@ -2,6 +2,7 @@ import { withRequestBudget } from '../src/request-budget';
 import { expect, test } from 'bun:test';
 import { digest } from '../src/auth/crypto';
 import { createMailService } from '../src/mail/service';
+import { errorText } from '../src/mail/summary';
 import { MailError, type ConfirmedReceipt, type MailOperationMarker, type FailedReceipt, type MailBackendReader, type MailBackendWriter, type MailContext, type MailOperationRecord, type MailOperationStore, type OperationClaim, type OperationKey, type ReservationResult, type UnknownReceipt, type WriteIntent, type MessageSnapshot, type PreparedDraft } from '../src/mail/contracts';
 
 const accountId = 'a'.repeat(24); const mailboxId = 'b'.repeat(24); const version = 'v'.repeat(43);
@@ -470,13 +471,13 @@ test('batch reads preserve order, cap concurrency and return isolated sanitized 
     f.reader.readMessage = async (bound, key) => { active++; high = Math.max(high, active); try { await Bun.sleep(2); if (key.uid === 3) { throw new MailError('not_found'); } const result = await original(bound, key); return { message: { ...result.message, ...key } }; } finally { active--; } };
     const result = await f.service.read_messages(context, { includeHtml: true, messages: Array.from({ length: 8 }, (_, index) => ({ mailboxId, uid: index + 1 })) });
     expect(high).toBe(3); expect(result.results.map(item => item.status === 'ok' ? item.message.uid : item.uid)).toEqual([1,2,3,4,5,6,7,8]);
-    expect(result.results[2]).toEqual({ status: 'failed', mailboxId, uid: 3, error: { code: 'not_found', message: 'not_found' } }); expect(result.bytesReturned).toBe(Buffer.byteLength(JSON.stringify(result))); expect(f.operations.calls).toHaveLength(0);
+    expect(result.results[2]).toEqual({ status: 'failed', mailboxId, uid: 3, error: { code: 'not_found', message: errorText('not_found', 'read_messages') } }); expect(JSON.stringify(result.results[2])).toContain('List or search again for current ids'); expect(result.bytesReturned).toBe(Buffer.byteLength(JSON.stringify(result))); expect(f.operations.calls).toHaveLength(0);
 });
 test('batch serialized budget includes metadata, envelope and reserved failure slots', async () => {
     const f = fixture(false); const original = f.reader.readMessage;
     f.reader.readMessage = async (bound, key) => ({ message: { ...(await original(bound, key)).message, ...key, text: 'x'.repeat(128 * 1024), html: ['x'.repeat(256 * 1024)] } });
     const result = await f.service.read_messages(context, { includeHtml: true, messages: Array.from({ length: 10 }, (_, index) => ({ mailboxId, uid: index + 1 })) });
-    expect(result.results.filter(item => item.status === 'ok')).toHaveLength(2); expect(result.results.filter(item => item.status === 'failed').every(item => item.status === 'failed' && item.error.code === 'too_large')).toBe(true); expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(1048576); expect(result.bytesReturned).toBe(Buffer.byteLength(JSON.stringify(result)));
+    expect(result.results.filter(item => item.status === 'ok')).toHaveLength(2); expect(result.results.filter(item => item.status === 'failed').every(item => item.status === 'failed' && item.error.code === 'too_large' && item.error.message.includes('Read it alone with read_message'))).toBe(true); expect(JSON.stringify(result)).not.toContain('"summary"'); expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(1048576); expect(result.bytesReturned).toBe(Buffer.byteLength(JSON.stringify(result)));
 });
 
 test('reply draft uses distinct durable create intent, skips preparation on replay, and requires both read and draft', async () => {

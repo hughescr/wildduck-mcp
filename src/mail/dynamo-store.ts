@@ -39,7 +39,8 @@ function parse<Schema extends z.ZodType>(schema: Schema, value: unknown): z.outp
  * rollback to 0.6 can still read receipts written now; tool results call it operationId. */
 const STORED_OPERATION_ID = 'operation_id';
 function storedReceipt(receipt: MailReceipt): Record<string, unknown> {
-    const { operationId, ...rest } = receipt;
+    // The summary is worked out again from the receipt whenever a result is returned; it is never stored.
+    const { operationId, summary: _summary, ...rest } = receipt;
     return { ...rest, [STORED_OPERATION_ID]: operationId };
 }
 /** Accepts the stored form and the result form. A value carrying both names is left as is and
@@ -61,7 +62,9 @@ function receiptFor(intent: WriteIntent, value: unknown): MailReceipt {
         const candidate = receipt.status === 'completed' && 'draft' in receipt ? receipt.draft : receipt.status === 'partial' && 'candidate' in receipt ? receipt.candidate : undefined;
         if (candidate && candidate.mailboxId === intent.target.mailboxId && candidate.uid === intent.target.uid) { throw unavailable(); }
     }
-    return receipt as MailReceipt;
+    // A stored record never carries a summary; drop one that is present so a receipt read back is the stored shape.
+    const { summary: _summary, ...stored } = receipt;
+    return stored as MailReceipt;
 }
 function operation(value: unknown, expected: OperationKey): MailOperationRecord {
     const data = parse(operationSchema, value);

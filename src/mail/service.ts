@@ -1,6 +1,7 @@
 import { remainingRequestTimeMs, withRequestBudget } from '../request-budget';
 import { digest, randomId } from '../auth/crypto';
 import { MailError, type CanonicalReadMessage, type ActivationProof, type AuthoredSourceDescriptor, type SourceGrade, type AttachmentDownloadLink, type AttachmentDownload, type BackendMailSession, type ConfirmedReceipt, type FailedReceipt, type MailBackendReader, type MailBackendWriter, type MailContext, type MailInput, type MailOperationMarker, type MailOperationRecord, type MailOperationStore, type MailOutput, type MailService, type MailToolName, type MailWriteTool, type MessageKey, type MessageRef, type MessageSnapshot, type OperationClaim, type OperationKey, type PreparedDraft, type UnknownReceipt, type WriteIntent } from './contracts';
+import { errorText } from './summary';
 import { activationProofSchema, draftContentSchema, failureReasonSchema, mailboxSchema, mailInputSchemas, mailOperationMarkerSchema, mailOutputSchemas, canonicalReadMessageOutputSchema, attachmentDownloadLinkSchema, messageKeySchema, messageRefSchema, MAX_BATCH_BYTES, BATCH_CONCURRENCY } from './schemas';
 
 interface Dependencies { reader: MailBackendReader; writer: MailBackendWriter; operations: MailOperationStore }
@@ -147,7 +148,7 @@ export function createMailService({ reader, writer, operations }: Dependencies):
         const inherited = remainingRequestTimeMs(); const deadline = performance.now() + Math.min(inherited ?? 32000, 32000);
         return withRequestBudget(() => Math.max(0, deadline - performance.now()), async () => {
         const results: Item[] = []; let next = 0;
-        const failure = (key: MessageKey, error: unknown): Item => { const safe = sanitized(error); return { status: 'failed', ...key, error: { code: safe.code, message: safe.code, ...(safe.retryAfter === undefined ? {} : { retryAfter: safe.retryAfter }) } }; };
+        const failure = (key: MessageKey, error: unknown): Item => { const safe = sanitized(error); return { status: 'failed', ...key, error: { code: safe.code, message: errorText(safe.code, 'read_messages'), ...(safe.retryAfter === undefined ? {} : { retryAfter: safe.retryAfter }) } }; };
         const envelope = (items: Item[]) => ({ includeHtml: parsed.includeHtml, results: items, byteBudget: MAX_BATCH_BYTES as typeof MAX_BATCH_BYTES, bytesReturned: MAX_BATCH_BYTES });
         // Reserve every failure slot and the envelope before dispatch. Replace slots in
         // input order so asynchronous completion cannot change which message fits.

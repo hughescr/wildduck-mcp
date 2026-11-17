@@ -2,8 +2,12 @@ import { describe, expect, test } from 'bun:test';
 import { isDeepStrictEqual } from 'node:util';
 import { GetCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import type { DynamoSender } from '../src/auth/dynamo-store';
+import type { AuthInfo } from '@modelcontextprotocol/server';
+import { digest as hashOf } from '../src/auth/crypto';
+import { handleMcp } from '../src/mcp';
 import { DynamoMailOperationStore } from '../src/mail/dynamo-store';
-import type { ConfirmedReceipt, MailOperationStore, OperationClaim, OperationKey, SourceGrade, WriteIntent } from '../src/mail/contracts';
+import { createMailService } from '../src/mail/service';
+import type { BoundMailService, ConfirmedReceipt, MailContext, MailOperationStore, OperationClaim, OperationKey, SourceGrade, WriteIntent } from '../src/mail/contracts';
 const mailboxId = 'a'.repeat(24); const digest = 'd'.repeat(43); const owner = 'owner-token-'.padEnd(43, 'a');
 const key = (operationId = 'operation-00000001', clientIdHash = 'c'.repeat(43), accountId = '1'.repeat(24)): OperationKey => ({ accountId, clientIdHash, operationId });
 const intent = (operationId = 'operation-00000001', tool: Exclude<WriteIntent['tool'], 'create_draft' | 'create_reply_draft'> = 'send_draft'): Exclude<WriteIntent, { tool: 'create_draft' | 'create_reply_draft' }> => ({ ...key(operationId), tool, payloadDigest: digest, target: { mailboxId, uid: 1 }, expectedVersion: digest });
@@ -359,5 +363,63 @@ describe('receipts stored by 0.6.x', () => {
         seed(f.client, other, { status: 'queued', operation_id: 'operation-legacy-xxxx', queueId: 'queue' });
         await expect(f.store.getOperation(key(value.operationId))).rejects.toThrow('temporarily_unavailable');
         await expect(f.store.getOperation(key(other.operationId))).rejects.toThrow('temporarily_unavailable');
+    });
+    test('a summary is never written to the store, and one found in a stored record is dropped when it is read', async () => {
+        const f = fixture(); const queued = intent('operation-plain-send'); const failed = { ...intent('operation-plain-failed'), target: { mailboxId, uid: 2 } };
+        await f.store.complete(await f.store.markDispatched(await claim(f.store, queued)), { status: 'queued', operationId: queued.operationId, queueId: 'queue-q1', summary: 'Draft sent: this must not be stored.' });
+        await f.store.failPreflight(await claim(f.store, failed), { status: 'failed', operationId: failed.operationId, reason: 'version_conflict', summary: 'Not done: this must not be stored.' });
+        const stored = (value: WriteIntent) => (f.client.records.get(operationPk(value))?.['record'] as { receipt?: unknown } | undefined)?.receipt;
+        expect(stored(queued)).toEqual({ status: 'queued', operation_id: queued.operationId, queueId: 'queue-q1' });
+        expect(stored(failed)).toEqual({ status: 'failed', operation_id: failed.operationId, reason: 'version_conflict' });
+        expect(JSON.stringify([...f.client.records.values()])).not.toContain('summary');
+        // A record that carries one anyway (written by something else) still reads back in the stored shape.
+        const odd = { ...intent('operation-plain-odd'), target: { mailboxId, uid: 3 } }; seed(f.client, odd, { status: 'queued', operation_id: odd.operationId, queueId: 'queue-odd', summary: 'Not stored.' });
+        const record = await f.store.getOperation(key(odd.operationId)); if (record?.state !== 'settled') { throw new Error('expected settled record'); }
+        expect(record.receipt).toEqual({ status: 'queued', operationId: odd.operationId, queueId: 'queue-odd' }); expect(record.receipt).not.toHaveProperty('summary');
+        const before = structuredClone([...f.client.records.entries()]);
+        const replay = await f.store.reserve(odd, owner); expect(replay.kind).toBe('replay'); if (replay.kind === 'replay' && replay.record.state === 'settled') { expect(replay.record.receipt).not.toHaveProperty('summary'); }
+        expect([...f.client.records.entries()]).toEqual(before);
+    });
+    test('receipts stored by 0.6.x and 0.7.2 replay through the MCP handler with a summary that is added to the output only', async () => {
+        const f = fixture(); const context: MailContext = { accountId: key().accountId, accessToken: 'c'.repeat(40), clientId: 'client-one', scopes: ['mail:read', 'mail:draft', 'mail:send', 'mail:modify'], connectionStatus: 'active' };
+        const clientIdHash = hashOf(context.clientId); const draftsTarget = { mailboxId, uid: 12 };
+        const forTool = (operationId: string, tool: 'delete_draft' | 'send_draft', uid: number): Extract<WriteIntent, { target: unknown }> => ({ accountId: context.accountId, clientIdHash, operationId, tool, payloadDigest: hashOf(JSON.stringify({ accountId: context.accountId, input: { expected_version: digest, uid }, tool })), target: { mailboxId, uid }, expectedVersion: digest });
+        const service = createMailService({ reader: {} as never, writer: {} as never, operations: f.store });
+        const mail = { delete_draft: (input: never) => service.delete_draft(context, input), send_draft: (input: never) => service.send_draft(context, input) } as unknown as BoundMailService;
+        const call = async (name: string, args: unknown) => {
+            const authInfo: AuthInfo = { token: 'synthetic-oauth-token', clientId: 'verified-client', scopes: context.scopes as string[], resource: new URL('https://service.example/mcp') };
+            const response = await handleMcp(new Request('https://service.example/mcp', { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'mcp-protocol-version': '2025-11-25' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }) }), authInfo, mail);
+            return (await response.json() as { result: { isError?: boolean; structuredContent: Record<string, unknown>; content: { text: string }[] } }).result;
+        };
+        // 0.6.x wrote operation_id and no summary; 0.7.2 wrote the same shape through this store.
+        const cases: { label: string; tool: 'delete_draft' | 'send_draft'; operationId: string; uid: number; stored: Record<string, unknown>; summary: string; isError: boolean }[] = [
+            { label: '0.6.x delete', tool: 'delete_draft', operationId: 'operation-replay-delete-06', uid: 12, stored: { status: 'completed', operation_id: 'operation-replay-delete-06', deleted: draftsTarget }, summary: 'Draft uid 12 permanently deleted: it was not moved to the Trash mailbox and cannot be recovered through this server.', isError: false },
+            { label: '0.6.x send', tool: 'send_draft', operationId: 'operation-replay-send-06', uid: 13, stored: { status: 'queued', operation_id: 'operation-replay-send-06', queueId: 'queue-0-6', sent: { mailboxId: 'e'.repeat(24), uid: 40 } }, summary: 'Draft sent: accepted by the mail server for delivery (queued), which does not confirm it arrived; the copy in Sent is uid 40 in mailbox eeeeeeeeeeeeeeeeeeeeeeee.', isError: false },
+            { label: '0.6.x failed', tool: 'send_draft', operationId: 'operation-replay-failed-06', uid: 14, stored: { status: 'failed', operation_id: 'operation-replay-failed-06', reason: 'version_conflict' }, summary: 'Not done: The message has changed since you read it', isError: true },
+            { label: '0.6.x unknown', tool: 'send_draft', operationId: 'operation-replay-unknown-06', uid: 15, stored: { status: 'outcome_unknown', operation_id: 'operation-replay-unknown-06', reason: 'dispatch_uncertain' }, summary: 'Outcome unknown:', isError: true },
+        ];
+        for (const item of cases) {
+            const value = forTool(item.operationId, item.tool, item.uid); const pk = operationPk(value);
+            f.client.records.set(pk, { pk, sk: 'STATE', record: { key: { accountId: value.accountId, clientIdHash: value.clientIdHash, operationId: value.operationId }, intent: value, ownerToken: owner, revision: 2, state: 'settled', receipt: item.stored } });
+            const reply = await call(item.tool, { uid: item.uid, expectedVersion: digest, operationId: item.operationId });
+            expect({ label: item.label, isError: reply.isError === true }).toEqual({ label: item.label, isError: item.isError });
+            expect({ label: item.label, first: Object.keys(reply.structuredContent)[0], summary: String(reply.structuredContent['summary']).startsWith(item.summary) }).toEqual({ label: item.label, first: 'summary', summary: true });
+            const { summary: _summary, operationId, ...rest } = reply.structuredContent; const { operation_id: _operationId, ...expected } = item.stored; expect({ label: item.label, rest, operationId }).toEqual({ label: item.label, rest: expected, operationId: item.operationId });
+            expect(JSON.parse(reply.content[0]?.text ?? 'null')).toEqual(reply.structuredContent);
+        }
+        // The 0.7.2 path: a receipt this store wrote, replayed with the same arguments.
+        const written = forTool('operation-replay-delete-072', 'delete_draft', 21);
+        await f.store.complete(await f.store.markDispatched(await claim(f.store, written)), { status: 'completed', operationId: written.operationId, deleted: { mailboxId, uid: 21 } });
+        expect((f.client.records.get(operationPk(written))?.['record'] as { receipt?: unknown } | undefined)?.receipt).toEqual({ status: 'completed', operation_id: written.operationId, deleted: { mailboxId, uid: 21 } });
+        const before = structuredClone([...f.client.records.entries()]);
+        const replayed = await call('delete_draft', { uid: 21, expectedVersion: digest, operationId: written.operationId });
+        expect(Object.keys(replayed.structuredContent)).toEqual(['summary', 'status', 'operationId', 'deleted']); expect(String(replayed.structuredContent['summary'])).toContain('Draft uid 21 permanently deleted');
+        // Replaying never writes: every stored record is exactly as it was, and none has a summary.
+        expect([...f.client.records.entries()]).toEqual(before); expect(JSON.stringify([...f.client.records.values()])).not.toContain('summary');
+        // A reserved record replays as in_progress, with the explanation in the result.
+        const pending = forTool('operation-replay-pending', 'send_draft', 22); expect((await f.store.reserve(pending, owner)).kind).toBe('acquired');
+        const progress = await call('send_draft', { uid: 22, expectedVersion: digest, operationId: pending.operationId });
+        expect(progress.isError).toBe(true); expect(Object.keys(progress.structuredContent)).toEqual(['summary', 'status', 'operationId']); expect(String(progress.structuredContent['summary'])).toContain('Retry the identical request');
+        expect(JSON.stringify([...f.client.records.values()])).not.toContain('summary');
     });
 });

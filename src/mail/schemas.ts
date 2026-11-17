@@ -14,6 +14,7 @@ export const MAX_HTML_BYTES = 256 * 1024;
 export const MAX_ATTACHMENT_BYTES = 2 * 1024 * 1024;
 export const MAX_SUBJECT_BYTES = AUTHORED_LIMITS.subjectBytes;
 export const MAX_SEARCH_TEXT_CHARACTERS = 255;
+export const MAX_SUMMARY_CHARACTERS = 700;
 const utf8 = (maximum: number) => (value: string) => Buffer.byteLength(value, 'utf8') <= maximum;
 const noHeaderControls = (value: string) => !/[\r\n\0]/u.test(value);
 const nonblank = (value: string) => value.trim().length > 0;
@@ -53,6 +54,8 @@ export const versionSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/u).describe('
 export const operationIdSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{15,127}$/u).describe('New unique id you choose for this action (16-128 letters, digits, - or _; a UUID works). Reuse it only to retry this identical request.');
 const digestSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/u);
 export const contentDigestSchema = z.string().regex(/^[a-f0-9]{64}$/u).describe('SHA-256 of the message source as checked by this server.');
+/** Added to a result when it is returned, never stored: the stored receipts do not carry it. */
+export const summarySchema = z.string().min(1).max(MAX_SUMMARY_CHARACTERS).describe('What happened and what to do next, in plain words. Present only when there is something to say.');
 const cursorSchema = z.string().max(1024).refine(nonblank);
 const paginationShape = { limit: z.number().int().min(1).max(MAX_PAGE_SIZE).default(20).describe('Messages per page, 1 to 50. Default 20.'), next: cursorSchema.optional().describe('The next value of the previous page, to get the following page. Do not combine with previous.'), previous: cursorSchema.optional().describe('The previous value of a page, to go back one page. Do not combine with next.') };
 const singleDirection = (input: { next?: string | undefined; previous?: string | undefined }) => input.next === undefined || input.previous === undefined;
@@ -161,12 +164,12 @@ export const getAttachmentDownloadOutputSchema = messageKeySchema.extend({ attac
 export const attachmentDownloadLinkSchema = z.strictObject({ metadata: getAttachmentDownloadOutputSchema, url: z.url().refine(value => new URL(value).protocol === 'https:') });
 const pageOutput = { messages: z.array(messageSummarySchema).max(MAX_PAGE_SIZE), next: cursorSchema.optional(), previous: cursorSchema.optional() };
 export const listMailboxesOutputSchema = z.strictObject({ mailboxes: z.array(mailboxSchema) });
-export const listMessagesOutputSchema = z.strictObject(pageOutput);
+export const listMessagesOutputSchema = z.strictObject({ summary: summarySchema.optional(), ...pageOutput });
 const searchMetadataSchema = z.union([
     z.strictObject({ mode: z.literal('fast'), strategy: z.literal('fulltext_prefilter'), complete: z.literal(false), verified: z.literal(true).describe('Every returned message was checked against your from, to and subject filters.'), retryWith: z.strictObject({ searchMode: z.literal('exhaustive') }).describe('To find every match, repeat the search from the first page with these settings.') }),
     z.strictObject({ mode: searchModeSchema, strategy: z.enum(['fulltext', 'structured']), complete: z.literal(true), verified: z.literal(false) }),
 ]).describe('How the search ran. complete false: a fast search that may have missed matches; a page can be short or empty and still have next. complete does not mean there are no more pages.');
-export const searchMessagesOutputSchema = z.strictObject({ ...pageOutput, search: searchMetadataSchema });
+export const searchMessagesOutputSchema = z.strictObject({ summary: summarySchema.optional(), ...pageOutput, search: searchMetadataSchema });
 export const mailWriteToolSchema = z.enum(['create_draft', 'create_reply_draft', 'update_draft', 'delete_draft', 'send_draft', 'move_message', 'update_message_flags']);
 export const mailOperationMarkerSchema = z.strictObject({ accountId: mailboxIdSchema, clientIdHash: digestSchema, operationId: operationIdSchema, payloadDigest: digestSchema, tool: mailWriteToolSchema });
 export const sourceGradeSchema = z.enum(['mcp_authored', 'observed']).describe('mcp_authored: created by this server and unchanged since; such a draft can be edited and sent here. observed: any other message.');
@@ -174,14 +177,24 @@ export const activationProofSchema = messageRefSchema.extend({ accountId: mailbo
 const authoredActivationProofSchema = activationProofSchema.extend({ sourceGrade: z.literal('mcp_authored') });
 export const failureReasonSchema = z.enum(['not_found', 'version_conflict', 'unsupported_draft', 'no_recipients', 'forbidden', 'reconnect_required', 'temporarily_unavailable', 'upstream_timeout', 'invalid_input', 'unsupported_content', 'source_integrity_unavailable', 'too_large', 'verification_failed']);
 export const mailErrorOutputSchema = z.strictObject({ code: failureReasonSchema.describe('Why this message could not be read, e.g. not_found (moved or deleted) or too_large (did not fit in this result; read it alone).'), message: z.string().max(1024), retryAfter: z.number().int().min(0).max(86400).optional().describe('Seconds to wait before trying again, when the mail server said so.') });
-export const readMessageOutputSchema = z.discriminatedUnion('htmlOmitted', [
+const htmlOmittedSchema = z.literal(true).describe('The HTML fields were left out because includeHtml was false.');
+const withoutHtml = { html: true, htmlTruncated: true, htmlRepresentation: true } as const;
+/** One message inside a batch: the summary belongs to the whole result, not to its items. */
+export const batchMessageOutputSchema = z.discriminatedUnion('htmlOmitted', [
     canonicalReadMessageOutputSchema.extend({ htmlOmitted: z.literal(false) }),
-    canonicalReadMessageOutputSchema.omit({ html: true, htmlTruncated: true, htmlRepresentation: true }).extend({ htmlOmitted: z.literal(true).describe('The HTML fields were left out because includeHtml was false.') }),
+    canonicalReadMessageOutputSchema.omit(withoutHtml).extend({ htmlOmitted: htmlOmittedSchema }),
 ]);
-export const batchMessageOutputSchema = readMessageOutputSchema;
-export const readMessagesOutputSchema = z.strictObject({ includeHtml: z.boolean(), results: z.array(z.discriminatedUnion('status', [z.strictObject({ status: z.literal('ok'), message: batchMessageOutputSchema }), z.strictObject({ status: z.literal('failed'), ...messageKeySchema.shape, error: mailErrorOutputSchema })])).min(1).max(MAX_BATCH_MESSAGES).describe('One result per requested message, in request order: ok with the message, or failed with an error.'), byteBudget: z.literal(MAX_BATCH_BYTES).describe('Maximum size of this result in bytes (1 MiB).'), bytesReturned: z.number().int().min(0).max(MAX_BATCH_BYTES).describe('Size of this result in bytes.') }).refine(value => value.results.every(item => item.status === 'failed' || item.message.htmlOmitted !== value.includeHtml), 'Batch HTML projection must match includeHtml.');
-export const getThreadOutputSchema = z.strictObject({ threadId: threadIdSchema, ...pageOutput, bodies: readMessagesOutputSchema.optional().describe('The full messages of this page, as read_messages returns them, when includeBodies was true.') });
-const operationOutput = { operationId: operationIdSchema.describe('The operationId of this request.') };
+export const readMessageOutputSchema = z.discriminatedUnion('htmlOmitted', [
+    canonicalReadMessageOutputSchema.extend({ summary: summarySchema.optional(), htmlOmitted: z.literal(false) }),
+    canonicalReadMessageOutputSchema.omit(withoutHtml).extend({ summary: summarySchema.optional(), htmlOmitted: htmlOmittedSchema }),
+]);
+const batchShape = { includeHtml: z.boolean(), results: z.array(z.discriminatedUnion('status', [z.strictObject({ status: z.literal('ok'), message: batchMessageOutputSchema }), z.strictObject({ status: z.literal('failed'), ...messageKeySchema.shape, error: mailErrorOutputSchema })])).min(1).max(MAX_BATCH_MESSAGES).describe('One result per requested message, in request order: ok with the message, or failed with an error.'), byteBudget: z.literal(MAX_BATCH_BYTES).describe('Maximum size of this result in bytes (1 MiB).'), bytesReturned: z.number().int().min(0).max(MAX_BATCH_BYTES).describe('Size of this result in bytes.') };
+const batchMatchesHtml = (value: { includeHtml: boolean; results: { status: string; message?: { htmlOmitted: boolean } }[] }) => value.results.every(item => item.status === 'failed' || item.message?.htmlOmitted !== value.includeHtml);
+/** The batch inside a get_thread result, which carries the summary itself. */
+const batchOutputSchema = z.strictObject(batchShape).refine(batchMatchesHtml, 'Batch HTML projection must match includeHtml.');
+export const readMessagesOutputSchema = z.strictObject({ summary: summarySchema.optional(), ...batchShape }).refine(batchMatchesHtml, 'Batch HTML projection must match includeHtml.');
+export const getThreadOutputSchema = z.strictObject({ summary: summarySchema.optional(), threadId: threadIdSchema, ...pageOutput, bodies: batchOutputSchema.optional().describe('The full messages of this page, as read_messages returns them, when includeBodies was true.') });
+const operationOutput = { summary: summarySchema.optional(), operationId: operationIdSchema.describe('The operationId of this request.') };
 export const inProgressSchema = z.strictObject({ status: z.literal('in_progress').describe('in_progress: no final result is recorded for this operationId yet, and no change is recorded. Retry the identical request once or twice after a few seconds; if it is still in_progress, stop retrying, read the message\'s current state and tell the user. Never repeat the change under a new operationId.'), ...operationOutput });
 export const outcomeUnknownSchema = z.strictObject({ status: z.literal('outcome_unknown').describe('outcome_unknown: the change was started but its result is not known, so it may or may not have happened. Retrying the identical request only looks up the recorded result and never repeats the change; it may then show the real result or stay unknown. Do not repeat the change under a new operationId; check the current state yourself (for a send, the Sent mailbox) and tell the user. While it is unknown, the affected message cannot be changed through this server.'), ...operationOutput, reason: z.literal('dispatch_uncertain').describe('The request may have reached the mail server, but its result could not be confirmed.') });
 export const conflictSchema = z.strictObject({ status: z.literal('conflict').describe('conflict: nothing was changed.'), ...operationOutput, reason: z.enum(['operation_conflict', 'draft_fenced']).describe('operation_conflict: this operationId was used before with other arguments; use a new one. draft_fenced: another action on this message is unfinished or uncertain, or the message was already moved, replaced, sent or deleted; list or read again.') });
