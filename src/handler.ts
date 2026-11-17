@@ -6,7 +6,7 @@ import { withRequestBudget } from './request-budget';
 export const MAX_LAMBDA_PAYLOAD_BYTES = 6_000_000;
 const encodedSize = (value: unknown) => Buffer.byteLength(JSON.stringify(value), 'utf8');
 function sizeError(response: boolean): APIGatewayProxyResult {
-    return { statusCode: response ? 502 : 413, isBase64Encoded: false, headers: { 'content-type': 'application/json', 'cache-control': 'no-store', 'access-control-allow-origin': '*' }, body: JSON.stringify({ error: response ? 'response_too_large' : 'payload_too_large', error_description: response ? 'The complete response exceeds the buffered transport bound; no data was silently dropped. For writes, check only the identical operation_id; do not retry with a new ID.' : 'The serialized request exceeds the buffered transport bound.' }) };
+    return { statusCode: response ? 502 : 413, isBase64Encoded: false, headers: { 'content-type': 'application/json', 'cache-control': 'no-store', 'access-control-allow-origin': '*' }, body: JSON.stringify({ error: response ? 'response_too_large' : 'payload_too_large', error_description: response ? 'The response is too large to return, so none of it was sent. For a write, retry only the identical request with the same operationId, never a new one.' : 'The request is too large to accept. Make it smaller, for example with fewer or smaller attachments.' }) };
 }
 /** Factory keeps tests on the same adapter/guards as production. It installs no
  * authentication bypass; production always builds the normal configured app. */

@@ -10,8 +10,8 @@ import { createMime, inspectSource, preparePatch, hasAttachmentReference, MIME_L
 import { mailInputSchemas, draftContentSchema, createReplyDraftInputSchema, updateDraftInputSchema, inputAddressSchema, newAttachmentSchema, draftBodySchema } from '../src/mail/schemas';
 import { decodedAddresses, partViews, rawParameters, rootHeaderLines, unfold, xorshift, type PartView } from './mime-fields';
 
-const operation_id = 'operation-id-0123456789';
-const target = { uid: 1, expected_version: 'a'.repeat(43), operation_id };
+const operationId = 'operation-id-0123456789';
+const target = { uid: 1, expectedVersion: 'a'.repeat(43), operationId };
 const body = { text: 'Body' };
 const fresh = (over: Partial<MimeCreate> = {}): MimeCreate => ({ from: { address: 'sender@example.test' }, to: [{ address: 'to@example.test' }], cc: [], bcc: [], subject: 'S', body: { text: 'Body', html: null }, ...over });
 const attach = (over: Partial<MimeAttachment> = {}): MimeAttachment => ({ filename: 'a.bin', contentType: 'application/octet-stream', contentBase64: 'aGk=', disposition: 'attachment', ...over });
@@ -86,7 +86,7 @@ describe('display names', () => {
     test('the schema rejects what the library cannot carry, with specific messages, in every address field of every draft tool', () => {
         const wrap = (name: string) => ({
             create_draft: ADDRESS_KEYS.map(key => draftContentSchema.safeParse({ to: [], body, subject: 'S', ...(key === 'from' ? { from: { address: 'a@example.test', name } } : { [key]: [{ address: 'a@example.test', name }] }) })),
-            reply: ADDRESS_KEYS.filter(key => key === 'from' || key === 'to' || key === 'cc').map(key => createReplyDraftInputSchema.safeParse({ original: { mailboxId: 'a'.repeat(24), uid: 1 }, body, operation_id, ...(key === 'from' ? { from: { address: 'a@example.test', name } } : { [key]: [{ address: 'a@example.test', name }] }) })),
+            reply: ADDRESS_KEYS.filter(key => key === 'from' || key === 'to' || key === 'cc').map(key => createReplyDraftInputSchema.safeParse({ original: { mailboxId: 'a'.repeat(24), uid: 1 }, body, operationId, ...(key === 'from' ? { from: { address: 'a@example.test', name } } : { [key]: [{ address: 'a@example.test', name }] }) })),
             update: ADDRESS_KEYS.map(key => updateDraftInputSchema.safeParse({ ...target, ...(key === 'from' ? { from: { address: 'a@example.test', name } } : { [key]: [{ address: 'a@example.test', name }] }) })),
         });
         const rejected = [

@@ -2,7 +2,8 @@
  * message as the tree imap-core's indexer parses and serves the bytes it rebuilds from that tree,
  * so rebuilt bytes must equal the prepared bytes exactly. Needs a WildDuck checkout with its
  * dependencies installed (no network or database); set WILDDUCK_CHECKOUT, or keep one beside this
- * repository. Without it these tests are skipped, as in CI. */
+ * repository. Without a checkout these tests are skipped, as in CI, but a WILDDUCK_CHECKOUT that is set
+ * and unusable fails the run. */
 import { describe, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -13,8 +14,12 @@ import libmime from 'libmime';
 import { createMime, inspectSource, preparePatch, type MimeAttachment, type MimeCreate } from '../src/mail/mime';
 import { authoredParts } from './mime-text';
 
-const checkout = process.env['WILDDUCK_CHECKOUT'] ?? resolve(import.meta.dir, '../../wildduck');
-const available = existsSync(join(checkout, 'imap-core/lib/indexer/indexer.js')) && existsSync(join(checkout, 'node_modules/libmime'));
+// An empty WILDDUCK_CHECKOUT counts as unset, so a CI variable that expands to nothing still skips.
+const requested = process.env['WILDDUCK_CHECKOUT'] ?? '';
+const explicit = requested !== '';
+const checkout = explicit ? requested : resolve(import.meta.dir, '../../wildduck');
+const indexerPath = join(checkout, 'imap-core/lib/indexer/indexer.js');
+const available = existsSync(indexerPath) && existsSync(join(checkout, 'node_modules/libmime'));
 interface Tree { parsedHeader: Record<string, unknown> }
 interface Indexer { parseMimeTree(raw: Buffer): Tree; rebuild(tree: Tree, textOnly: boolean, options: object): { value: Readable }; getMaildata(tree: Tree): { text: string; attachments: { filename: string }[] } }
 const indexer = (): Indexer => {
@@ -48,6 +53,13 @@ const STRUCTURES = {
     related: { html: true, attachments: [file('logo.png', { contentType: 'image/png', disposition: 'inline', cid: 'logo@example.test' })] },
 } as const;
 
+// A set WILDDUCK_CHECKOUT that cannot be used fails here rather than silently skipping every case below.
+if (explicit) {
+    test(`WILDDUCK_CHECKOUT is a usable WildDuck checkout: ${checkout}`, () => {
+        if (!available) { throw new Error(`WILDDUCK_CHECKOUT=${checkout} is not a usable WildDuck checkout: ${indexerPath} and ${join(checkout, 'node_modules/libmime')} must both exist`); }
+        try { indexer(); } catch (error) { throw new Error(`WILDDUCK_CHECKOUT=${checkout} is not a usable WildDuck checkout: ${indexerPath} cannot be required: ${error instanceof Error ? error.message : String(error)}`); }
+    });
+}
 describe.skipIf(!available)(`WildDuck stores authored drafts byte for byte (skipped without a WildDuck checkout at ${checkout})`, () => {
     for (const [structure, shape] of Object.entries(STRUCTURES)) {
         for (const [encoding, text] of Object.entries(BODIES)) {

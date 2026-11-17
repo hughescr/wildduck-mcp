@@ -35,10 +35,24 @@ function parse<Schema extends z.ZodType>(schema: Schema, value: unknown): z.outp
     if (!result.success) { throw unavailable(); }
     return result.data;
 }
+/** Stored receipts keep the 0.6 field name operation_id, so the stored format is unchanged and a
+ * rollback to 0.6 can still read receipts written now; tool results call it operationId. */
+const STORED_OPERATION_ID = 'operation_id';
+function storedReceipt(receipt: MailReceipt): Record<string, unknown> {
+    const { operationId, ...rest } = receipt;
+    return { ...rest, [STORED_OPERATION_ID]: operationId };
+}
+/** Accepts the stored form and the result form. A value carrying both names is left as is and
+ * then fails the strict schema. */
+function resultReceipt(value: unknown): unknown {
+    if (value === null || typeof value !== 'object' || Array.isArray(value) || !Object.hasOwn(value, STORED_OPERATION_ID) || Object.hasOwn(value, 'operationId')) { return value; }
+    const { [STORED_OPERATION_ID]: operationId, ...rest } = value as Record<string, unknown>;
+    return { ...rest, operationId };
+}
 function receiptFor(intent: WriteIntent, value: unknown): MailReceipt {
     // Schema validation preserves the supplied grade; absent/invalid grades are never inferred.
-    const receipt = parse(mailOutputSchemas[intent.tool], value);
-    if (!['completed', 'partial', 'queued', 'failed', 'outcome_unknown'].includes(receipt.status) || receipt.operation_id !== intent.operationId) { throw unavailable(); }
+    const receipt = parse(mailOutputSchemas[intent.tool], resultReceipt(value));
+    if (!['completed', 'partial', 'queued', 'failed', 'outcome_unknown'].includes(receipt.status) || receipt.operationId !== intent.operationId) { throw unavailable(); }
     if (intent.tool === 'delete_draft' && receipt.status === 'completed' && 'deleted' in receipt && !equal(receipt.deleted, intent.target)) { throw unavailable(); }
     if ('proof' in receipt && receipt.proof.accountId !== intent.accountId) { throw unavailable(); }
     if (intent.tool === 'update_message_flags' && receipt.status === 'completed' && 'message' in receipt && (receipt.message.mailboxId !== intent.target.mailboxId || receipt.message.uid !== intent.target.uid)) { throw unavailable(); }
@@ -157,7 +171,7 @@ export class DynamoMailOperationStore implements MailOperationStore {
         const receipt = typeof result === 'string' ? undefined : receiptFor(before.intent, result);
         if (receipt && ((expected === 'reserved' && receipt.status !== 'failed') || (expected === 'dispatched' && !['completed', 'partial', 'queued', 'outcome_unknown'].includes(receipt.status)))) { throw unavailable(); }
         const nextRevision = before.revision + 1;
-        const after: MailOperationRecord = receipt ? { ...before, revision: nextRevision, state: 'settled', receipt } : { ...before, revision: nextRevision, state: 'dispatched' };
+        const after = receipt ? { ...before, revision: nextRevision, state: 'settled' as const, receipt: storedReceipt(receipt) } : { ...before, revision: nextRevision, state: 'dispatched' as const };
         // Revalidate the complete stored value before any write.
         operation(after, claim.key);
         const items = [this.checkedPut(opKey(claim.key), before, after)];

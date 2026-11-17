@@ -21,6 +21,15 @@ function stable(value: unknown): string {
     }
     return JSON.stringify(value);
 }
+/** The arguments a payload digest covers: everything except operationId. The digest keeps the
+ * 0.6 key name expected_version, so it is unchanged by the 0.7 rename and an identical retry of a
+ * delete, send, move or flag change recorded by 0.6 still replays its stored outcome. */
+function digestedPayload(parsed: WriteInput): Record<string, unknown> {
+    const { operationId: _operationId, ...payload } = parsed;
+    if (!('expectedVersion' in payload)) { return payload; }
+    const { expectedVersion, ...rest } = payload;
+    return { ...rest, expected_version: expectedVersion };
+}
 function session(context: MailContext, scope: string): BackendMailSession {
     if (!context || typeof context.accountId !== 'string' || !/^[a-f0-9]{24}$/u.test(context.accountId) || typeof context.accessToken !== 'string' || !/^[a-fA-F0-9]{40}$/u.test(context.accessToken) || typeof context.clientId !== 'string' || context.clientId.length < 1 || context.clientId.length > 16384 || !Array.isArray(context.scopes) || !context.scopes.every(value => typeof value === 'string')) { throw new MailError('forbidden'); }
     if (context.connectionStatus !== 'active') { throw new MailError('reconnect_required'); }
@@ -42,12 +51,12 @@ const sameMessage = (left: MessageKey, right: MessageKey) => left.mailboxId === 
 function matches(record: MailOperationRecord, key: OperationKey, tool: MailWriteTool, parsed: WriteInput, payloadDigest: string): boolean {
     if (!sameKey(record.key, key) || !sameKey(record.intent, key) || record.intent.tool !== tool || record.intent.payloadDigest !== payloadDigest) { return false; }
     if (tool === 'create_draft' || tool === 'create_reply_draft') { return record.intent.tool === tool; }
-    return 'uid' in parsed && record.intent.tool !== 'create_draft' && record.intent.tool !== 'create_reply_draft' && record.intent.target.uid === parsed.uid && record.intent.expectedVersion === parsed.expected_version && /^[a-f0-9]{24}$/u.test(record.intent.target.mailboxId) && (!('mailboxId' in parsed) || record.intent.target.mailboxId === parsed.mailboxId);
+    return 'uid' in parsed && record.intent.tool !== 'create_draft' && record.intent.tool !== 'create_reply_draft' && record.intent.target.uid === parsed.uid && record.intent.expectedVersion === parsed.expectedVersion && /^[a-f0-9]{24}$/u.test(record.intent.target.mailboxId) && (!('mailboxId' in parsed) || record.intent.target.mailboxId === parsed.mailboxId);
 }
 function receipt(tool: MailWriteTool, record: MailOperationRecord): MailOutput<MailWriteTool> {
-    if (record.state === 'reserved') { return output(tool, { status: 'in_progress', operation_id: record.key.operationId }); }
-    if (record.state === 'dispatched') { return output(tool, { status: 'outcome_unknown', operation_id: record.key.operationId, reason: 'dispatch_uncertain' }); }
-    if (record.state !== 'settled' || record.receipt.operation_id !== record.key.operationId) { throw temporary(); }
+    if (record.state === 'reserved') { return output(tool, { status: 'in_progress', operationId: record.key.operationId }); }
+    if (record.state === 'dispatched') { return output(tool, { status: 'outcome_unknown', operationId: record.key.operationId, reason: 'dispatch_uncertain' }); }
+    if (record.state !== 'settled' || record.receipt.operationId !== record.key.operationId) { throw temporary(); }
     if (!['completed', 'queued', 'partial', 'failed', 'outcome_unknown'].includes(record.receipt.status)) { throw temporary(); }
     return output(tool, record.receipt);
 }
@@ -138,7 +147,7 @@ export function createMailService({ reader, writer, operations }: Dependencies):
         const inherited = remainingRequestTimeMs(); const deadline = performance.now() + Math.min(inherited ?? 32000, 32000);
         return withRequestBudget(() => Math.max(0, deadline - performance.now()), async () => {
         const results: Item[] = []; let next = 0;
-        const failure = (key: MessageKey, error: unknown): Item => { const safe = sanitized(error); return { status: 'failed', ...key, error: { code: safe.code, message: safe.code, ...(safe.retryAfter === undefined ? {} : { retry_after: safe.retryAfter }) } }; };
+        const failure = (key: MessageKey, error: unknown): Item => { const safe = sanitized(error); return { status: 'failed', ...key, error: { code: safe.code, message: safe.code, ...(safe.retryAfter === undefined ? {} : { retryAfter: safe.retryAfter }) } }; };
         const envelope = (items: Item[]) => ({ includeHtml: parsed.includeHtml, results: items, byteBudget: MAX_BATCH_BYTES as typeof MAX_BATCH_BYTES, bytesReturned: MAX_BATCH_BYTES });
         // Reserve every failure slot and the envelope before dispatch. Replace slots in
         // input order so asynchronous completion cannot change which message fits.
@@ -185,11 +194,10 @@ export function createMailService({ reader, writer, operations }: Dependencies):
     async function write(tool: MailWriteTool, context: MailContext, raw: WriteInput): Promise<MailOutput<MailWriteTool>> {
         const scope = tool === 'send_draft' ? 'mail:send' : tool === 'move_message' || tool === 'update_message_flags' ? 'mail:modify' : 'mail:draft';
         const bound = session(context, scope); if (tool === 'create_reply_draft') { session(context, 'mail:read'); } const parsed = input(tool, raw);
-        const key: OperationKey = { accountId: bound.accountId, clientIdHash: digest(context.clientId), operationId: parsed.operation_id };
-        const { operation_id: _operationId, ...payload } = parsed;
-        const payloadDigest = digest(stable({ accountId: bound.accountId, tool, input: payload }));
+        const key: OperationKey = { accountId: bound.accountId, clientIdHash: digest(context.clientId), operationId: parsed.operationId };
+        const payloadDigest = digest(stable({ accountId: bound.accountId, tool, input: digestedPayload(parsed) }));
         const marker: MailOperationMarker = { ...key, payloadDigest, tool };
-        const conflict = (reason: 'operation_conflict' | 'draft_fenced') => output(tool, { status: 'conflict', operation_id: key.operationId, reason });
+        const conflict = (reason: 'operation_conflict' | 'draft_fenced') => output(tool, { status: 'conflict', operationId: key.operationId, reason });
         const checkedReplay = (record: MailOperationRecord) => matches(record, key, tool, parsed, payloadDigest) ? receipt(tool, record) : conflict('operation_conflict');
         let existing: MailOperationRecord | undefined;
         try { existing = await operations.getOperation(key); } catch (error) { throw sanitized(error); }
@@ -204,7 +212,7 @@ export function createMailService({ reader, writer, operations }: Dependencies):
             }
         } catch (error) { throw sanitized(error); }
         const intent: WriteIntent = tool === 'create_draft' || tool === 'create_reply_draft' ? { ...key, payloadDigest, tool } : {
-            ...key, payloadDigest, tool, target: { mailboxId, uid: (parsed as MailInput<'send_draft'>).uid }, expectedVersion: (parsed as MailInput<'send_draft'>).expected_version,
+            ...key, payloadDigest, tool, target: { mailboxId, uid: (parsed as MailInput<'send_draft'>).uid }, expectedVersion: (parsed as MailInput<'send_draft'>).expectedVersion,
         };
         const ownerToken = randomId(); let claim: OperationClaim<'reserved'>;
         try {
@@ -227,20 +235,20 @@ export function createMailService({ reader, writer, operations }: Dependencies):
                 if (!writer.prepareReply) { throw temporary(); }
                 prepared = await writer.prepareReply(bound, parsed as MailInput<'create_reply_draft'>, marker);
             } else if (tool === 'create_draft') {
-                const { operation_id: _id, ...content } = parsed as MailInput<'create_draft'>;
+                const { operationId: _id, ...content } = parsed as MailInput<'create_draft'>;
                 prepared = await writer.prepareCreate(bound, draftContentSchema.parse(content), marker);
             } else if (tool === 'update_draft' && snapshot && source) {
-                const { operation_id: _id, uid: _uid, expected_version: _version, ...patch } = parsed as MailInput<'update_draft'>;
+                const { operationId: _id, uid: _uid, expectedVersion: _version, ...patch } = parsed as MailInput<'update_draft'>;
                 prepared = await writer.prepareUpdate(bound, snapshot, patch, marker, source);
             }
             if ((tool === 'create_draft' || tool === 'create_reply_draft' || tool === 'update_draft') && !prepared) { throw temporary(); }
             if (prepared && (prepared.mailboxId !== mailboxId || stable(mailOperationMarkerSchema.parse(prepared.marker)) !== stable(marker) || !/^[a-f0-9]{64}$/u.test(prepared.mime.sha256))) { throw temporary(); }
         } catch (error) {
-            const failed: FailedReceipt = { status: 'failed', operation_id: key.operationId, reason: sanitized(error).code };
+            const failed: FailedReceipt = { status: 'failed', operationId: key.operationId, reason: sanitized(error).code };
             try { await operations.failPreflight(claim, failed); } catch { throw temporary(); }
             return output(tool, failed);
         }
-        const unknown: UnknownReceipt = { status: 'outcome_unknown', operation_id: key.operationId, reason: 'dispatch_uncertain' };
+        const unknown: UnknownReceipt = { status: 'outcome_unknown', operationId: key.operationId, reason: 'dispatch_uncertain' };
         async function saved(): Promise<MailOutput<MailWriteTool> | undefined> {
             try { const record = await operations.getOperation(key); if (record && record.state === 'settled' && matches(record, key, tool, parsed, payloadDigest)) { return receipt(tool, record); } } catch { /* No durable outcome can be proved. */ }
             return undefined;
@@ -281,30 +289,30 @@ export function createMailService({ reader, writer, operations }: Dependencies):
                     verified = messageRefSchema.parse(await writer.verifyPreparedDraft(bound, candidate, prepared));
                     if (!sameMessage(candidate, verified)) { throw temporary(); }
                 } catch {
-                    return await finish({ status: 'partial', operation_id: key.operationId, candidate, candidateVerified: false, reason: 'candidate_verification_failed', originalDeletion: 'not_attempted' });
+                    return await finish({ status: 'partial', operationId: key.operationId, candidate, candidateVerified: false, reason: 'candidate_verification_failed', originalDeletion: 'not_attempted' });
                 }
                 const activation = proof(bound.accountId, verified, prepared.mime.sha256, 'mcp_authored');
-                if (intent.tool === 'create_draft' || intent.tool === 'create_reply_draft') { return await finish({ status: 'completed', operation_id: key.operationId, draft: verified, verified: true, proof: activation }); }
+                if (intent.tool === 'create_draft' || intent.tool === 'create_reply_draft') { return await finish({ status: 'completed', operationId: key.operationId, draft: verified, verified: true, proof: activation }); }
                 try { await inspect(bound, intent.target, intent.expectedVersion, true); } catch (error) {
-                    return await finish({ status: 'partial', operation_id: key.operationId, candidate: verified, candidateVerified: true, proof: activation, reason: error instanceof MailError && error.code === 'version_conflict' ? 'original_version_changed' : 'original_verification_failed', originalDeletion: 'not_attempted' });
+                    return await finish({ status: 'partial', operationId: key.operationId, candidate: verified, candidateVerified: true, proof: activation, reason: error instanceof MailError && error.code === 'version_conflict' ? 'original_version_changed' : 'original_verification_failed', originalDeletion: 'not_attempted' });
                 }
                 try { await writer.deleteDraft(bound, intent.target); } catch (error) {
                     const confirmedFailure = error instanceof MailError && ['forbidden', 'not_found', 'unsupported_draft'].includes(error.code);
-                    return await finish({ status: 'partial', operation_id: key.operationId, candidate: verified, candidateVerified: true, proof: activation, reason: confirmedFailure ? 'original_deletion_failed' : 'original_deletion_unconfirmed', originalDeletion: confirmedFailure ? 'failed' : 'unconfirmed' });
+                    return await finish({ status: 'partial', operationId: key.operationId, candidate: verified, candidateVerified: true, proof: activation, reason: confirmedFailure ? 'original_deletion_failed' : 'original_deletion_unconfirmed', originalDeletion: confirmedFailure ? 'failed' : 'unconfirmed' });
                 }
-                return await finish({ status: 'completed', operation_id: key.operationId, draft: verified, verified: true, proof: activation, previousDeleted: true });
+                return await finish({ status: 'completed', operationId: key.operationId, draft: verified, verified: true, proof: activation, previousDeleted: true });
             }
             if (intent.tool === 'create_draft' || intent.tool === 'create_reply_draft' || !snapshot) { throw temporary(); }
             if (tool === 'delete_draft') {
                 await writer.deleteDraft(bound, intent.target);
-                return await finish({ status: 'completed', operation_id: key.operationId, deleted: intent.target });
+                return await finish({ status: 'completed', operationId: key.operationId, deleted: intent.target });
             }
             if (tool === 'send_draft') {
                 if (!source) { throw temporary(); }
                 const stamped = messageRefSchema.parse(await writer.stampSendMarker(bound, snapshot, marker, source));
                 if (!sameMessage(stamped, intent.target)) { throw temporary(); }
                 const result = await writer.submitDraft(bound, intent.target);
-                return await finish({ status: 'queued', operation_id: key.operationId, queueId: result.queueId, ...(result.sent === undefined ? {} : { sent: messageKeySchema.parse(result.sent) }) });
+                return await finish({ status: 'queued', operationId: key.operationId, queueId: result.queueId, ...(result.sent === undefined ? {} : { sent: messageKeySchema.parse(result.sent) }) });
             }
             const mutation = tool === 'move_message'
                 ? await writer.moveMessage(bound, snapshot, (parsed as MailInput<'move_message'>).destinationMailboxId, marker, source)
@@ -312,7 +320,7 @@ export function createMailService({ reader, writer, operations }: Dependencies):
             const message = messageRefSchema.parse(mutation.message);
             if (tool === 'move_message' ? message.mailboxId !== (parsed as MailInput<'move_message'>).destinationMailboxId : !sameMessage(message, intent.target)) { throw temporary(); }
             if (source ? mutation.sourceGrade !== 'mcp_authored' || mutation.contentDigest !== source.contentDigest : mutation.sourceGrade !== 'observed') { throw temporary(); }
-            return await finish({ status: 'completed', operation_id: key.operationId, message, verified: true, proof: proof(bound.accountId, message, mutation.contentDigest, mutation.sourceGrade) });
+            return await finish({ status: 'completed', operationId: key.operationId, message, verified: true, proof: proof(bound.accountId, message, mutation.contentDigest, mutation.sourceGrade) });
         } catch { return uncertain(dispatched); }
     }
     return {

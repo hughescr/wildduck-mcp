@@ -588,7 +588,7 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
     async prepareUpdate(session: BackendMailSession, snapshot: MessageSnapshot, patch: DraftPatch, marker: MailOperationMarker, trusted: AuthoredSourceDescriptor): Promise<PreparedDraft> {
         const state = this.state(session, snapshot); this.checkMarker(session, marker);
         if (!snapshot.isDraft) { throw new MailError('unsupported_draft'); }
-        const parsed = mailInputSchemas.update_draft.safeParse({ ...patch, uid: snapshot.message.uid, expected_version: snapshot.message.version, operation_id: marker.operationId });
+        const parsed = mailInputSchemas.update_draft.safeParse({ ...patch, uid: snapshot.message.uid, expectedVersion: snapshot.message.version, operationId: marker.operationId });
         if (!parsed.success) { throw new MailError('invalid_input'); }
         try {
             // A body patch replaces the whole body; only the rendered parts are stored.
@@ -601,7 +601,7 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
             if (patch.deleteAttachmentIds?.length && Array.isArray(state.raw['files']) && state.raw['files'].length > 0) { throw new MailError('unsupported_content'); }
             const source = await inspectSource(bytes, (state.raw['attachments'] as Json[]).map(item => ({ attachmentId: string(item['id']), hash: string(item['hash']) })));
             // The parsed patch: its names and subject carry the schema's normalisation.
-            const { uid: _uid, expected_version: _version, operation_id: _operation, ...fields } = parsed.data;
+            const { uid: _uid, expectedVersion: _version, operationId: _operation, ...fields } = parsed.data;
             const mime = await preparePatch(source, { ...fields, body });
             const envelope = outbound(mime.envelope); await this.ownedFrom(session, { address: envelope.from });
             const flags = strings(state.raw['flags']); const labels = strings(state.raw['labels']);
@@ -720,7 +720,7 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
     async updateMessageFlags(session: BackendMailSession, snapshot: MessageSnapshot, patch: MailInput<'update_message_flags'>, marker: MailOperationMarker, source?: AuthoredSourceDescriptor): Promise<VerifiedMessageMutation> {
         const state = this.state(session, snapshot); this.checkMarker(session, marker);
         const parsed = mailInputSchemas.update_message_flags.safeParse(patch);
-        if (!parsed.success || patch.mailboxId !== snapshot.message.mailboxId || patch.uid !== snapshot.message.uid || patch.expected_version !== snapshot.message.version) { throw new MailError('invalid_input'); }
+        if (!parsed.success || patch.mailboxId !== snapshot.message.mailboxId || patch.uid !== snapshot.message.uid || patch.expectedVersion !== snapshot.message.version) { throw new MailError('invalid_input'); }
         const flags = new Set(strings(state.raw['flags']).map(canonicalFlag));
         for (const value of patch.removeFlags ?? []) { flags.delete(canonicalFlag(value)); } for (const value of patch.addFlags ?? []) { flags.add(canonicalFlag(value)); }
         for (const [key, flag] of [['seen', '\\Seen'], ['flagged', '\\Flagged']] as const) { if (patch[key] === true) { flags.add(flag); } else if (patch[key] === false) { flags.delete(flag); } }

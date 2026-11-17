@@ -4,12 +4,12 @@ import { MailError } from '../src/mail/contracts';
 import { McpServer, WebStandardStreamableHTTPServerTransport, type StandardSchemaWithJSON } from '@modelcontextprotocol/server';
 import { mailInputSchemas, mailOutputSchemas, draftContentSchema, inputAddressSchema, outputAddressSchema, operationIdSchema, versionSchema, MAX_DRAFT_TEXT_BYTES, MAX_SUBJECT_BYTES, MAX_ATTACHMENT_BYTES, MAX_HTML_BYTES } from '../src/mail/schemas';
 const mailboxId = 'a'.repeat(24), otherMailbox = 'b'.repeat(24);
-const operation_id = '061a78f9-14bd-4bb9-849d-5f6a3f304612', expected_version = 'v'.repeat(43);
-const target = { uid: 1, expected_version, operation_id };
+const operationId = '061a78f9-14bd-4bb9-849d-5f6a3f304612', expectedVersion = 'v'.repeat(43);
+const target = { uid: 1, expectedVersion, operationId };
 const body = { text: 'First line\nSecond line\r\nThird line' };
 const draft = { to: [{ address: 'recipient@example.invalid', name: 'Recipient' }], subject: 'Hello', body };
 const attachment = { filename: 'hello.txt', contentType: 'text/plain', contentBase64: Buffer.from('hello').toString('base64') };
-const ref = { mailboxId, uid: 2, version: expected_version };
+const ref = { mailboxId, uid: 2, version: expectedVersion };
 const proof = { ...ref, accountId: mailboxId, contentDigest: 'a'.repeat(64), sourceGrade: 'mcp_authored' as const };
 
 test('strict tools expose bounded pagination without hidden filters', () => {
@@ -66,24 +66,24 @@ test('search requires a meaningful filter, preserves false, and rejects rather t
     for (const value of [{ receivedSince: '2026-02-30T12:00:00Z' }, { receivedSince: '2026-10-26' }, { receivedSince: '2026-10-26T12:00:00' }, { receivedSince: '2026-10-26T00:00:01Z', receivedUntil: '2026-10-26T00:00:00Z' }]) { expect(mailInputSchemas.search_messages.safeParse(value).success).toBe(false); }
 });
 test('create takes one body form; patches preserve omitted fields and explicitly allow recipient clearing', () => {
-    expect(mailInputSchemas.create_draft.parse({ ...draft, operation_id })).toEqual({ ...draft, cc: [], bcc: [], attachments: [], operation_id });
-    expect(mailInputSchemas.create_draft.safeParse({ ...draft, operation_id, from: { address: 'owner@example.invalid' }, replyTo: [] }).success).toBe(true);
+    expect(mailInputSchemas.create_draft.parse({ ...draft, operationId })).toEqual({ ...draft, cc: [], bcc: [], attachments: [], operationId });
+    expect(mailInputSchemas.create_draft.safeParse({ ...draft, operationId, from: { address: 'owner@example.invalid' }, replyTo: [] }).success).toBe(true);
     expect(mailInputSchemas.update_draft.parse({ ...target, subject: 'Changed' })).toEqual({ ...target, subject: 'Changed' });
     expect(mailInputSchemas.update_draft.parse({ ...target, to: [] })).toEqual({ ...target, to: [] });
     for (const patch of [{}, { attachments: [] }, { deleteAttachmentIds: [] }, { body: {} }, { body: { text: '', html: null } }, { body: { text: '', html: '<b>new</b>' } }, { text: 'legacy replacement' }, { deleteAttachmentIds: ['ATT1', 'ATT1'] }]) { expect(mailInputSchemas.update_draft.safeParse({ ...target, ...patch }).success).toBe(false); }
     for (const value of [{ markdown: '**new**' }, { html: '<b>new</b>' }, { text: '' }]) { expect(mailInputSchemas.update_draft.parse({ ...target, body: value, deleteAttachmentIds: ['ATT1'] }).body).toEqual(value); }
-    for (const fields of [{ raw: 'MIME' }, { mailboxId }, { storageId: 'file' }, { html: '<b>legacy</b>' }, { markdown: 'top-level legacy' }]) { expect(mailInputSchemas.create_draft.safeParse({ ...draft, operation_id, ...fields }).success).toBe(false); }
+    for (const fields of [{ raw: 'MIME' }, { mailboxId }, { storageId: 'file' }, { html: '<b>legacy</b>' }, { markdown: 'top-level legacy' }]) { expect(mailInputSchemas.create_draft.safeParse({ ...draft, operationId, ...fields }).success).toBe(false); }
 });
 test('body accepts exactly one of markdown, html or text with per-form UTF-8 bounds and a clear error', () => {
-    const reply = { original: { mailboxId, uid: 1 }, operation_id };
-    const parsers = [(value: unknown) => mailInputSchemas.create_draft.safeParse({ ...draft, operation_id, body: value }), (value: unknown) => mailInputSchemas.create_reply_draft.safeParse({ ...reply, body: value }), (value: unknown) => mailInputSchemas.update_draft.safeParse({ ...target, body: value })];
+    const reply = { original: { mailboxId, uid: 1 }, operationId };
+    const parsers = [(value: unknown) => mailInputSchemas.create_draft.safeParse({ ...draft, operationId, body: value }), (value: unknown) => mailInputSchemas.create_reply_draft.safeParse({ ...reply, body: value }), (value: unknown) => mailInputSchemas.update_draft.safeParse({ ...target, body: value })];
     for (const parse of parsers) {
         for (const value of [{ markdown: '# Hi\n*there*' }, { html: '<p>Hi</p>' }, { text: 'Hi\nthere' }, { markdown: '' }]) { const result = parse(value); expect(result.success).toBe(true); expect(result.data?.body).toEqual(value); }
         for (const value of [{ markdown: 'a', html: '<p>a</p>' }, { markdown: 'a', text: 'a' }, { html: '<p>a</p>', text: 'a' }, { markdown: 'a', html: 'b', text: 'c' }, {}, { body: 'a' }, { markdown: 'a', extra: 1 }, { text: 'legacy', html: null }, { text: 'legacy', html: '<p>legacy</p>' }, { markdown: null }, { text: 5 }, 'plain string', null]) {
             expect(parse(value).success).toBe(false);
         }
     }
-    const message = (value: unknown) => mailInputSchemas.create_draft.safeParse({ ...draft, operation_id, body: value }).error?.issues.map(issue => issue.message).join(' | ');
+    const message = (value: unknown) => mailInputSchemas.create_draft.safeParse({ ...draft, operationId, body: value }).error?.issues.map(issue => issue.message).join(' | ');
     for (const value of [{ markdown: 'a', html: 'b' }, {}, { unknown: 'x' }]) { expect(message(value)).toBe('Provide exactly one of body.markdown, body.html or body.text.'); }
     expect(message({ text: 'legacy', html: null })).toContain('"html"');
     for (const [key, maximum] of [['markdown', MAX_DRAFT_TEXT_BYTES], ['text', MAX_DRAFT_TEXT_BYTES], ['html', MAX_HTML_BYTES]] as const) {
@@ -96,7 +96,7 @@ test('body JSON Schema is an anyOf of three strict single-key objects, each desc
     for (const name of ['create_draft', 'create_reply_draft', 'update_draft'] as const) {
         const json = mailInputSchemas[name]['~standard'].jsonSchema.input({ target: 'draft-2020-12' }) as { properties: { body: { description: string; anyOf: Array<{ type: string; properties: Record<string, { type: string; maxLength: number; description: string }>; required: string[]; additionalProperties: boolean }> } } };
         const schema = json.properties.body;
-        expect(schema.description).toContain('Exactly one of markdown (preferred), html or text');
+        expect(schema.description).toContain('one of markdown (preferred), html or text');
         expect(schema.anyOf.map(item => Object.keys(item.properties))).toEqual([['markdown'], ['html'], ['text']]);
         for (const item of schema.anyOf) {
             const [key] = Object.keys(item.properties) as [string];
@@ -108,7 +108,7 @@ test('body JSON Schema is an anyOf of three strict single-key objects, each desc
     }
 });
 test('subjects reject every C0 control and DEL up front with a clear message, and nothing else', () => {
-    const target = { uid: 1, expected_version: 'a'.repeat(43), operation_id: 'operation-id-0123456789' };
+    const target = { uid: 1, expectedVersion: 'a'.repeat(43), operationId: 'operation-id-0123456789' };
     const messages = (result: { success: boolean; error?: { issues: { message: string }[] } }) => result.error?.issues.map(issue => issue.message) ?? [];
     for (const subject of ['a\tb', 'a\u0001b', 'a\u007fb', 'a\u001fb', 'a\nb', 'a\rb', 'a\0b']) {
         for (const result of [draftContentSchema.safeParse({ ...draft, subject }), mailInputSchemas.update_draft.safeParse({ ...target, subject })]) {
@@ -143,7 +143,7 @@ test('outbound headers reject injections and UTF-8 overflow while bodies preserv
     expect(draftContentSchema.safeParse({ ...draft, to: many, cc: many, bcc: [many[0]] }).success).toBe(false);
 });
 test('attachment additions require canonical bounded base64, safe names/types and unique inline CIDs', () => {
-    const parse = (attachments: unknown[]) => mailInputSchemas.create_draft.safeParse({ ...draft, operation_id, attachments });
+    const parse = (attachments: unknown[]) => mailInputSchemas.create_draft.safeParse({ ...draft, operationId, attachments });
     expect(parse([attachment]).success).toBe(true);
     for (const fields of [{ filename: '../file\nInjected' }, { filename: 'é'.repeat(128) }, { contentType: 'text/plain; charset=utf-8' }, { contentBase64: 'aGVsbG8' }, { contentBase64: 'aGVsbG8=\n' }, { contentBase64: 'Zh==' }, { disposition: 'inline' }, { url: 'https://example.invalid' }]) { expect(parse([{ ...attachment, ...fields }]).success).toBe(false); }
     expect(parse([{ ...attachment, contentType: 'image/png', disposition: 'inline', cid: 'part@example.invalid' }]).success).toBe(true);
@@ -165,14 +165,14 @@ test('IMAP keywords and labels stay distinct and unsafe/contradictory mutations 
     expect(mailInputSchemas.move_message.safeParse({ ...target, mailboxId, destinationMailboxId: otherMailbox }).success).toBe(true);
 });
 test('operation IDs and versions are strict; canonical draft writes cannot accept caller mailboxes', () => {
-    expect(operationIdSchema.safeParse(operation_id).success).toBe(true);
+    expect(operationIdSchema.safeParse(operationId).success).toBe(true);
     for (const value of ['short', 'x'.repeat(129), 'a'.repeat(15) + '/', 'x'.repeat(15) + '\n', '💌'.repeat(16)]) { expect(operationIdSchema.safeParse(value).success).toBe(false); }
     for (const value of ['x'.repeat(42), 'x'.repeat(44), 'x'.repeat(42) + '+']) { expect(versionSchema.safeParse(value).success).toBe(false); }
     for (const name of ['delete_draft', 'send_draft'] as const) { expect(mailInputSchemas[name].safeParse(target).success).toBe(true); expect(mailInputSchemas[name].safeParse({ mailboxId, ...target }).success).toBe(false); }
 });
 test('read data retains full flags/labels, separate dates, HTML data, explicit truncation and honest sizes', () => {
     expect(outputAddressSchema.safeParse({ address: 'malformed sender <>', name: 'Untrusted\nMIME' }).success).toBe(true);
-    const value = { mailboxId, uid: 1, subject: 's'.repeat(4096), snippet: null, threadId: null, from: [{ address: 'malformed sender <>' }], to: [], date: null, receivedAt: '2026-10-26T00:00:00Z', flags: { seen: false, flagged: false, draft: false, answered: false, deleted: false, forwarded: true }, imapFlags: ['$Forwarded', 'legacy keyword'], labels: ['My Label'], hasAttachments: true, replyTo: [], cc: [], bcc: [], messageId: null, references: [], text: 'partial text', textTruncated: true, html: ['<script>untrusted data</script>'], htmlTruncated: false, htmlRepresentation: 'wildduck_normalized' as const, htmlOmitted: false as const, attachments: [{ attachmentId: 'ATT1', filename: '<untrusted>.txt', contentType: 'text/plain', size: 1024, sizeIsApproximate: true, inline: false, cid: null }], version: expected_version };
+    const value = { mailboxId, uid: 1, subject: 's'.repeat(4096), snippet: null, threadId: null, from: [{ address: 'malformed sender <>' }], to: [], date: null, receivedAt: '2026-10-26T00:00:00Z', flags: { seen: false, flagged: false, draft: false, answered: false, deleted: false, forwarded: true }, imapFlags: ['$Forwarded', 'legacy keyword'], labels: ['My Label'], hasAttachments: true, replyTo: [], cc: [], bcc: [], messageId: null, references: [], text: 'partial text', textTruncated: true, html: ['<script>untrusted data</script>'], htmlTruncated: false, htmlRepresentation: 'wildduck_normalized' as const, htmlOmitted: false as const, attachments: [{ attachmentId: 'ATT1', filename: '<untrusted>.txt', contentType: 'text/plain', size: 1024, sizeIsApproximate: true, inline: false, cid: null }], version: expectedVersion };
     expect(mailOutputSchemas.read_message.parse(value)).toEqual(value);
     for (const fields of [{ receivedAt: undefined }, { htmlTruncated: undefined }, { rawHeaders: 'headers' }, { attachments: [{ ...value.attachments[0], content: 'bytes' }] }, { attachments: [{ ...value.attachments[0], size: null }] }]) { expect(mailOutputSchemas.read_message.safeParse({ ...value, ...fields }).success).toBe(false); }
     const download = { mailboxId, uid: 1, attachmentId: 'ATT1', filename: null, contentType: 'application/octet-stream', size: 5, resourceUri: 'wildduck://attachment/ATT1' };
@@ -180,20 +180,20 @@ test('read data retains full flags/labels, separate dates, HTML data, explicit t
     expect(mailOutputSchemas.read_attachment.safeParse({ ...download, blob: 'aGVsbG8=' }).success).toBe(false);
 });
 test('receipts bind verified targets and distinguish stale, partial and unknown outcomes from success', () => {
-    expect(mailOutputSchemas.create_draft.safeParse({ status: 'completed', operation_id, draft: ref, verified: true, proof }).success).toBe(true);
-    expect(mailOutputSchemas.create_draft.safeParse({ status: 'completed', operation_id, draft: ref, verified: true, proof: { ...proof, uid: 99 } }).success).toBe(false);
-    expect(mailOutputSchemas.update_draft.safeParse({ status: 'completed', operation_id, draft: ref, verified: true, proof, previousDeleted: false }).success).toBe(false);
-    expect(mailOutputSchemas.update_draft.safeParse({ status: 'partial', operation_id, candidate: ref, candidateVerified: true, proof, reason: 'original_version_changed', originalDeletion: 'not_attempted' }).success).toBe(true);
-    expect(mailOutputSchemas.update_draft.safeParse({ status: 'partial', operation_id, candidate: ref, candidateVerified: true, proof, reason: 'original_deletion_unconfirmed', originalDeletion: 'failed' }).success).toBe(false);
-    expect(mailOutputSchemas.update_draft.safeParse({ status: 'partial', operation_id, candidate: ref, candidateVerified: true, proof, reason: 'original_verification_failed', originalDeletion: 'not_attempted' }).success).toBe(true);
-    expect(mailOutputSchemas.update_draft.safeParse({ status: 'partial', operation_id, candidate: ref, candidateVerified: true, proof, reason: 'original_verification_failed', originalDeletion: 'unconfirmed' }).success).toBe(false);
-    const partial = { status: 'partial', operation_id, candidate: { mailboxId, uid: 2 }, candidateVerified: false, reason: 'candidate_verification_failed', originalDeletion: 'not_attempted' };
+    expect(mailOutputSchemas.create_draft.safeParse({ status: 'completed', operationId, draft: ref, verified: true, proof }).success).toBe(true);
+    expect(mailOutputSchemas.create_draft.safeParse({ status: 'completed', operationId, draft: ref, verified: true, proof: { ...proof, uid: 99 } }).success).toBe(false);
+    expect(mailOutputSchemas.update_draft.safeParse({ status: 'completed', operationId, draft: ref, verified: true, proof, previousDeleted: false }).success).toBe(false);
+    expect(mailOutputSchemas.update_draft.safeParse({ status: 'partial', operationId, candidate: ref, candidateVerified: true, proof, reason: 'original_version_changed', originalDeletion: 'not_attempted' }).success).toBe(true);
+    expect(mailOutputSchemas.update_draft.safeParse({ status: 'partial', operationId, candidate: ref, candidateVerified: true, proof, reason: 'original_deletion_unconfirmed', originalDeletion: 'failed' }).success).toBe(false);
+    expect(mailOutputSchemas.update_draft.safeParse({ status: 'partial', operationId, candidate: ref, candidateVerified: true, proof, reason: 'original_verification_failed', originalDeletion: 'not_attempted' }).success).toBe(true);
+    expect(mailOutputSchemas.update_draft.safeParse({ status: 'partial', operationId, candidate: ref, candidateVerified: true, proof, reason: 'original_verification_failed', originalDeletion: 'unconfirmed' }).success).toBe(false);
+    const partial = { status: 'partial', operationId, candidate: { mailboxId, uid: 2 }, candidateVerified: false, reason: 'candidate_verification_failed', originalDeletion: 'not_attempted' };
     expect(mailOutputSchemas.create_draft.safeParse(partial).success).toBe(true);
     expect(mailOutputSchemas.create_draft.safeParse({ ...partial, proof }).success).toBe(false);
-    expect(mailOutputSchemas.update_message_flags.safeParse({ status: 'completed', operation_id, message: ref, verified: true, proof }).success).toBe(true);
-    expect(mailOutputSchemas.update_message_flags.safeParse({ status: 'completed', operation_id, message: ref, verified: true, proof, labels: [] }).success).toBe(false);
-    expect(mailOutputSchemas.send_draft.safeParse({ status: 'queued', operation_id, queueId: 'queue-123', sent: { mailboxId, uid: 2 } }).success).toBe(true);
-    for (const value of [{ status: 'delivered', operation_id, queueId: 'queue-123' }, { status: 'queued', operation_id, queueId: '' }, { status: 'outcome_unknown', operation_id, reason: 'dispatch_uncertain', retryable: true }]) { expect(mailOutputSchemas.send_draft.safeParse(value).success).toBe(false); }
+    expect(mailOutputSchemas.update_message_flags.safeParse({ status: 'completed', operationId, message: ref, verified: true, proof }).success).toBe(true);
+    expect(mailOutputSchemas.update_message_flags.safeParse({ status: 'completed', operationId, message: ref, verified: true, proof, labels: [] }).success).toBe(false);
+    expect(mailOutputSchemas.send_draft.safeParse({ status: 'queued', operationId, queueId: 'queue-123', sent: { mailboxId, uid: 2 } }).success).toBe(true);
+    for (const value of [{ status: 'delivered', operationId, queueId: 'queue-123' }, { status: 'queued', operationId, queueId: '' }, { status: 'outcome_unknown', operationId, reason: 'dispatch_uncertain', retryable: true }]) { expect(mailOutputSchemas.send_draft.safeParse(value).success).toBe(false); }
 });
 test('native Zod exposes all schemas and validation directly through installed MCP SDK', async () => {
     const standard: StandardSchemaWithJSON = mailInputSchemas.list_messages;
@@ -203,7 +203,7 @@ test('native Zod exposes all schemas and validation directly through installed M
     const request = async (rpc: object) => {
     const server = new McpServer({ name: 'schema-contract-test', version: '1' });
     server.registerTool('list_messages', { inputSchema: mailInputSchemas.list_messages, outputSchema: mailOutputSchemas.list_messages }, async () => ({ content: [{ type: 'text', text: '[]' }], structuredContent: { messages: [] } }));
-    server.registerTool('send_draft', { inputSchema: mailInputSchemas.send_draft, outputSchema: mailOutputSchemas.send_draft }, async () => ({ content: [{ type: 'text', text: 'Synthetic queue receipt.' }], structuredContent: { status: 'queued', operation_id, queueId: 'synthetic' } }));
+    server.registerTool('send_draft', { inputSchema: mailInputSchemas.send_draft, outputSchema: mailOutputSchemas.send_draft }, async () => ({ content: [{ type: 'text', text: 'Synthetic queue receipt.' }], structuredContent: { status: 'queued', operationId, queueId: 'synthetic' } }));
     const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true }); await server.connect(transport);
     try { return await transport.handleRequest(new Request('https://service.example/mcp', { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'mcp-protocol-version': '2025-11-25' }, body: JSON.stringify(rpc) })); } finally { await server.close(); }
     };
@@ -211,7 +211,7 @@ test('native Zod exposes all schemas and validation directly through installed M
         const listed = await request({ jsonrpc: '2.0', id: 1, method: 'tools/list' }); const list = await listed.json();
         expect(list.result.tools[0].inputSchema.properties.limit.maximum).toBe(50); expect(list.result.tools[0].inputSchema.additionalProperties).toBe(false);
         const response = await request({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'send_draft', arguments: target } });
-        expect(response.status).toBe(200); expect((await response.json()).result.structuredContent).toEqual({ status: 'queued', operation_id, queueId: 'synthetic' });
+        expect(response.status).toBe(200); expect((await response.json()).result.structuredContent).toEqual({ status: 'queued', operationId, queueId: 'synthetic' });
     }
 });
 test('MailError accepts only sanitized codes without retaining raw causes or details', () => {
@@ -232,20 +232,20 @@ test('recipient validation is the pinned existing API predicate intersected with
     const invalid = 'x'.repeat(65) + '@example.invalid';
     for (const field of ['to', 'cc', 'bcc', 'replyTo'] as const) {
         const recipients = [{ address: 'valid@example.invalid' }, { address: invalid }];
-        expect(mailInputSchemas.create_draft.safeParse({ ...draft, operation_id, [field]: recipients }).success).toBe(false);
+        expect(mailInputSchemas.create_draft.safeParse({ ...draft, operationId, [field]: recipients }).success).toBe(false);
         expect(mailInputSchemas.update_draft.safeParse({ ...target, [field]: recipients }).success).toBe(false);
     }
-    expect(mailInputSchemas.create_draft.parse({ ...draft, operation_id }).to).toEqual(draft.to);
+    expect(mailInputSchemas.create_draft.parse({ ...draft, operationId }).to).toEqual(draft.to);
 });
 test('activation proof requires an explicit source grade; observed source cannot create authored drafts', () => {
-    const complete = { status: 'completed', operation_id, draft: ref, verified: true, proof };
+    const complete = { status: 'completed', operationId, draft: ref, verified: true, proof };
     const { sourceGrade: _grade, ...missingGrade } = proof;
     expect(mailOutputSchemas.create_draft.safeParse({ ...complete, proof: missingGrade }).success).toBe(false);
     expect(mailOutputSchemas.create_draft.safeParse({ ...complete, proof: { ...proof, sourceGrade: 'observed' } }).success).toBe(false);
     expect(mailOutputSchemas.update_draft.safeParse({ ...complete, previousDeleted: true, proof: { ...proof, sourceGrade: 'observed' } }).success).toBe(false);
-    expect(mailOutputSchemas.update_draft.safeParse({ status: 'partial', operation_id, candidate: ref, candidateVerified: true, proof: { ...proof, sourceGrade: 'observed' }, reason: 'original_deletion_failed', originalDeletion: 'failed' }).success).toBe(false);
+    expect(mailOutputSchemas.update_draft.safeParse({ status: 'partial', operationId, candidate: ref, candidateVerified: true, proof: { ...proof, sourceGrade: 'observed' }, reason: 'original_deletion_failed', originalDeletion: 'failed' }).success).toBe(false);
     for (const name of ['move_message', 'update_message_flags'] as const) {
-        expect(mailOutputSchemas[name].safeParse({ status: 'completed', operation_id, message: ref, verified: true, proof: { ...proof, sourceGrade: 'observed' } }).success).toBe(true);
+        expect(mailOutputSchemas[name].safeParse({ status: 'completed', operationId, message: ref, verified: true, proof: { ...proof, sourceGrade: 'observed' } }).success).toBe(true);
     }
     expect(mailInputSchemas.update_draft.safeParse({ ...target, subject: 'Change', source: { grade: 'mcp_authored', accountId: mailboxId, mailboxId, uid: 1, contentDigest: proof.contentDigest } }).success).toBe(false);
 });

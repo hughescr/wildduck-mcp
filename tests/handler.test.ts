@@ -21,7 +21,7 @@ test('encoded event bodies are counted and ordinary attachment-size JSON still r
 test('serialized response bound prevents silent omission and counts escaped JSON bodies', async () => {
     const app = new Hono(); app.get('/large', context => context.json({ labels: '"'.repeat(1_600_000), private: 'private-response-data' })); app.get('/small', context => { context.header('Set-Cookie', 'safe=value; Secure; HttpOnly'); return context.json({ ok: true }); });
     const invoke = createLambdaHandler(app); const denied = await invoke(lambdaEvent('/large'));
-    expect(denied.statusCode).toBe(502); expect(JSON.parse(denied.body).error).toBe('response_too_large'); expect(denied.body).toContain('no data was silently dropped'); expect(denied.body).toContain('identical operation_id'); expect(denied.body).not.toContain('private-response-data'); expect(Buffer.byteLength(JSON.stringify(denied))).toBeLessThan(MAX_LAMBDA_PAYLOAD_BYTES);
+    expect(denied.statusCode).toBe(502); expect(JSON.parse(denied.body).error).toBe('response_too_large'); expect(denied.body).toContain('none of it was sent'); expect(denied.body).toContain('same operationId'); expect(denied.body).not.toContain('private-response-data'); expect(Buffer.byteLength(JSON.stringify(denied))).toBeLessThan(MAX_LAMBDA_PAYLOAD_BYTES);
     const ordinary = await invoke(lambdaEvent('/small')); expect(ordinary.statusCode).toBe(200); expect(JSON.parse(ordinary.body)).toEqual({ ok: true }); expect(ordinary.cookies).toEqual(['safe=value; Secure; HttpOnly']);
 });
 test('Lambda budget remains live after authentication and trusts only the bound server context', async () => {

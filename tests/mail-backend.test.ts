@@ -500,11 +500,11 @@ test('move uses singular UID mapping, atomically carries marker, compares observ
 });
 test('flag writes keep IMAP keywords and labels separate, verify actual sets and do not accept reserved draft toggles', async () => {
     const f = model(); const snapshot = await f.backend.inspectMessage(session, target);
-    const result = await f.backend.updateMessageFlags(session, snapshot, { ...target, expected_version: snapshot.message.version, operation_id: marker.operationId, seen: true, flagged: true, addFlags: ['\\Answered', 'NewKeyword'], removeFlags: ['KeepKeyword'], addLabels: ['NewLabel'], removeLabels: ['KeepLabel'] }, { ...marker, tool: 'update_message_flags' });
+    const result = await f.backend.updateMessageFlags(session, snapshot, { ...target, expectedVersion: snapshot.message.version, operationId: marker.operationId, seen: true, flagged: true, addFlags: ['\\Answered', 'NewKeyword'], removeFlags: ['KeepKeyword'], addLabels: ['NewLabel'], removeLabels: ['KeepLabel'] }, { ...marker, tool: 'update_message_flags' });
     expect(result.contentDigest).toHaveLength(64); expect(result.sourceGrade).toBe('observed'); expect(f.current().flags).toEqual(['\\Draft', '\\Answered', 'NewKeyword', '\\Seen', '\\Flagged']); expect(f.current().labels).toEqual(['NewLabel']);
     const body = JSON.parse(String(f.calls.find(call => call.init.method === 'PUT')?.init.body)); expect(body.addFlags).toEqual(['\\Answered', 'NewKeyword']); expect(body.addLabels).toEqual(['NewLabel']); expect(body).not.toHaveProperty('draft'); expect(body).not.toHaveProperty('deleted');
     const bad = model(); const original = await bad.backend.inspectMessage(session, target);
-    await errorCode(bad.backend.updateMessageFlags(session, original, { ...target, expected_version: original.message.version, operation_id: marker.operationId, addFlags: ['\\Draft'] }, marker), 'invalid_input'); expect(bad.calls.some(call => call.init.method === 'PUT')).toBe(false);
+    await errorCode(bad.backend.updateMessageFlags(session, original, { ...target, expectedVersion: original.message.version, operationId: marker.operationId, addFlags: ['\\Draft'] }, marker), 'invalid_input'); expect(bad.calls.some(call => call.init.method === 'PUT')).toBe(false);
 });
 test('source rejects missing or inconsistent lengths before any upload without a new header contract', async () => {
     for (const length of [undefined, String(originalSource.length + 1)]) {
@@ -557,7 +557,7 @@ test('moves and flag changes carry authored grade only with a matching trusted d
             const f = model(); f.patch({ metaData: { [MAIL_OPERATION_METADATA_KEY]: marker } }); const snapshot = await f.backend.inspectMessage(session, target);
             const result = useMove
                 ? await f.backend.moveMessage(session, snapshot, 'd'.repeat(24), { ...marker, tool: 'move_message' }, trusted)
-                : await f.backend.updateMessageFlags(session, snapshot, { ...target, expected_version: snapshot.message.version, operation_id: marker.operationId, seen: true }, { ...marker, tool: 'update_message_flags' }, trusted);
+                : await f.backend.updateMessageFlags(session, snapshot, { ...target, expectedVersion: snapshot.message.version, operationId: marker.operationId, seen: true }, { ...marker, tool: 'update_message_flags' }, trusted);
             expect(result.sourceGrade).toBe(trusted ? 'mcp_authored' : 'observed');
             expect(result.contentDigest).toBe(authored().contentDigest);
         }
@@ -676,16 +676,16 @@ test('only bounded valid Retry-After seconds are retained from unavailable respo
 
 test('reply preparation derives recipients and MIME threading without changing the original', async () => {
     const f = model(['alias@example.com']); f.patch({ from: [{ address: 'author@example.com' }], replyTo: [{ address: 'help@example.com' }], to: [{ address: 'sender@example.com' }, { address: 'alias@example.com' }, { address: 'visible@example.com' }], cc: [{ address: 'copy@example.com' }], bcc: [{ address: 'blind@example.com' }], text: 'Original <text>', references: ['<ancestor@example.com>'] });
-    const prepared = await f.backend.prepareReply?.(session, { original: target, mode: 'reply_all', body: { markdown: 'Response' }, quoteOriginal: true, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    const prepared = await f.backend.prepareReply?.(session, { original: target, mode: 'reply_all', body: { markdown: 'Response' }, quoteOriginal: true, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
     expect(prepared?.mime.envelope.to.map(item => item.address)).toEqual(['help@example.com', 'visible@example.com']); expect(prepared?.mime.envelope.cc.map(item => item.address)).toEqual(['copy@example.com']); expect(prepared?.mime.envelope.bcc).toEqual([]);
     const mime = prepared?.mime.raw.toString() ?? ''; expect(mime).toContain('In-Reply-To: <test@example.com>'); expect(mime).toContain('References: <ancestor@example.com> <test@example.com>'); expect(mime).not.toContain('blind@example.com'); expect(mime).not.toContain('Bcc:'); expect(f.calls.every(call => call.init.method === 'GET')).toBe(true);
-    const invalid = model(); invalid.patch({ messageId: null }); await errorCode(invalid.backend.prepareReply?.(session, { original: target, mode: 'reply', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' }) ?? Promise.resolve(), 'unsupported_content'); expect(invalid.calls.every(call => call.init.method === 'GET')).toBe(true);
+    const invalid = model(); invalid.patch({ messageId: null }); await errorCode(invalid.backend.prepareReply?.(session, { original: target, mode: 'reply', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' }) ?? Promise.resolve(), 'unsupported_content'); expect(invalid.calls.every(call => call.init.method === 'GET')).toBe(true);
 });
 test('expanded HTML reply quotes surface too_large, not invalid MIME or unsupported_content', async () => {
     const f = model();
     f.patch({ from: { address: 'author@example.com' }, to: [{ address: 'sender@example.com' }], text: '\t'.repeat(40000) });
     if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
-    await errorCode(f.backend.prepareReply(session, { original: target, mode: 'reply', body: { html: '<p>Response</p>' }, quoteOriginal: true, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' }), 'too_large');
+    await errorCode(f.backend.prepareReply(session, { original: target, mode: 'reply', body: { html: '<p>Response</p>' }, quoteOriginal: true, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' }), 'too_large');
     expect(f.calls.every(call => call.init.method === 'GET')).toBe(true);
 });
 test('reply defaults to owned SMTP recipient before visible To/Cc and retains only a trusted name', async () => {
@@ -693,7 +693,7 @@ test('reply defaults to owned SMTP recipient before visible To/Cc and retains on
     f.patch({ envelope: { from: 'author@example.net', rcpt: [{ value: 'outsider@example.net' }, { value: 'ALIAS@example.com' }, { value: 'second@example.com' }] },
         from: { address: 'author@example.net' }, to: [{ address: 'sender@example.com', name: 'Attacker name' }], cc: [{ address: 'second@example.com' }], bcc: [] });
     if (!f.backend.prepareReply) { throw new Error("Missing reply implementation"); }
-    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply_all', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply_all', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
     expect(prepared.mime.envelope.from).toEqual([{ address: 'alias@example.com', name: 'Sender' }]);
     expect(prepared.mime.envelope.to.map(item => item.address)).toEqual(['help@example.com']);
     expect(prepared.mime.envelope.cc).toEqual([]); expect(prepared.mime.envelope.bcc).toEqual([]);
@@ -710,14 +710,14 @@ test.each([
 ] as const)('reply selects visible owned recipients in To/Cc order or the primary fallback', async (rcpt, to, cc, expected) => {
     const f = model(['alias@example.com', 'second@example.com']); f.patch({ envelope: { from: '', rcpt }, to, cc });
     if (!f.backend.prepareReply) { throw new Error("Missing reply implementation"); }
-    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
     expect(prepared.mime.envelope.from).toEqual([{ address: expected, name: 'Sender' }]);
 });
 test.each(['sender+service@example.com', 'sender.service@example.com'])('configured reply defaults %s to its owned base, excludes tagged self recipients and permits later edits', async address => {
     const f = model([], { dotAsPlus: true });
     f.patch({ envelope: { from: 'author@example.net', rcpt: [{ value: address }] }, to: [{ address }, { address: 'reader@example.net' }], cc: [{ address: 'sender.other@example.com' }] });
     if (!f.backend.prepareReply) { throw new Error("Missing reply implementation"); }
-    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply_all', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply_all', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
     expect(prepared.mime.envelope.from).toEqual([{ address: 'sender@example.com', name: 'Sender' }]);
     expect(prepared.mime.envelope.to.map(item => item.address)).toEqual(['help@example.com', 'reader@example.net']);
     expect(prepared.mime.envelope.cc).toEqual([]);
@@ -740,7 +740,7 @@ test.each([
     const f = model(['alias@example.com'], { dotAsPlus, stripReplySuffix });
     f.patch({ envelope: { from: '', rcpt: [{ value: address }] }, to: [{ address: 'reader@example.net' }], cc: [], bcc: [{ address }] });
     if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
-    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
     expect(prepared.mime.envelope.from).toEqual([{ address: expected, name: 'Sender' }]);
     expect(prepared.mime.envelope.bcc).toEqual([]);
 });
@@ -748,7 +748,7 @@ test('retaining a tag can use a routed dotted alias whose registered spelling ca
     const f = model(['alice.smith@example.com'], { dotAsPlus: true, stripReplySuffix: false });
     f.patch({ envelope: { from: '', rcpt: [{ value: 'alicesmith.service@example.com' }] }, to: [], cc: [] });
     if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
-    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
     expect(prepared.mime.envelope.from).toEqual([{ address: 'alicesmith.service@example.com', name: 'Sender' }]);
 });
 test.each([
@@ -763,7 +763,7 @@ test.each([
     const f = model(['alias@example.com', 'real.alias@example.com', 'alice.smith@example.com'], { dotAsPlus }, expected === 'sender.primary@example.com' ? expected : undefined);
     f.patch({ envelope: { from: 'author@example.net', rcpt: blind ? [{ value: address }] : [] }, to: blind ? [{ address: 'reader@example.net' }] : [{ address }], cc: [], bcc: blind ? [{ address }] : [] });
     if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
-    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
     expect(prepared.mime.envelope.from).toEqual([{ address: expected, name: 'Sender' }]);
     expect(prepared.mime.envelope.bcc).toEqual([]);
 });
@@ -771,13 +771,13 @@ test('an unselectable dotted alias base does not prevent a later owned recipient
     const f = model(['alice.smith@example.com', 'alias@example.com'], { dotAsPlus: true });
     f.patch({ envelope: { from: '', rcpt: [{ value: 'alicesmith.tag@example.com' }] }, to: [{ address: 'alias.service@example.com' }], cc: [] });
     if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
-    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
     expect(prepared.mime.envelope.from).toEqual([{ address: 'alias@example.com', name: 'Sender' }]);
 });
 test.each(['alias+chosen@example.com', 'alias.chosen@example.com'])('explicit sender %s and recipient overrides win, remain editable, and unsupported tagged senders fail before upload', async address => {
     const f = model(['alias@example.com'], { dotAsPlus: true }); f.patch({ envelope: { from: '', rcpt: [{ value: 'sender.service@example.com' }] } });
     if (!f.backend.prepareReply) { throw new Error("Missing reply implementation"); }
-    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply_all', from: { address, name: 'Chosen' }, to: [{ address: 'sender.service@example.com' }], cc: [], body: { text: 'Response' }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply_all', from: { address, name: 'Chosen' }, to: [{ address: 'sender.service@example.com' }], cc: [], body: { text: 'Response' }, quoteOriginal: false, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
     expect(prepared.mime.envelope.from).toEqual([{ address, name: 'Chosen' }]);
     expect(prepared.mime.envelope.to).toEqual([{ address: 'sender.service@example.com' }]);
     const candidate = await f.backend.uploadPreparedDraft(session, prepared); await f.backend.verifyPreparedDraft(session, candidate, prepared);
@@ -810,13 +810,13 @@ test('reply does not select URL-equivalent Unicode domains that WildDuck resolve
     const f = model([], { dotAsPlus: true });
     f.patch({ envelope: { from: '', rcpt: [{ value: 'sender.service@ｅxample.com' }] }, to: [{ address: 'reader@example.net' }], cc: [] });
     if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
-    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
     expect(prepared.mime.envelope.from[0]?.address).toBe('sender@example.com');
 });
 test('reply draft upload stores Unicode response, quote and threading as RFC822 instead of base64 text', async () => {
     const f = model(); f.patch({ subject: 'Original subject', from: [{ address: 'author@example.com' }], replyTo: [{ address: 'help@example.com' }], text: 'Original café 你好 🌍', html: ['<p>Original café 你好 🌍</p>'], references: ['<ancestor@example.com>'] });
     if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
-    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { html: '<p>Response ✓ 日本語</p>' }, quoteOriginal: true, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { html: '<p>Response ✓ 日本語</p>' }, quoteOriginal: true, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
     const key = await f.backend.uploadPreparedDraft(session, prepared); await f.backend.verifyPreparedDraft(session, key, prepared);
     expect(f.source().equals(prepared.mime.raw)).toBe(true);
     expect(f.source().toString()).toContain('In-Reply-To: <test@example.com>'); expect(f.source().toString()).toContain('References: <ancestor@example.com> <test@example.com>');
@@ -828,7 +828,7 @@ test('reply draft upload stores Unicode response, quote and threading as RFC822 
 });
 test.each([['plain', 'Edited reply\n\nC\n'], ['empty', ''], ['wrapped Unicode', 'Edited café 你好 🌍 '.repeat(20)]])('%s reply body update verifies after WildDuck completes the uploaded final line', async (_name, text) => {
     const f = model(); if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
-    const original = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Original reply\n\nC\n' }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    const original = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Original reply\n\nC\n' }, quoteOriginal: false, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
     const key = await f.backend.uploadPreparedDraft(session, original);
     await f.backend.verifyPreparedDraft(session, key, original);
     const before = await f.backend.inspectMessage(session, key);
@@ -894,7 +894,7 @@ test.each([
 ] as const)('create_reply_draft CRLF canonicalisation with quoteOriginal=%p and body %j covers response, text quote and HTML quote', async (quoteOriginal, body, text, html) => {
     const f = model(); f.patch({ text: 'first\r\nsecond\nthird\rfourth', html: ['<p>ignored</p>'], from: [{ address: 'author@example.com' }], replyTo: [{ address: 'help@example.com' }] });
     if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
-    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body, quoteOriginal, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body, quoteOriginal, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
     const key = await f.backend.uploadPreparedDraft(session, prepared); await f.backend.verifyPreparedDraft(session, key, prepared);
     const stored = await parsedMime(f.source()); expect(f.source().equals(prepared.mime.raw)).toBe(true);
     expect(stored.text).toBe(text); expect(stored.html).toEqual([...html]);
@@ -904,7 +904,7 @@ test.each([
 test.each([{ markdown: 'My **reply**' }, { html: '<p>My <b>reply</b></p>' }, { text: 'My reply' }])('quoteOriginal with %j appends the quote after rendering, so Markdown in the original stays literal', async body => {
     const f = model(); f.patch({ text: '# not a heading\n*x* and _y_ <b>tag</b>\n\n- not a list', from: [{ address: 'author@example.com' }], replyTo: [{ address: 'help@example.com' }] });
     if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
-    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body, quoteOriginal: true, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body, quoteOriginal: true, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
     const key = await f.backend.uploadPreparedDraft(session, prepared); await f.backend.verifyPreparedDraft(session, key, prepared);
     const stored = await parsedMime(f.source());
     expect(stored.text).toEndWith('My reply\r\n\r\n> # not a heading\r\n> *x* and _y_ <b>tag</b>\r\n> \r\n> - not a list');
@@ -916,7 +916,7 @@ test.each([{ markdown: 'My **reply**' }, { html: '<p>My <b>reply</b></p>' }, { t
 });
 test.each(lineEndingVariants)('update_draft body patch with %s input in every form is CRLF-only and passes verification after the WildDuck round trip', async (_name, text, html) => {
     const f = model(); if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
-    const original = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Original reply\n' }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    const original = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Original reply\n' }, quoteOriginal: false, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
     const key = await f.backend.uploadPreparedDraft(session, original); await f.backend.verifyPreparedDraft(session, key, original);
     const before = await f.backend.inspectMessage(session, key);
     for (const form of bodyForms(text, html)) {
@@ -1023,7 +1023,7 @@ test.each(e2eCases)('%s: create, header patch, body patch and replies round-trip
     for (const quoteOriginal of [false, true]) {
         const r = model(); r.patch({ subject, text, html: [], from: [{ address: 'author@example.com' }], replyTo: [{ address: 'help@example.com' }] });
         if (!r.backend.prepareReply) { throw new Error('Missing reply implementation'); }
-        const reply = await r.backend.prepareReply(session, { original: target, mode: 'reply', body, quoteOriginal, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+        const reply = await r.backend.prepareReply(session, { original: target, mode: 'reply', body, quoteOriginal, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
         const replyKey = await r.backend.uploadPreparedDraft(session, reply); await r.backend.verifyPreparedDraft(session, replyKey, reply);
         const parts = await checkStored(r, reply, 'Re: ' + subject);
         encodings(parts);
@@ -1074,7 +1074,7 @@ const serviceContext = { ...session, clientId: 'client-one', scopes: ['mail:read
 const posts = (f: ReturnType<typeof model>) => f.calls.filter(call => call.init.method === 'POST');
 test('identical Markdown retry through the service replays the settled result without re-rendering or another upload', async () => {
     const f = model(); const service = createMailService({ reader: f.backend, writer: f.backend, operations: memoryOperations() });
-    const request = { to: [{ address: 'to@example.com' }], cc: [], bcc: [], subject: 'LF retry', body: { markdown: 'one\ntwo\n' }, attachments: [], operation_id: 'lf-retry-operation-01' };
+    const request = { to: [{ address: 'to@example.com' }], cc: [], bcc: [], subject: 'LF retry', body: { markdown: 'one\ntwo\n' }, attachments: [], operationId: 'lf-retry-operation-01' };
     const first = await service.create_draft(serviceContext, request); expect(first.status).toBe('completed');
     const stored = await parsedMime(f.source()); expect(stored.text).toBe('one\r\ntwo'); expect(stored.html).toEqual([`${P}one<br>two</p>`]);
     const calls = f.calls.length;
@@ -1099,12 +1099,12 @@ test.each([
         const stored = await parsedMime(f.source()); expect(stored.text).toBe(text); expect(stored.html).toEqual([...html]);
         expect(structure(f.source())).toEqual(html.length ? ['multipart/alternative', 'text/plain', 'text/html'] : ['text/plain']);
     };
-    const created = await service.create_draft(serviceContext, { to: [{ address: 'to@example.com' }], cc: [], bcc: [], subject: 'Forms', body, attachments: [], operation_id: 'form-create-operation' });
+    const created = await service.create_draft(serviceContext, { to: [{ address: 'to@example.com' }], cc: [], bcc: [], subject: 'Forms', body, attachments: [], operationId: 'form-create-operation' });
     await check(created, 1);
-    const reply = await service.create_reply_draft(serviceContext, { original: target, mode: 'reply', body, quoteOriginal: false, attachments: [], operation_id: 'form-reply-operation' });
+    const reply = await service.create_reply_draft(serviceContext, { original: target, mode: 'reply', body, quoteOriginal: false, attachments: [], operationId: 'form-reply-operation' });
     await check(reply, 2);
     if (reply.status !== 'completed') { throw new Error('expected reply'); }
-    const updated = await service.update_draft(serviceContext, { uid: reply.draft.uid, expected_version: reply.draft.version, body, operation_id: 'form-update-operation' });
+    const updated = await service.update_draft(serviceContext, { uid: reply.draft.uid, expectedVersion: reply.draft.version, body, operationId: 'form-update-operation' });
     await check(updated, 3); expect(f.calls.filter(call => call.init.method === 'DELETE')).toHaveLength(1);
 });
 test.each([
@@ -1112,19 +1112,19 @@ test.each([
     ['generated plain text', { html: `<p>${'x'.repeat(200 * 1024)}</p>` }],
 ])('renderer too_large for %s fails durably in preflight before any upload', async (_name, body) => {
     const f = model(); const service = createMailService({ reader: f.backend, writer: f.backend, operations: memoryOperations() });
-    const request = { to: [{ address: 'to@example.com' }], cc: [], bcc: [], subject: 'Too large', body, attachments: [], operation_id: 'too-large-render-01' };
-    const failed = { status: 'failed', operation_id: request.operation_id, reason: 'too_large' } as const;
+    const request = { to: [{ address: 'to@example.com' }], cc: [], bcc: [], subject: 'Too large', body, attachments: [], operationId: 'too-large-render-01' };
+    const failed = { status: 'failed', operationId: request.operationId, reason: 'too_large' } as const;
     expect(await service.create_draft(serviceContext, request)).toEqual(failed);
     expect(await service.create_draft(serviceContext, structuredClone(request))).toEqual(failed);
-    expect(await service.create_reply_draft(serviceContext, { original: target, mode: 'reply', body, quoteOriginal: true, attachments: [], operation_id: 'too-large-reply-01' })).toEqual({ ...failed, operation_id: 'too-large-reply-01' });
+    expect(await service.create_reply_draft(serviceContext, { original: target, mode: 'reply', body, quoteOriginal: true, attachments: [], operationId: 'too-large-reply-01' })).toEqual({ ...failed, operationId: 'too-large-reply-01' });
     expect(f.calls.every(call => call.init.method === 'GET')).toBe(true);
     // Rendering precedes every upstream read inside preparation: only the service's Drafts lookup ran.
     expect(f.calls.map(call => new URL(call.url).pathname.slice(`/users/${accountId}`.length))).toEqual(['/mailboxes', '/mailboxes']);
     await errorCode(f.backend.prepareCreate(session, { ...content, body }, marker), 'too_large');
-    const created = await service.create_draft(serviceContext, { ...request, body: { text: 'small' }, operation_id: 'too-large-base-01' });
+    const created = await service.create_draft(serviceContext, { ...request, body: { text: 'small' }, operationId: 'too-large-base-01' });
     if (created.status !== 'completed') { throw new Error('expected draft'); }
     const source = f.source(); const before = f.calls.length;
-    expect(await service.update_draft(serviceContext, { uid: created.draft.uid, expected_version: created.draft.version, body, operation_id: 'too-large-update-01' })).toEqual({ ...failed, operation_id: 'too-large-update-01' });
+    expect(await service.update_draft(serviceContext, { uid: created.draft.uid, expectedVersion: created.draft.version, body, operationId: 'too-large-update-01' })).toEqual({ ...failed, operationId: 'too-large-update-01' });
     expect(posts(f)).toHaveLength(1); expect(f.calls.slice(before).every(call => call.init.method === 'GET' && !call.url.endsWith('/message.eml'))).toBe(true); expect(f.source().equals(source)).toBe(true);
 });
 test('failed draft verification logs only the failing check and safe code, and diagnostic failures cannot change its result', async () => {
@@ -1151,7 +1151,7 @@ test.each([['reply', 'reply'], ['reply_all', 'replyAll']] as const)('%s attaches
     f.patch({ draft: false, flags: ['\\Seen'], from: { address: 'author@example.com' }, to: [{ address: 'sender@example.com' }], bcc: [], text: 'Original' });
     const original = structuredClone(f.current());
     if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
-    const prepared = await f.backend.prepareReply(session, { original: target, mode, from: { address: 'alias@other.example' }, body: { text: 'Response' }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+    const prepared = await f.backend.prepareReply(session, { original: target, mode, from: { address: 'alias@other.example' }, body: { text: 'Response' }, quoteOriginal: false, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
     expect(f.current()).toEqual(original); expect(f.calls.every(call => call.init.method === 'GET')).toBe(true);
     const candidate = await f.backend.uploadPreparedDraft(session, prepared); await f.backend.verifyPreparedDraft(session, candidate, prepared);
     const reference = { mailbox: mailboxId, id: target.uid, action };
@@ -1175,7 +1175,7 @@ test.each([['reply', 'reply'], ['reply_all', 'replyAll']] as const)('%s attaches
 test('reply activation rejects missing or changed backend reference metadata', async () => {
     for (const reference of [undefined, { mailbox: mailboxId, id: 99, action: 'reply' }, { mailbox: mailboxId, id: target.uid, action: 'forward' }]) {
         const f = model(); if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
-        const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operation_id: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+        const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
         const candidate = await f.backend.uploadPreparedDraft(session, prepared); f.patch({ reference });
         await errorCode(f.backend.verifyPreparedDraft(session, candidate, prepared), 'verification_failed');
         expect(f.calls.some(call => call.url.endsWith('/submit') || call.init.method === 'PUT')).toBe(false);

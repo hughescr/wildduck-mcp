@@ -52,13 +52,13 @@ async function lifecycleMatrix(store: MailOperationStore): Promise<void> {
     expect(await store.reserve({ ...send, ...key('operation-00000002', 'x'.repeat(43)) }, owner)).toEqual({ kind: 'conflict', reason: 'draft_fenced' });
     const otherAccount = { ...send, ...key('operation-00000003', 'c'.repeat(43), '2'.repeat(24)) };
     const otherClaim = await claim(store, otherAccount);
-    await store.failPreflight(otherClaim, { status: 'failed', operation_id: otherAccount.operationId, reason: 'version_conflict' });
+    await store.failPreflight(otherClaim, { status: 'failed', operationId: otherAccount.operationId, reason: 'version_conflict' });
     await claim(store, { ...otherAccount, operationId: 'operation-00000004' });
     const dispatched = await store.markDispatched(reserved);
     expect(dispatched.revision).toBe(1);
     await expect(store.markDispatched(reserved)).rejects.toThrow('temporarily_unavailable');
-    await expect(store.complete({ ...dispatched, ownerToken: 'forged-owner'.padEnd(43, 'z') }, { status: 'queued', operation_id: send.operationId, queueId: 'queue-1' })).rejects.toThrow('temporarily_unavailable');
-    await store.complete(dispatched, { status: 'queued', operation_id: send.operationId, queueId: 'queue-1' });
+    await expect(store.complete({ ...dispatched, ownerToken: 'forged-owner'.padEnd(43, 'z') }, { status: 'queued', operationId: send.operationId, queueId: 'queue-1' })).rejects.toThrow('temporarily_unavailable');
+    await store.complete(dispatched, { status: 'queued', operationId: send.operationId, queueId: 'queue-1' });
     const queued = await store.getOperation(key());
     expect(queued?.state).toBe('settled');
     if (queued?.state === 'settled') { expect(queued.receipt.status).toBe('queued'); }
@@ -66,46 +66,46 @@ async function lifecycleMatrix(store: MailOperationStore): Promise<void> {
     // A new mailbox/UID is independently writable; old targets never expire.
     const unknown = { ...intent('operation-00000006'), target: { mailboxId, uid: 2 } };
     const pending = await store.markDispatched(await claim(store, unknown));
-    await store.markOutcomeUnknown(pending, { status: 'outcome_unknown', operation_id: unknown.operationId, reason: 'dispatch_uncertain' });
+    await store.markOutcomeUnknown(pending, { status: 'outcome_unknown', operationId: unknown.operationId, reason: 'dispatch_uncertain' });
     expect((await store.reserve(unknown, owner)).kind).toBe('replay');
     expect(await store.reserve({ ...unknown, operationId: 'operation-00000007' }, owner)).toEqual({ kind: 'conflict', reason: 'draft_fenced' });
     const update = { ...intent('operation-00000008', 'update_draft'), target: { mailboxId, uid: 3 } };
     const updating = await store.markDispatched(await claim(store, update));
-    await store.complete(updating, { status: 'partial', operation_id: update.operationId, candidate: { mailboxId, uid: 4, version: digest }, candidateVerified: true, proof: verifiedDraft(4).proof, reason: 'original_deletion_failed', originalDeletion: 'failed' });
+    await store.complete(updating, { status: 'partial', operationId: update.operationId, candidate: { mailboxId, uid: 4, version: digest }, candidateVerified: true, proof: verifiedDraft(4).proof, reason: 'original_deletion_failed', originalDeletion: 'failed' });
     expect(await store.reserve({ ...update, operationId: 'operation-00000009' }, owner)).toEqual({ kind: 'conflict', reason: 'draft_fenced' });
     await claim(store, { ...update, operationId: 'operation-00000010', target: { mailboxId, uid: 4 } });
     const create: WriteIntent = { ...key('operation-00000011'), tool: 'create_draft', payloadDigest: digest };
     const creating = await store.markDispatched(await claim(store, create));
-    await store.complete(creating, { status: 'completed', operation_id: create.operationId, ...verifiedDraft(5) });
+    await store.complete(creating, { status: 'completed', operationId: create.operationId, ...verifiedDraft(5) });
 }
 async function expandedMatrix(store: MailOperationStore): Promise<void> {
     const flags = { ...intent('operation-flags001', 'update_message_flags'), target: { mailboxId, uid: 200 } };
-    await store.complete(await store.markDispatched(await claim(store, flags)), { status: 'completed', operation_id: flags.operationId, ...verifiedMessage(200) });
+    await store.complete(await store.markDispatched(await claim(store, flags)), { status: 'completed', operationId: flags.operationId, ...verifiedMessage(200) });
     const replay = await store.reserve(flags, owner);
     expect(replay.kind).toBe('replay');
-    if (replay.kind === 'replay' && replay.record.state === 'settled') { expect(replay.record.receipt).toEqual({ status: 'completed', operation_id: flags.operationId, ...verifiedMessage(200) }); }
+    if (replay.kind === 'replay' && replay.record.state === 'settled') { expect(replay.record.receipt).toEqual({ status: 'completed', operationId: flags.operationId, ...verifiedMessage(200) }); }
     const move = { ...flags, operationId: 'operation-move0001', tool: 'move_message' as const };
     const destination = 'b'.repeat(24);
-    await store.complete(await store.markDispatched(await claim(store, move)), { status: 'completed', operation_id: move.operationId, ...verifiedMessage(201, destination) });
+    await store.complete(await store.markDispatched(await claim(store, move)), { status: 'completed', operationId: move.operationId, ...verifiedMessage(201, destination) });
     expect(await store.reserve({ ...flags, operationId: 'operation-flags002' }, owner)).toEqual({ kind: 'conflict', reason: 'draft_fenced' });
     await claim(store, { ...flags, operationId: 'operation-flags003', target: { mailboxId: destination, uid: 201 } });
     const unknownFlags = { ...flags, operationId: 'operation-flags004', target: { mailboxId, uid: 202 } };
-    await store.markOutcomeUnknown(await store.markDispatched(await claim(store, unknownFlags)), { status: 'outcome_unknown', operation_id: unknownFlags.operationId, reason: 'dispatch_uncertain' });
+    await store.markOutcomeUnknown(await store.markDispatched(await claim(store, unknownFlags)), { status: 'outcome_unknown', operationId: unknownFlags.operationId, reason: 'dispatch_uncertain' });
     expect(await store.reserve({ ...unknownFlags, operationId: 'operation-flags005' }, owner)).toEqual({ kind: 'conflict', reason: 'draft_fenced' });
     const unverified = { ...intent('operation-partial01', 'update_draft'), target: { mailboxId, uid: 203 } };
-    await store.complete(await store.markDispatched(await claim(store, unverified)), { status: 'partial', operation_id: unverified.operationId, candidate: { mailboxId, uid: 204 }, candidateVerified: false, reason: 'candidate_verification_failed', originalDeletion: 'not_attempted' });
+    await store.complete(await store.markDispatched(await claim(store, unverified)), { status: 'partial', operationId: unverified.operationId, candidate: { mailboxId, uid: 204 }, candidateVerified: false, reason: 'candidate_verification_failed', originalDeletion: 'not_attempted' });
     expect(await store.reserve({ ...unverified, operationId: 'operation-partial02' }, owner)).toEqual({ kind: 'conflict', reason: 'draft_fenced' });
     const stale = { ...intent('operation-partial03', 'update_draft'), target: { mailboxId, uid: 205 } };
-    const receipt = { status: 'partial' as const, operation_id: stale.operationId, candidate: verifiedDraft(206).draft, candidateVerified: true as const, proof: verifiedDraft(206).proof, reason: 'original_version_changed' as const, originalDeletion: 'not_attempted' as const };
+    const receipt = { status: 'partial' as const, operationId: stale.operationId, candidate: verifiedDraft(206).draft, candidateVerified: true as const, proof: verifiedDraft(206).proof, reason: 'original_version_changed' as const, originalDeletion: 'not_attempted' as const };
     await store.complete(await store.markDispatched(await claim(store, stale)), receipt);
     const staleReplay = await store.getOperation(key(stale.operationId));
     expect(staleReplay?.state).toBe('settled'); if (staleReplay?.state === 'settled') { expect(staleReplay.receipt).toEqual(receipt); }
     expect(await store.reserve({ ...stale, operationId: 'operation-partial04' }, owner)).toEqual({ kind: 'conflict', reason: 'draft_fenced' });
     const sending = { ...intent('operation-send-sent'), target: { mailboxId, uid: 207 } };
     const sent = { mailboxId: destination, uid: 208 };
-    await store.complete(await store.markDispatched(await claim(store, sending)), { status: 'queued', operation_id: sending.operationId, queueId: 'actual-queue', sent });
+    await store.complete(await store.markDispatched(await claim(store, sending)), { status: 'queued', operationId: sending.operationId, queueId: 'actual-queue', sent });
     const sentRecord = await store.getOperation(key(sending.operationId));
-    if (sentRecord?.state === 'settled') { expect(sentRecord.receipt).toEqual({ status: 'queued', operation_id: sending.operationId, queueId: 'actual-queue', sent }); } else { throw new Error('missing send receipt'); }
+    if (sentRecord?.state === 'settled') { expect(sentRecord.receipt).toEqual({ status: 'queued', operationId: sending.operationId, queueId: 'actual-queue', sent }); } else { throw new Error('missing send receipt'); }
 }
 async function provenanceMatrix(store: MailOperationStore): Promise<void> {
     let uid = 300;
@@ -114,7 +114,7 @@ async function provenanceMatrix(store: MailOperationStore): Promise<void> {
             const operationId = `operation-provenance${uid}`;
             const value = { ...intent(operationId, tool), target: { mailboxId, uid } };
             const message = verifiedMessage(uid, tool === 'move_message' ? 'b'.repeat(24) : mailboxId, grade);
-            const receipt = { status: 'completed' as const, operation_id: operationId, ...message };
+            const receipt = { status: 'completed' as const, operationId, ...message };
             await store.complete(await store.markDispatched(await claim(store, value)), receipt);
             const stored = await store.getOperation(key(operationId));
             expect(stored?.state).toBe('settled');
@@ -163,7 +163,7 @@ describe('Dynamo mail operation adapter', () => {
         client.beforeTransaction = () => { const data = guard[1].record as Record<string, unknown>; data.ownerToken = 'changed-owner'.padEnd(43, 'x'); };
         await expect(store.markDispatched(reserved)).rejects.toThrow('temporarily_unavailable');
         expect((await store.getOperation(key()))?.state).toBe('reserved');
-        await expect(store.failPreflight(reserved, { status: 'failed', operation_id: key().operationId, reason: 'forbidden' })).rejects.toThrow('temporarily_unavailable');
+        await expect(store.failPreflight(reserved, { status: 'failed', operationId: key().operationId, reason: 'forbidden' })).rejects.toThrow('temporarily_unavailable');
         expect(client.records.has(guard[0])).toBe(true);
     });
     test('malformed keys, intent, persisted fields and receipt mismatches fail closed before transaction', async () => {
@@ -174,8 +174,8 @@ describe('Dynamo mail operation adapter', () => {
         expect(client.calls).toHaveLength(0);
         const reserved = await claim(store, intent()); const dispatched = await store.markDispatched(reserved);
         const count = client.calls.filter(command => command instanceof TransactWriteCommand).length;
-        await expect(store.complete(dispatched, { status: 'queued', operation_id: 'operation-other000', queueId: 'queue' })).rejects.toThrow('temporarily_unavailable');
-        await expect(store.complete(dispatched, { status: 'completed', operation_id: key().operationId, ...verifiedDraft(1) })).rejects.toThrow('temporarily_unavailable');
+        await expect(store.complete(dispatched, { status: 'queued', operationId: 'operation-other000', queueId: 'queue' })).rejects.toThrow('temporarily_unavailable');
+        await expect(store.complete(dispatched, { status: 'completed', operationId: key().operationId, ...verifiedDraft(1) })).rejects.toThrow('temporarily_unavailable');
         expect(client.calls.filter(command => command instanceof TransactWriteCommand)).toHaveLength(count);
         const stored = [...client.records.values()].find(value => String(value.pk).includes('#mail-operation#'));
         if (!stored) { throw new Error('missing operation'); } stored.expiresAt = 1;
@@ -183,8 +183,8 @@ describe('Dynamo mail operation adapter', () => {
     });
     test('invalid partial replacement receipts cannot commit; dispatch cannot be released as preflight failure', async () => {
         const { store } = fixture(); const updating = await store.markDispatched(await claim(store, intent('operation-00000001', 'update_draft')));
-        await expect(store.complete(updating, { status: 'completed', operation_id: key().operationId, ...verifiedDraft(2), previousDeleted: false } as unknown as ConfirmedReceipt)).rejects.toThrow('temporarily_unavailable');
-        await expect(store.failPreflight({ ...updating, state: 'reserved' }, { status: 'failed', operation_id: key().operationId, reason: 'forbidden' })).rejects.toThrow('temporarily_unavailable');
+        await expect(store.complete(updating, { status: 'completed', operationId: key().operationId, ...verifiedDraft(2), previousDeleted: false } as unknown as ConfirmedReceipt)).rejects.toThrow('temporarily_unavailable');
+        await expect(store.failPreflight({ ...updating, state: 'reserved' }, { status: 'failed', operationId: key().operationId, reason: 'forbidden' })).rejects.toThrow('temporarily_unavailable');
     });
     test('a committed reservation with persistently lost acknowledgements never grants dispatch permission', async () => {
         const { client, store } = fixture(); client.fault = 'lost_persistent';
@@ -197,14 +197,14 @@ describe('Dynamo mail operation adapter', () => {
     });
     test('delete receipts bind the exact target and successful deletion permanently retires its UID', async () => {
         const { store } = fixture(); const deleting = await store.markDispatched(await claim(store, intent('operation-00000001', 'delete_draft')));
-        await expect(store.complete(deleting, { status: 'completed', operation_id: key().operationId, deleted: { mailboxId, uid: 2 } })).rejects.toThrow('temporarily_unavailable');
-        await store.complete(deleting, { status: 'completed', operation_id: key().operationId, deleted: { mailboxId, uid: 1 } });
+        await expect(store.complete(deleting, { status: 'completed', operationId: key().operationId, deleted: { mailboxId, uid: 2 } })).rejects.toThrow('temporarily_unavailable');
+        await store.complete(deleting, { status: 'completed', operationId: key().operationId, deleted: { mailboxId, uid: 1 } });
         expect(await store.reserve(intent('operation-00000002'), owner)).toEqual({ kind: 'conflict', reason: 'draft_fenced' });
     });
     test('flag completion atomically releases guard, survives a lost response and never releases a subsequent owner on replay', async () => {
         const { client, store } = fixture(); const value = intent('operation-flags001', 'update_message_flags');
         const dispatched = await store.markDispatched(await claim(store, value)); client.fault = 'lost_once';
-        await store.complete(dispatched, { status: 'completed', operation_id: value.operationId, ...verifiedMessage(1) });
+        await store.complete(dispatched, { status: 'completed', operationId: value.operationId, ...verifiedMessage(1) });
         const writes = client.calls.filter(command => command instanceof TransactWriteCommand);
         expect(writes.at(-1)).toBe(writes.at(-2));
         expect(writes.at(-1)?.input.TransactItems?.[1]?.Delete).toBeDefined();
@@ -222,7 +222,7 @@ describe('Dynamo mail operation adapter', () => {
         const guard = [...client.records.values()].find(row => String(row.pk).includes('#mail-guard#'));
         if (!guard) { throw new Error('missing guard'); }
         client.beforeTransaction = () => { (guard.record as { revision: number }).revision++; };
-        await expect(store.complete(dispatched, { status: 'completed', operation_id: value.operationId, ...verifiedMessage(1) })).rejects.toThrow('temporarily_unavailable');
+        await expect(store.complete(dispatched, { status: 'completed', operationId: value.operationId, ...verifiedMessage(1) })).rejects.toThrow('temporarily_unavailable');
         expect((await store.getOperation(key(value.operationId)))?.state).toBe('dispatched');
         expect(client.records.has(String(guard.pk))).toBe(true);
     });
@@ -230,14 +230,14 @@ describe('Dynamo mail operation adapter', () => {
         for (const tool of ['update_message_flags', 'move_message', 'update_draft'] as const) {
             const { client, store } = fixture(); const value = intent('operation-invalid001', tool);
             const dispatched = await store.markDispatched(await claim(store, value));
-            const valid = tool === 'update_draft' ? { status: 'completed', operation_id: value.operationId, ...verifiedDraft(2), previousDeleted: true } : { status: 'completed', operation_id: value.operationId, ...verifiedMessage(tool === 'move_message' ? 2 : 1, tool === 'move_message' ? 'b'.repeat(24) : mailboxId) };
+            const valid = tool === 'update_draft' ? { status: 'completed', operationId: value.operationId, ...verifiedDraft(2), previousDeleted: true } : { status: 'completed', operationId: value.operationId, ...verifiedMessage(tool === 'move_message' ? 2 : 1, tool === 'move_message' ? 'b'.repeat(24) : mailboxId) };
             const count = client.calls.filter(command => command instanceof TransactWriteCommand).length;
             await expect(store.complete(dispatched, { ...valid, proof: { ...valid.proof, accountId: 'f'.repeat(24) } } as ConfirmedReceipt)).rejects.toThrow('temporarily_unavailable');
             if (tool === 'update_message_flags') {
-                await expect(store.complete(dispatched, { status: 'completed', operation_id: value.operationId, ...verifiedMessage(2) })).rejects.toThrow('temporarily_unavailable');
+                await expect(store.complete(dispatched, { status: 'completed', operationId: value.operationId, ...verifiedMessage(2) })).rejects.toThrow('temporarily_unavailable');
                 await expect(store.complete(dispatched, { ...valid, labels: ['private-label'] } as unknown as ConfirmedReceipt)).rejects.toThrow('temporarily_unavailable');
             }
-            if (tool === 'move_message') { await expect(store.complete(dispatched, { status: 'completed', operation_id: value.operationId, ...verifiedMessage(2) })).rejects.toThrow('temporarily_unavailable'); }
+            if (tool === 'move_message') { await expect(store.complete(dispatched, { status: 'completed', operationId: value.operationId, ...verifiedMessage(2) })).rejects.toThrow('temporarily_unavailable'); }
             expect(client.calls.filter(command => command instanceof TransactWriteCommand)).toHaveLength(count);
         }
     });
@@ -246,14 +246,14 @@ describe('Dynamo mail operation adapter', () => {
             const { client, store } = fixture();
             const value: WriteIntent = tool === 'create_draft' ? { ...key(), tool, payloadDigest: digest } : intent(key().operationId, tool);
             const dispatched = await store.markDispatched(await claim(store, value));
-            const valid = { status: 'completed' as const, operation_id: value.operationId, ...verifiedDraft(2), ...(tool === 'update_draft' ? { previousDeleted: true as const } : {}) };
+            const valid = { status: 'completed' as const, operationId: value.operationId, ...verifiedDraft(2), ...(tool === 'update_draft' ? { previousDeleted: true as const } : {}) };
             const writes = client.calls.filter(command => command instanceof TransactWriteCommand).length;
             const { sourceGrade: _grade, ...missingGrade } = valid.proof;
             for (const proof of [missingGrade, { ...valid.proof, sourceGrade: 'observed' }, { ...valid.proof, sourceGrade: 'invented_grade' }]) {
                 await expect(store.complete(dispatched, { ...valid, proof } as unknown as ConfirmedReceipt)).rejects.toThrow('temporarily_unavailable');
             }
             if (tool === 'update_draft') {
-                await expect(store.complete(dispatched, { status: 'partial', operation_id: value.operationId, candidate: verifiedDraft(2).draft, candidateVerified: true, proof: { ...valid.proof, sourceGrade: 'observed' }, reason: 'original_deletion_failed', originalDeletion: 'failed' } as unknown as ConfirmedReceipt)).rejects.toThrow('temporarily_unavailable');
+                await expect(store.complete(dispatched, { status: 'partial', operationId: value.operationId, candidate: verifiedDraft(2).draft, candidateVerified: true, proof: { ...valid.proof, sourceGrade: 'observed' }, reason: 'original_deletion_failed', originalDeletion: 'failed' } as unknown as ConfirmedReceipt)).rejects.toThrow('temporarily_unavailable');
             }
             expect(client.calls.filter(command => command instanceof TransactWriteCommand)).toHaveLength(writes);
             await store.complete(dispatched, valid as ConfirmedReceipt);
@@ -264,7 +264,7 @@ describe('Dynamo mail operation adapter', () => {
     });
     test('persisted proof without a provenance grade fails closed rather than migrating to authored', async () => {
         const { client, store } = fixture(); const value = intent('operation-provenance1', 'update_message_flags');
-        await store.complete(await store.markDispatched(await claim(store, value)), { status: 'completed', operation_id: value.operationId, ...verifiedMessage(1) });
+        await store.complete(await store.markDispatched(await claim(store, value)), { status: 'completed', operationId: value.operationId, ...verifiedMessage(1) });
         const row = [...client.records.values()].find(record => String(record.pk).includes('#mail-operation#'));
         if (!row) { throw new Error('missing operation'); }
         const record = row.record as { receipt: { proof: Record<string, unknown> } };
@@ -310,8 +310,54 @@ test('reply draft ledger reserves without original guard and validates authored 
     const reservation = await f.store.reserve(value, owner); expect(reservation.kind).toBe('acquired'); if (reservation.kind !== 'acquired') { throw new Error('expected acquisition'); }
     expect(f.client.records.size).toBe(1);
     const dispatched = await f.store.markDispatched(reservation.claim);
-    await expect(f.store.complete(dispatched, { status: 'completed', operation_id: value.operationId, ...verifiedDraft(9), proof: { ...verifiedDraft(9).proof, sourceGrade: 'observed' } } as unknown as ConfirmedReceipt)).rejects.toThrow('temporarily_unavailable');
-    const receipt = { status: 'completed' as const, operation_id: value.operationId, ...verifiedDraft(9) }; await f.store.complete(dispatched, receipt);
+    await expect(f.store.complete(dispatched, { status: 'completed', operationId: value.operationId, ...verifiedDraft(9), proof: { ...verifiedDraft(9).proof, sourceGrade: 'observed' } } as unknown as ConfirmedReceipt)).rejects.toThrow('temporarily_unavailable');
+    const receipt = { status: 'completed' as const, operationId: value.operationId, ...verifiedDraft(9) }; await f.store.complete(dispatched, receipt);
     expect(await f.store.getOperation(key())).toMatchObject({ state: 'settled', receipt }); expect((await f.store.reserve(value, owner)).kind).toBe('replay');
     expect(await f.store.reserve({ ...value, payloadDigest: 'e'.repeat(43) }, owner)).toEqual({ kind: 'conflict', reason: 'operation_conflict' }); expect(f.client.records.size).toBe(1);
+});
+
+describe('receipts stored by 0.6.x', () => {
+    const operationPk = (value: OperationKey) => `wildduck-mcp#mail-operation#${value.accountId}#${value.clientIdHash}#${value.operationId}`;
+    /** The exact item shape 0.6.x wrote: receipts carry operation_id. */
+    const seed = (client: ModelSender, value: WriteIntent, receipt: Record<string, unknown>) => {
+        const pk = operationPk(value); const record = { key: key(value.operationId), intent: value, ownerToken: owner, revision: 2, state: 'settled', receipt };
+        client.records.set(pk, { pk, sk: 'STATE', record });
+    };
+    const create = (operationId: string): WriteIntent => ({ ...key(operationId), tool: 'create_draft', payloadDigest: digest });
+    const legacy: [WriteIntent, Record<string, unknown>][] = [
+        [intent('operation-legacy-send'), { status: 'queued', operation_id: 'operation-legacy-send', queueId: 'queue-0-6' }],
+        [create('operation-legacy-create'), { status: 'completed', operation_id: 'operation-legacy-create', ...verifiedDraft(7) }],
+        [create('operation-legacy-partial'), { status: 'partial', operation_id: 'operation-legacy-partial', candidate: { mailboxId, uid: 8 }, candidateVerified: false, reason: 'candidate_verification_failed', originalDeletion: 'not_attempted' }],
+        [{ ...intent('operation-legacy-update', 'update_draft'), target: { mailboxId, uid: 9 } }, { status: 'partial', operation_id: 'operation-legacy-update', candidate: verifiedDraft(10).draft, candidateVerified: true, proof: verifiedDraft(10).proof, reason: 'original_deletion_unconfirmed', originalDeletion: 'unconfirmed' }],
+        [{ ...intent('operation-legacy-flags', 'update_message_flags'), target: { mailboxId, uid: 11 } }, { status: 'completed', operation_id: 'operation-legacy-flags', ...verifiedMessage(11) }],
+        [{ ...intent('operation-legacy-delete', 'delete_draft'), target: { mailboxId, uid: 12 } }, { status: 'completed', operation_id: 'operation-legacy-delete', deleted: { mailboxId, uid: 12 } }],
+        [intent('operation-legacy-failed'), { status: 'failed', operation_id: 'operation-legacy-failed', reason: 'version_conflict' }],
+        [intent('operation-legacy-unknown'), { status: 'outcome_unknown', operation_id: 'operation-legacy-unknown', reason: 'dispatch_uncertain' }],
+    ];
+    test('read back and replay with operationId, and validate against the current output schemas', async () => {
+        const f = fixture();
+        for (const [value, receipt] of legacy) {
+            seed(f.client, value, receipt);
+            const { operation_id: stored, ...rest } = receipt; const expected = { ...rest, operationId: stored };
+            const record = await f.store.getOperation(key(value.operationId));
+            expect(record?.state).toBe('settled'); if (record?.state !== 'settled') { throw new Error('expected settled record'); }
+            expect(record.receipt).toEqual(expected as never); expect(record.receipt).not.toHaveProperty('operation_id');
+            const replay = await f.store.reserve(value, owner);
+            expect(replay.kind).toBe('replay'); if (replay.kind === 'replay' && replay.record.state === 'settled') { expect(replay.record.receipt).toEqual(expected as never); }
+        }
+    });
+    test('new receipts are stored in the same 0.6.x shape, so a rollback can still read them', async () => {
+        const f = fixture(); const value = intent('operation-current-send');
+        await f.store.complete(await f.store.markDispatched(await claim(f.store, value)), { status: 'queued', operationId: value.operationId, queueId: 'queue-0-7' });
+        expect((f.client.records.get(operationPk(value))?.['record'] as { receipt?: unknown } | undefined)?.receipt).toEqual({ status: 'queued', operation_id: value.operationId, queueId: 'queue-0-7' });
+        const record = await f.store.getOperation(key(value.operationId)); if (record?.state !== 'settled') { throw new Error('expected settled record'); }
+        expect(record.receipt).toEqual({ status: 'queued', operationId: value.operationId, queueId: 'queue-0-7' });
+    });
+    test('a stored receipt carrying both names, or a mismatched id, is refused', async () => {
+        const f = fixture(); const value = intent('operation-legacy-both'); const other = intent('operation-legacy-other');
+        seed(f.client, value, { status: 'queued', operation_id: value.operationId, operationId: value.operationId, queueId: 'queue' });
+        seed(f.client, other, { status: 'queued', operation_id: 'operation-legacy-xxxx', queueId: 'queue' });
+        await expect(f.store.getOperation(key(value.operationId))).rejects.toThrow('temporarily_unavailable');
+        await expect(f.store.getOperation(key(other.operationId))).rejects.toThrow('temporarily_unavailable');
+    });
 });
