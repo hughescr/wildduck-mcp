@@ -1,7 +1,7 @@
 import type { ConnectionStatus } from '../auth/contracts';
 import type { PreparedMime } from './mime';
-import type { CanonicalReadMessage, ConfirmedReceipt, DraftContent, DraftPatch, FailedReceipt, MailFailureCode, Mailbox, MailInput, MailInputRaw, MailOperationMarker, MailOutput, MailReceipt, MailToolName, MailWriteTool, MessageKey, MessageRef, SourceGrade, UnknownReceipt } from './schemas';
-export type { ActivationProof, AttachmentMetadata, CanonicalReadMessage, CompletedReceipt, ConfirmedReceipt, DraftAddress, DraftContent, DraftPatch, DraftRef, FailedReceipt, MailAddress, Mailbox, MailFailureCode, MailInput, MailInputRaw, MailOperationMarker, MailOutput, MailReceipt, MailToolName, MailWriteTool, MessageFlags, MessageKey, MessageRef, MessageSummary, NewAttachment, PartialReceipt, SourceGrade, UnknownReceipt } from './schemas';
+import type { AttachmentUploadRequest, CanonicalReadMessage, ConfirmedReceipt, DraftContent, DraftPatch, FailedReceipt, MailFailureCode, Mailbox, MailInput, MailInputRaw, MailOperationMarker, MailOutput, MailReceipt, MailToolName, MailWriteTool, MessageKey, MessageRef, SourceGrade, UnknownReceipt } from './schemas';
+export type { ActivationProof, AttachmentMetadata, AttachmentSource, AttachmentUploadRequest, Base64Attachment, CanonicalReadMessage, CompletedReceipt, ConfirmedReceipt, DraftAddress, DraftContent, DraftPatch, DraftRef, FailedReceipt, MailAddress, Mailbox, MailFailureCode, MailInput, MailInputRaw, MailOperationMarker, MailOutput, MailReceipt, MailToolName, MailWriteTool, MessageFlags, MessageKey, MessageRef, MessageSummary, NewAttachment, PartialReceipt, SourceAttachment, SourceGrade, UnknownReceipt, UploadAttachment } from './schemas';
 
 export const searchFailureCauses = ['deadline', 'network', 'http_status', 'invalid_json', 'invalid_shape', 'mailbox_scope_mismatch', 'too_large'] as const;
 export type SearchFailureCause = typeof searchFailureCauses[number];
@@ -16,6 +16,12 @@ export class MailError extends Error {
 export const MAIL_OPERATION_METADATA_KEY = 'wildduckMcpOperationV1';
 /** Request-local identity; never derive account/token from tool arguments. */
 export interface BackendMailSession { readonly accountId: string; readonly accessToken: string }
+/** The session the service passes to prepareCreate/prepareReply/prepareUpdate. clientIdHash is
+ * digest(context.clientId), the same value as OperationKey.clientIdHash, set only by the service
+ * from the verified OAuth grant, never from tool arguments. The backend uses it only to look up
+ * upload records, which are bound to account AND client; it must refuse uploadId attachments
+ * when it is absent or malformed (43 base64url characters). */
+export interface DraftMailSession extends BackendMailSession { readonly clientIdHash: string }
 export interface MailContext extends BackendMailSession {
     readonly clientId: string; readonly scopes: readonly string[]; readonly connectionStatus: ConnectionStatus;
 }
@@ -24,6 +30,53 @@ export interface ReadMessageResult { readonly message: CanonicalReadMessage; rea
 export interface AttachmentDownload { readonly metadata: MailOutput<'read_attachment'>; readonly bytes: Uint8Array }
 /** Signed URL travels separately and is serialized only as resource_link.uri. */
 export interface AttachmentDownloadLink { readonly metadata: MailOutput<'get_attachment_download'>; readonly url: string }
+/** create_attachment_upload's service result (attachmentUploadLinkSchema). The presigned upload URL
+ * travels separately and is serialized only as resource_link.uri; metadata carries no summary. */
+export interface AttachmentUploadLink { readonly metadata: Omit<MailOutput<'create_attachment_upload'>, 'summary'>; readonly url: string }
+/** One attachment ready for MIME composition, whichever source it came from (contentBase64,
+ * uploadId or source). The backend builds it during preflight (prepareCreate/prepareReply/
+ * prepareUpdate, before the service marks the operation dispatched): bytes decoded, fetched and
+ * verified; filename and contentType final (the caller's, else the source attachment's, and then
+ * checked by the same authored rules as the schema, failing with invalid_input); disposition and
+ * cid always the caller's. mime.ts composes from this type and enforces the byte rules the schema
+ * cannot (message/rfc822 CRLF, MAX_MESSAGE_BYTES). */
+export interface ResolvedAttachment { readonly filename: string; readonly contentType: string; readonly bytes: Uint8Array; readonly disposition: 'attachment' | 'inline'; readonly cid?: string | undefined }
+/** S3 key prefix of staged uploads; objectKey is this prefix plus the uploadId. The key carries no
+ * account, client or file name, and the bucket's lifecycle rule for this prefix removes objects. */
+export const ATTACHMENT_UPLOAD_KEY_PREFIX = 'uploads/v1/';
+/** Who may use an upload: the account AND the OAuth client that staged it. */
+export interface AttachmentUploadOwner { readonly accountId: string; readonly clientIdHash: string }
+/** Immutable after creation. Digest-pinned: the bytes used are exactly sizeBytes long with this
+ * SHA-256 (lowercase hex). Reusable by any number of drafts until expiresAt and never deleted on
+ * use; S3 lifecycle and the store's TTL remove it later. */
+export interface AttachmentUploadRecord extends AttachmentUploadOwner {
+    readonly uploadId: string; readonly sizeBytes: number; readonly sha256: string; readonly objectKey: string;
+    /** Epoch seconds: creation + UPLOAD_TTL_SECONDS. */
+    readonly expiresAt: number;
+}
+/** Upload records, beside the operation ledger. Unknown, expired, foreign-account and
+ * foreign-client ids are indistinguishable to every caller: all are simply absent (not_found).
+ * Ambiguous DB outcomes throw sanitized MailError('temporarily_unavailable'). */
+export interface AttachmentUploadStore {
+    /** One conditional write that never overwrites (an existing key throws temporarily_unavailable). */
+    createUpload(record: AttachmentUploadRecord): Promise<void>;
+    /** One strongly consistent batch read of all ids an operation names, keyed by uploadId. Returns
+     * only records whose accountId and clientIdHash equal owner and whose expiresAt is still in the
+     * future (TTL deletion is lazy, so expired items must be filtered here). */
+    getUploads(owner: AttachmentUploadOwner, uploadIds: readonly string[]): Promise<ReadonlyMap<string, AttachmentUploadRecord>>;
+}
+/** A presigned upload for one record. expiresAt (ISO) is never later than the record's expiry; it
+ * is earlier when signing credentials expire first. The URL is a bearer credential: never log or
+ * persist it. method/headers follow attachmentUploadRequestSchema. */
+export type PresignedAttachmentUpload = AttachmentUploadRequest & { readonly url: string; readonly expiresAt: string };
+export interface AttachmentUploadStager {
+    /** Sign a transfer of exactly record.sizeBytes bytes with record.sha256 to record.objectKey. */
+    presign(record: AttachmentUploadRecord): Promise<PresignedAttachmentUpload>;
+    /** The staged object's bytes, read only up to maxBytes (too_large when record.sizeBytes exceeds
+     * it) and aborted with signal. Length or SHA-256 different from the record: verification_failed.
+     * No object (not uploaded yet, or already removed): not_found. */
+    readStaged(record: AttachmentUploadRecord, options: { readonly maxBytes: number; readonly signal: AbortSignal }): Promise<Uint8Array>;
+}
 export interface MailBackendReader {
     listMailboxes(session: BackendMailSession): Promise<MailOutput<'list_mailboxes'>>;
     listMessages(session: BackendMailSession, input: MailInput<'list_messages'>): Promise<MailOutput<'list_messages'>>;
@@ -76,10 +129,16 @@ export interface MailBackendWriter {
      * within the request; send stamping must consume this verified source. */
     verifyAuthoredSource(session: BackendMailSession, snapshot: MessageSnapshot, source: AuthoredSourceDescriptor): Promise<void>;
     /** Read/validate/compose completely BEFORE markDispatched. Pick owned default
-     * From when omitted. Patch omissions preserve exact existing MIME and files. */
-    prepareReply?(session: BackendMailSession, input: MailInput<'create_reply_draft'>, marker: MailOperationMarker): Promise<PreparedDraft>;
-    prepareCreate(session: BackendMailSession, input: DraftContent, marker: MailOperationMarker): Promise<PreparedDraft>;
-    prepareUpdate(session: BackendMailSession, snapshot: MessageSnapshot, patch: DraftPatch, marker: MailOperationMarker, source: AuthoredSourceDescriptor): Promise<PreparedDraft>;
+     * From when omitted. Patch omissions preserve exact existing MIME and files.
+     * Attachments: resolve every source to a ResolvedAttachment here, in preflight. uploadId: one
+     * getUploads batch for (session.accountId, session.clientIdHash), then readStaged; a missing
+     * record is not_found, other bytes verification_failed. source: read that attachment of that
+     * account message (the service has already required mail:read). The payload digest covers only
+     * the references, which is sound because an upload's bytes are pinned by its record and a
+     * message's attachments never change under the same mailbox/uid. */
+    prepareReply?(session: DraftMailSession, input: MailInput<'create_reply_draft'>, marker: MailOperationMarker): Promise<PreparedDraft>;
+    prepareCreate(session: DraftMailSession, input: DraftContent, marker: MailOperationMarker): Promise<PreparedDraft>;
+    prepareUpdate(session: DraftMailSession, snapshot: MessageSnapshot, patch: DraftPatch, marker: MailOperationMarker, source: AuthoredSourceDescriptor): Promise<PreparedDraft>;
     /** Single raw upload WITH marker before visibility; NEVER replacePrevious. */
     uploadPreparedDraft(session: BackendMailSession, prepared: PreparedDraft): Promise<MessageKey>;
     /** Compare source bytes exactly against trusted prepared MIME and verify API-
@@ -164,8 +223,10 @@ export interface MailOperationStore {
  * drafts mail:draft, send mail:send, move/flags mail:modify. Every mutation checks
  * private marker -> durable original operation -> exact target activation proof,
  * except its own staged verification. Unactivated candidates never become sendable.
- * Public writes always pass this coordinator; no raw writer reaches MCP. */
-export type MailResult<Name extends MailToolName> = Name extends 'read_attachment' ? AttachmentDownload : Name extends 'get_attachment_download' ? AttachmentDownloadLink : MailOutput<Name>;
+ * Public writes always pass this coordinator; no raw writer reaches MCP.
+ * Drafts whose attachments use source also need mail:read. create_attachment_upload needs
+ * mail:draft and is not a write tool: no operationId, no ledger, a new record per call. */
+export type MailResult<Name extends MailToolName> = Name extends 'read_attachment' ? AttachmentDownload : Name extends 'get_attachment_download' ? AttachmentDownloadLink : Name extends 'create_attachment_upload' ? AttachmentUploadLink : MailOutput<Name>;
 export type MailService = { [Name in MailToolName]: (context: MailContext, input: Name extends 'search_messages' ? MailInputRaw<Name> : MailInput<Name>) => Promise<MailResult<Name>> };
 export type BoundMailService = { [Name in MailToolName]: (input: MailInput<Name>) => Promise<MailResult<Name>> };
 export type MailWriteCoordinator = Pick<MailService, MailWriteTool>;

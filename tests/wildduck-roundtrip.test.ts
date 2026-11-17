@@ -38,7 +38,7 @@ async function stored(raw: Buffer): Promise<{ rebuilt: Buffer; subject: string; 
 }
 
 const base: MimeCreate = { from: { address: 'sender@example.test', name: 'Zoë Sender' }, to: [{ address: 'to@example.test', name: '日本語のお名前' }], cc: [{ address: 'cc@example.test', name: 'Smith, John "JJ"' }], bcc: [], subject: 'Plain subject', body: { text: 'Hello\n', html: null } };
-const file = (filename: string, over: Partial<MimeAttachment> = {}): MimeAttachment => ({ filename, contentType: 'application/pdf', contentBase64: Buffer.from('%PDF-1.7 ' + filename).toString('base64'), disposition: 'attachment', ...over });
+const file = (filename: string, over: Partial<MimeAttachment> = {}): MimeAttachment => ({ filename, contentType: 'application/pdf', bytes: Buffer.from('%PDF-1.7 ' + filename), disposition: 'attachment', ...over });
 const SUBJECTS = { plain: 'Plain subject', latin: 'Résumé café, déjà vu', cjk: '新しい件名です', folded: 'A long subject that the library folds at the spaces between its words '.repeat(4).trim() };
 const BODIES = {
     '7bit': 'Hello there,\nplain ASCII text.\n',

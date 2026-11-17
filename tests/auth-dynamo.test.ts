@@ -1,14 +1,23 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { GetCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import { DynamoAtomicStore } from '../src/auth/dynamo-store';
 import type { AtomicWrite, Connection } from '../src/auth/contracts';
-const connection = (id = 'conn', revision = 0): Connection => ({ kind: 'connection', id, revision, expiresAt: 2000000000, accountId: 'account', credentialGeneration: 0, status: 'active', credentials: { keyId: 'v1', nonce: 'a'.repeat(16), tag: 'a'.repeat(22), ciphertext: 'abc' } });
+import { remainingRequestTimeMs, withRequestBudget } from '../src/request-budget';
+import { cancelled, captureWarnings, throttleError, virtualRetry } from './dynamo-virtual';
+let logs: Record<string, unknown>[] = [];
+let restoreWarnings = () => {};
+beforeEach(() => { const captured = captureWarnings(); logs = captured.lines; restoreWarnings = captured.restore; });
+afterEach(() => { restoreWarnings(); });
+const connection =(id = 'conn', revision = 0): Connection => ({ kind: 'connection', id, revision, expiresAt: 2000000000, accountId: 'account', credentialGeneration: 0, status: 'active', credentials: { keyId: 'v1', nonce: 'a'.repeat(16), tag: 'a'.repeat(22), ciphertext: 'abc' } });
 const write = (): AtomicWrite => ({ operationId: 'a'.repeat(43), conditions: [{ kind: 'connection', id: 'conn', revision: null }], puts: [connection()] });
 function fixture(handler: (command: GetCommand | TransactWriteCommand) => Promise<unknown> = async () => ({}), timeoutMs = 5000) {
     const calls: (GetCommand | TransactWriteCommand)[] = [];
-    const store = new DynamoAtomicStore({ tableName: 'AuthTable', timeoutMs, client: { async send(command) { calls.push(command); return handler(command); } } });
-    return { calls, store };
+    // A virtual clock: backoff waits cost no real time, and the longest jitter makes the schedule deterministic.
+    const virtual = virtualRetry();
+    const store = new DynamoAtomicStore({ tableName: 'AuthTable', timeoutMs, retry: virtual.retry, client: { async send(command: GetCommand | TransactWriteCommand) { calls.push(command); return handler(command); } } });
+    return { calls, store, virtual };
 }
+const throttled = (attempt: number, operation: string) => ({ event: 'dynamodb_throttled', store: 'auth', operation, attempt });
 describe('DynamoDB auth store', () => {
     test('strong reads use exact namespace, validate stored shape and do not write', async () => {
         const { store, calls } = fixture(async () => ({ Item: { ...connection(), pk: 'wildduck-mcp#connection#conn', sk: 'STATE' } }));
@@ -81,6 +90,75 @@ test('ambiguous delivery retries the identical transaction token and payload bef
     expect((calls[0] as TransactWriteCommand).input).toEqual((calls[1] as TransactWriteCommand).input);
 });
 
+describe('throttling', () => {
+    test('a throttled transaction is retried with the identical command and token, then succeeds', async () => {
+        let attempts = 0;
+        const { store, calls, virtual } = fixture(async () => { if (++attempts <= 2) { throw throttleError(); } return {}; });
+        expect(await store.transact(write())).toBe(true);
+        expect(calls).toHaveLength(3);
+        expect(calls[1]).toBe(calls[0]); expect(calls[2]).toBe(calls[0]);
+        expect((calls[0] as TransactWriteCommand).input.ClientRequestToken).toHaveLength(36);
+        expect(virtual.sleeps).toEqual([200, 400]);
+        expect(logs).toEqual([throttled(1, 'transact'), throttled(2, 'transact')]);
+    });
+    test('a throttled strongly consistent read is retried too, and the retry log carries only fixed fields', async () => {
+        let attempts = 0;
+        const { store, calls } = fixture(async () => { if (++attempts === 1) { throw throttleError('ThrottlingException'); } return { Item: { ...connection(), pk: 'wildduck-mcp#connection#conn', sk: 'STATE' } }; });
+        expect(await store.get('connection', 'conn')).toEqual(connection());
+        expect(calls).toHaveLength(2);
+        expect(logs).toEqual([throttled(1, 'get')]);
+        expect(Object.keys(logs[0] ?? {}).sort()).toEqual(['attempt', 'event', 'operation', 'store']);
+    });
+    test('cancelled transactions are retried only when every non-None reason is a throttle', async () => {
+        for (const reasons of [['ThrottlingError', 'None'], ['ProvisionedThroughputExceeded', 'ProvisionedThroughputExceeded'], ['None', 'ThrottlingError', 'TransactionConflict']]) {
+            let attempts = 0; logs.length = 0;
+            const { store, calls } = fixture(async () => { if (++attempts === 1) { throw cancelled(...reasons); } return {}; });
+            expect(await store.transact({ ...write(), conditions: [...write().conditions, { kind: 'connection', id: 'other', revision: 1 }] })).toBe(true);
+            expect(calls).toHaveLength(2); expect(logs).toEqual([throttled(1, 'transact')]);
+        }
+    });
+    test('throttling until the throttle budget ends is temporarily_unavailable, for reads and transactions', async () => {
+        for (const run of [(store: DynamoAtomicStore) => store.transact(write()), (store: DynamoAtomicStore) => store.get('connection', 'conn')]) {
+            logs.length = 0;
+            const { store, calls, virtual } = fixture(async () => { throw throttleError('RequestLimitExceeded'); });
+            await expect(run(store)).rejects.toThrow('temporarily_unavailable');
+            // Waits of 200, 400, 800, 1600 ms, then 1600 each, the last cut to the 10 s deadline.
+            expect(virtual.sleeps).toEqual([200, 400, 800, 1600, 1600, 1600, 1600, 1600, 600]);
+            expect(virtual.clock.ms).toBe(10000);
+            expect(calls).toHaveLength(9); expect(logs).toHaveLength(9);
+        }
+    });
+    test('full jitter draws each wait between zero and the step cap', async () => {
+        let attempts = 0;
+        const virtual = virtualRetry(0.5);
+        const store = new DynamoAtomicStore({ tableName: 'AuthTable', retry: virtual.retry, client: { async send() { if (++attempts <= 3) { throw throttleError(); } return {}; } } });
+        expect(await store.transact(write())).toBe(true);
+        expect(virtual.sleeps).toEqual([100, 200, 400]);
+    });
+    test('a conditional conflict is never retried and never logged as throttling', async () => {
+        const { store, calls, virtual } = fixture(async () => { throw cancelled('ConditionalCheckFailed'); });
+        expect(await store.transact(write())).toBe(false);
+        expect(calls).toHaveLength(1); expect(virtual.sleeps).toEqual([]); expect(logs).toEqual([]);
+    });
+    test('a condition failure beside a throttle stays an ambiguity: short retries only, no throttle log', async () => {
+        const { store, calls, virtual } = fixture(async () => { throw cancelled('ConditionalCheckFailed', 'ProvisionedThroughputExceeded'); });
+        await expect(store.transact({ ...write(), conditions: [...write().conditions, { kind: 'connection', id: 'other', revision: 1 }] })).rejects.toThrow('temporarily_unavailable');
+        expect(calls).toHaveLength(3); expect(virtual.sleeps).toEqual([25, 50]); expect(logs).toEqual([]);
+    });
+    test('other read errors are still not retried', async () => {
+        const { store, calls } = fixture(async () => { throw new Error('socket closed'); });
+        await expect(store.get('connection', 'conn')).rejects.toThrow('temporarily_unavailable');
+        expect(calls).toHaveLength(1);
+    });
+    test('unthrottled calls keep the short timeout; once throttled, the wait stops at the live request time minus two seconds', async () => {
+        const { store, virtual, calls } = fixture(async () => { throw throttleError(); });
+        // 3 s of request time left when the store starts: the deadline is 1 s away.
+        await expect(withRequestBudget(() => 3000 - virtual.clock.ms, () => store.transact(write()))).rejects.toThrow('temporarily_unavailable');
+        expect(virtual.clock.ms).toBe(1000); expect(calls.length).toBeLessThan(9);
+        expect(remainingRequestTimeMs()).toBeUndefined();
+    });
+});
+
 test.skipIf(process.env.DYNAMO_LOCAL_AUTH_TEST !== '1')('actual DynamoDB Local: atomic CAS, mixed read conditions, 1/1 capacity and idempotent retry', async () => {
     const { DynamoDBClient, CreateTableCommand, DescribeTableCommand, DeleteTableCommand, UpdateTimeToLiveCommand } = await import('@aws-sdk/client-dynamodb');
     const { DynamoDBDocumentClient } = await import('@aws-sdk/lib-dynamodb');
@@ -108,7 +186,7 @@ test.skipIf(process.env.DYNAMO_LOCAL_AUTH_TEST !== '1')('actual DynamoDB Local: 
     } finally { await client.send(new DeleteTableCommand({ TableName: tableName })); client.destroy(); }
 });
 
-test('real SDK throttling consumes only the unified three-attempt HTTP budget', async () => {
+test('real SDK throttling makes exactly one HTTP request per store attempt, all with the identical payload, until the throttle budget ends', async () => {
     const { Readable } = await import('node:stream');
     let attempts = 0;
     const payloads: string[] = [];
@@ -116,7 +194,7 @@ test('real SDK throttling consumes only the unified three-attempt HTTP budget', 
     // Provide transport and identity before SDK construction: its middleware
     // captures resolved providers, so mutating config later can still read the
     // host AWS configuration and fail before reaching the HTTP handler.
-    const store = new DynamoAtomicStore({ tableName: 'AuthTable', timeoutMs: 5000, clientConfig: {
+    const store = new DynamoAtomicStore({ tableName: 'AuthTable', timeoutMs: 5000, retry: virtualRetry().retry, clientConfig: {
         region: 'us-east-1', credentials: { accessKeyId: 'local', secretAccessKey: 'local' }, requestHandler: {
             async handle(request: { body?: unknown }) {
                 attempts++;
@@ -126,7 +204,8 @@ test('real SDK throttling consumes only the unified three-attempt HTTP budget', 
         },
     } });
     await expect(store.transact(write())).rejects.toThrow('temporarily_unavailable');
-    expect(attempts).toBe(3);
+    // Waits of 200, 400, 800, then 1600 ms each fill the 10 s throttle budget: nine requests (the SDK itself never retries).
+    expect(attempts).toBe(9);
     expect(new Set(payloads).size).toBe(1);
     attempts = 0;
     failure = { __type: 'com.amazonaws.dynamodb.v20120810#TransactionCanceledException', CancellationReasons: [{ Code: 'ConditionalCheckFailed' }] };

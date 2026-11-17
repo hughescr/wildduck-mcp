@@ -589,3 +589,55 @@ test('the in-memory store keeps no summary, and notes any the service offers it'
     const unknown = fixture(); unknown.behavior.postError = true; await unknown.service.send_draft(context, target);
     for (const f of [settled, failing, unknown]) { expect(f.operations.summariesOffered).toEqual([]); expect(JSON.stringify([...f.operations.records.values()])).not.toContain('"summary":'); expect(f.operations.records.size).toBeGreaterThan(0); }
 });
+const uploadId = '0b5e7c1a-3f2d-4c8b-9a6e-1d2c3b4a5f60';
+const uploaded = { filename: 'report.pdf', contentType: 'application/pdf', uploadId, disposition: 'attachment' as const };
+const copied = { source: { mailboxId, uid: 3, attachmentId: 'ATT1' }, disposition: 'attachment' as const };
+test('an identical retry replays the stored result before any attachment is resolved again', async () => {
+    const f = fixture(); const request = { ...content, operationId: 'upload_replay_001', attachments: [uploaded] };
+    const first = await f.service.create_draft(context, request); expect(first.status).toBe('completed');
+    expect(f.calls.filter(call => call.method === 'prepareCreate')).toHaveLength(1);
+    // The upload is gone now (expired, or its store is down): resolving it again would fail, so any resolution is a test failure.
+    f.writer.prepareCreate = async () => { throw new MailError('not_found'); };
+    const calls = f.calls.length; const before = structuredClone([...f.operations.records.values()]);
+    const replay = await f.service.create_draft(context, structuredClone(request));
+    expect(replay).toEqual(first); expect(f.calls).toHaveLength(calls); expect(f.operations.calls.at(-1)).toBe('get'); expect(f.operations.calls).not.toContain('fail');
+    expect([...f.operations.records.values()]).toEqual(before);
+    // The same operationId with another upload is a different request, and is refused without looking at either upload.
+    const other = await f.service.create_draft(context, { ...request, attachments: [{ ...uploaded, uploadId: '1b5e7c1a-3f2d-4c8b-9a6e-1d2c3b4a5f60' }] });
+    expect(other).toEqual({ status: 'conflict', operationId: 'upload_replay_001', reason: 'operation_conflict' }); expect(f.calls).toHaveLength(calls);
+});
+test('an upload that cannot be resolved is a stored failure: a retry replays it and only a new operationId tries again', async () => {
+    const f = fixture(); f.writer.prepareCreate = async () => { throw new MailError('not_found'); };
+    const request = { ...content, operationId: 'upload_missing_001', attachments: [uploaded] };
+    const failed = await f.service.create_draft(context, request);
+    expect(failed).toEqual({ status: 'failed', operationId: 'upload_missing_001', reason: 'not_found' });
+    f.writer.prepareCreate = async () => { throw new Error('must not be called again'); };
+    expect(await f.service.create_draft(context, structuredClone(request))).toEqual(failed);
+    expect(f.calls.filter(call => call.method === 'upload')).toHaveLength(0);
+});
+test('copying a stored attachment (source) needs mail:read on every draft tool, checked before any store or backend call', async () => {
+    const draftOnly: MailContext = { ...context, scopes: ['mail:draft'] };
+    const attempts = {
+        create_draft: (f: ReturnType<typeof fixture>) => f.service.create_draft(draftOnly, { ...content, operationId: 'source_scope_001', attachments: [copied] }),
+        create_reply_draft: (f: ReturnType<typeof fixture>) => f.service.create_reply_draft(draftOnly, { original: { mailboxId, uid: 1 }, mode: 'reply', body: { text: 'Hi' }, quoteOriginal: false, attachments: [copied], operationId: 'source_scope_002' }),
+        update_draft: (f: ReturnType<typeof fixture>) => f.service.update_draft(draftOnly, { ...target, attachments: [copied] }),
+    };
+    for (const [name, attempt] of Object.entries(attempts)) {
+        const f = fixture(); const outcome = await attempt(f).then(() => 'accepted', (error: unknown) => (error as MailError).code);
+        expect({ name, outcome, backend: f.calls.length, store: f.operations.calls.length }).toEqual({ name, outcome: 'forbidden', backend: 0, store: 0 });
+    }
+    // With mail:read the same request reaches the backend; uploads and base64 attachments never need it.
+    const f = fixture(); expect((await f.service.create_draft(context, { ...content, operationId: 'source_scope_003', attachments: [copied] })).status).toBe('completed');
+    const inline = { filename: 'a.txt', contentType: 'text/plain', contentBase64: 'aGk=', disposition: 'attachment' as const };
+    const g = fixture(); expect((await g.service.create_draft(draftOnly, { ...content, operationId: 'source_scope_004', attachments: [uploaded, inline] })).status).toBe('completed');
+    const h = fixture(); expect((await h.service.update_draft(draftOnly, { ...target, attachments: [uploaded] })).status).toBe('completed');
+});
+test('the payload digest of a request with only base64 attachments is the one earlier versions stored', async () => {
+    const f = fixture(); const request = { ...content, operationId: 'digest_stable_001', attachments: [{ filename: 'a.txt', contentType: 'text/plain', contentBase64: 'aGk=', disposition: 'attachment' as const }] };
+    await f.service.create_draft(context, request);
+    const record = f.operations.records.get(keyOf({ accountId, clientIdHash: digest(context.clientId), operationId: 'digest_stable_001' }));
+    const { operationId: _operationId, ...payload } = request;
+    // The digest of the 0.7 payload shape, worked out here independently of the service.
+    const stable = (value: unknown): string => Array.isArray(value) ? `[${value.map(stable).join(',')}]` : value !== null && typeof value === 'object' ? `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stable((value as Record<string, unknown>)[key])}`).join(',')}}` : JSON.stringify(value);
+    expect(record?.intent.payloadDigest).toBe(digest(stable({ accountId, tool: 'create_draft', input: payload })));
+});

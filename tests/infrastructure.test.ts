@@ -20,6 +20,8 @@ test('deployment keeps the agreed tiny footprint without hidden indexes or scali
     const table = configuration.resources.Resources['CredentialTable'];
     expect(table?.Properties['ProvisionedThroughput']).toEqual({ ReadCapacityUnits: 1, WriteCapacityUnits: 1 });
     expect(table?.Properties['BillingMode']).toBe('PROVISIONED');
+    // Upload records and auth records rely on this attribute name for free expiry.
+    expect(table?.Properties['TimeToLiveSpecification']).toEqual({ AttributeName: 'expiresAt', Enabled: true });
     expect(table?.Properties['GlobalSecondaryIndexes']).toBeUndefined();
     expect(table?.Properties['LocalSecondaryIndexes']).toBeUndefined();
     expect(table?.DeletionPolicy).toBe('Retain');
@@ -30,6 +32,7 @@ interface PolicyStatement {
     Effect?: string;
     Action: string | string[];
     Resource: unknown;
+    Condition?: unknown;
 }
 
 interface Bootstrap {
@@ -146,18 +149,25 @@ test('attachment staging is encrypted/private, expires objects and multipart upl
     expect(bucket?.Properties.PublicAccessBlockConfiguration).toEqual({ BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true });
     expect(bucket?.Properties.OwnershipControls).toEqual({ Rules: [{ ObjectOwnership: 'BucketOwnerEnforced' }] });
     expect(bucket?.Properties.BucketEncryption).toEqual({ ServerSideEncryptionConfiguration: [{ ServerSideEncryptionByDefault: { SSEAlgorithm: 'AES256' } }] });
-    expect(bucket?.Properties.LifecycleConfiguration).toEqual({ Rules: [{ Id: 'ExpirePrivateDownloads', Status: 'Enabled', Prefix: 'downloads/', ExpirationInDays: 1, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 } }] });
+    expect(bucket?.Properties.LifecycleConfiguration).toEqual({ Rules: [
+        { Id: 'ExpirePrivateDownloads', Status: 'Enabled', Prefix: 'downloads/', ExpirationInDays: 1, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 } },
+        { Id: 'ExpireStagedUploads', Status: 'Enabled', Prefix: 'uploads/', ExpirationInDays: 1, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 } },
+    ] });
     const policy = bootstrapCf.Resources.DownloadBucketPolicy?.Properties.PolicyDocument as { Statement: unknown[] };
     expect(policy.Statement).toEqual([{ Sid: 'RequireTLS', Effect: 'Deny', Principal: '*', Action: 's3:*', Resource: [{ 'Fn::GetAtt': ['DownloadBucket', 'Arn'] }, { 'Fn::Sub': '${DownloadBucket.Arn}/*' }], Condition: { Bool: { 'aws:SecureTransport': false } } }]);
     expect(bucket?.Properties.CorsConfiguration).toEqual({ CorsRules: [{ AllowedOrigins: ['*'], AllowedMethods: ['GET', 'HEAD'], AllowedHeaders: ['Range'], ExposedHeaders: ['Content-Length', 'Content-Range', 'Accept-Ranges', 'Content-Disposition'], MaxAge: 300 }] });
 });
-test('runtime may HEAD the dedicated cache bucket and stage only its downloads prefix', async () => {
+test('runtime may HEAD the dedicated cache bucket, stage its downloads prefix and presign/read only its uploads prefix', async () => {
     const execution = bootstrapCf.Resources.ExecutionRole?.Properties.Policies as { PolicyDocument: { Statement: PolicyStatement[] } }[];
     const statements = execution.flatMap(policy => policy.PolicyDocument.Statement).filter(statement => JSON.stringify(statement.Action).includes('s3:'));
     expect(statements).toEqual([
         { Effect: 'Allow', Action: 's3:ListBucket', Resource: { 'Fn::GetAtt': ['DownloadBucket', 'Arn'] } },
         { Effect: 'Allow', Action: ['s3:PutObject', 's3:GetObject', 's3:AbortMultipartUpload'], Resource: { 'Fn::Sub': '${DownloadBucket.Arn}/downloads/*' } },
+        { Effect: 'Allow', Action: ['s3:PutObject', 's3:GetObject'], Resource: { 'Fn::Sub': '${DownloadBucket.Arn}/uploads/*' } },
     ]);
+    // BatchGetItem reads every staged upload an operation names in one call; LeadingKeys is evaluated against every key of the batch.
+    const table = execution.flatMap(policy => policy.PolicyDocument.Statement).filter(statement => JSON.stringify(statement.Action).includes('dynamodb:'));
+    expect(table).toEqual([{ Effect: 'Allow', Action: ['dynamodb:GetItem', 'dynamodb:BatchGetItem', 'dynamodb:PutItem', 'dynamodb:UpdateItem', 'dynamodb:DeleteItem', 'dynamodb:ConditionCheckItem'], Resource: { 'Fn::Sub': 'arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/wildduck-mcp-prod-state' }, Condition: { 'ForAllValues:StringLike': { 'dynamodb:LeadingKeys': ['wildduck-mcp#*'] } } }]);
     const serverless = Bun.YAML.parse(await Bun.file('serverless.yml').text()) as { provider: { timeout: number; environment: Record<string, unknown> } };
     expect(serverless.provider.timeout).toBe(60);
     expect(serverless.provider.environment.DOWNLOAD_BUCKET_NAME).toEqual({ 'Fn::ImportValue': 'wildduck-mcp-prod-download-bucket' });

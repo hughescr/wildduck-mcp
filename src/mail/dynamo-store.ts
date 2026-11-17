@@ -2,11 +2,12 @@ import { randomUUID } from 'node:crypto';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, TransactWriteCommand, type TransactWriteCommandInput } from '@aws-sdk/lib-dynamodb';
 import { z } from 'zod';
-import type { DynamoSender } from '../auth/dynamo-store';
+import { conditionalConflict, DEFAULT_THROTTLE_TIMEOUT_MS, DynamoRetrier, MAX_THROTTLE_TIMEOUT_MS, retryEnv, type DynamoBudget, type DynamoRetryEnv, type DynamoSender } from '../dynamo-retry';
 import { MailError, type ConfirmedReceipt, type DraftGuardKey, type DraftGuardRecord, type FailedReceipt, type MailOperationRecord, type MailOperationStore, type MailReceipt, type OperationClaim, type OperationKey, type ReservationResult, type UnknownReceipt, type WriteIntent } from './contracts';
 import { mailOutputSchemas, messageKeySchema, operationIdSchema, versionSchema } from './schemas';
 
-export interface DynamoMailStoreOptions { tableName: string; client?: DynamoSender; timeoutMs?: number }
+/** timeoutMs bounds an unthrottled operation; throttleTimeoutMs (default 10 s) is the total once DynamoDB has throttled it. */
+export interface DynamoMailStoreOptions { tableName: string; client?: DynamoSender; timeoutMs?: number; throttleTimeoutMs?: number; retry?: Partial<DynamoRetryEnv> }
 const safe = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/u);
 const owner = z.string().regex(/^[A-Za-z0-9_-]{16,128}$/u);
 const revision = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER - 1);
@@ -84,41 +85,23 @@ function guardKey(value: DraftGuardKey): { pk: string; sk: string } {
     const data = parse(targetKey, value);
     return { pk: `wildduck-mcp#mail-guard#${data.accountId}#${data.mailboxId}#${data.uid}`, sk: 'STATE' };
 }
-function conflict(error: unknown, count: number): boolean {
-    if (error === null || typeof error !== 'object') { return false; }
-    const data = error as { name?: unknown; CancellationReasons?: unknown };
-    return data.name === 'TransactionCanceledException' && Array.isArray(data.CancellationReasons) && data.CancellationReasons.length === count && data.CancellationReasons.every(reason => reason !== null && typeof reason === 'object' && ['None', 'ConditionalCheckFailed'].includes(reason.Code)) && data.CancellationReasons.some(reason => reason.Code === 'ConditionalCheckFailed');
-}
 /** Existing pk/sk table, fixed provisioned capacity. Receipts and fences have no TTL. */
 export class DynamoMailOperationStore implements MailOperationStore {
-    private readonly client: DynamoSender;
-    private readonly timeoutMs: number;
+    private readonly retrier: DynamoRetrier;
     constructor(private readonly options: DynamoMailStoreOptions) {
         if (!/^[A-Za-z0-9_.-]{3,255}$/u.test(options.tableName)) { throw new Error('Invalid mail table name'); }
-        this.timeoutMs = options.timeoutMs ?? 5000;
-        if (!Number.isInteger(this.timeoutMs) || this.timeoutMs < 1 || this.timeoutMs > 5000) { throw new Error('Invalid mail store timeout'); }
-        this.client = options.client ?? DynamoDBDocumentClient.from(new DynamoDBClient({ maxAttempts: 1 }));
+        const timeoutMs = options.timeoutMs ?? 5000;
+        if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 5000) { throw new Error('Invalid mail store timeout'); }
+        const throttleTimeoutMs = options.throttleTimeoutMs ?? DEFAULT_THROTTLE_TIMEOUT_MS;
+        if (!Number.isInteger(throttleTimeoutMs) || throttleTimeoutMs < 1 || throttleTimeoutMs > MAX_THROTTLE_TIMEOUT_MS) { throw new Error('Invalid mail store throttle timeout'); }
+        const client = options.client ?? DynamoDBDocumentClient.from(new DynamoDBClient({ maxAttempts: 1 }));
+        this.retrier = new DynamoRetrier({ store: 'mail', client, unavailable, env: retryEnv(options.retry), timeoutMs, throttleTimeoutMs, retryTransient: () => true });
     }
-    private deadline(): number { return Date.now() + this.timeoutMs; }
-    private async send(command: GetCommand | TransactWriteCommand, deadline: number): Promise<unknown> {
-        if (deadline <= Date.now()) { throw unavailable(); }
-        const controller = new AbortController();
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        try {
-            const request = async () => {
-                for (let attempt = 0; ; attempt++) {
-                    try { return await this.client.send(command, { abortSignal: controller.signal }); }
-                    catch (error) {
-                        if (attempt >= 2 || controller.signal.aborted || (command instanceof TransactWriteCommand && conflict(error, command.input.TransactItems?.length ?? 0))) { throw error; }
-                        await new Promise(resolve => setTimeout(resolve, 25 * 2 ** attempt));
-                        if (controller.signal.aborted) { throw unavailable(); }
-                    }
-                }
-            };
-            return await Promise.race([request(), new Promise<never>((_resolve, reject) => { timer = setTimeout(() => { controller.abort(); reject(unavailable()); }, Math.max(1, deadline - Date.now())); })]);
-        } finally { clearTimeout(timer); }
-    }
-    private async read(key: { pk: string; sk: string }, deadline: number): Promise<unknown | undefined> {
+    /** The time budget of one public operation, shared by all its reads and writes ("deadline" below): timeoutMs
+     * while unthrottled, the throttle budget once DynamoDB has throttled any of them. */
+    private deadline(): DynamoBudget { return this.retrier.begin(); }
+    private send(command: GetCommand | TransactWriteCommand, deadline: DynamoBudget): Promise<unknown> { return this.retrier.send(command, deadline); }
+    private async read(key: { pk: string; sk: string }, deadline: DynamoBudget): Promise<unknown | undefined> {
         try {
             const result = await this.send(new GetCommand({ TableName: this.options.tableName, Key: key, ConsistentRead: true }), deadline) as { Item?: Record<string, unknown> };
             if (result.Item === undefined) { return undefined; }
@@ -128,20 +111,21 @@ export class DynamoMailOperationStore implements MailOperationStore {
         } catch { throw unavailable(); }
     }
     async getOperation(key: OperationKey): Promise<MailOperationRecord | undefined> { return this.getStoredOperation(key, this.deadline()); }
-    private async transact(items: NonNullable<TransactWriteCommandInput['TransactItems']>, deadline: number): Promise<boolean> {
+    private async transact(items: NonNullable<TransactWriteCommandInput['TransactItems']>, deadline: DynamoBudget): Promise<boolean> {
+        // Built once: every retry inside send() re-sends this same command, hence the same ClientRequestToken.
         try { await this.send(new TransactWriteCommand({ ClientRequestToken: randomUUID(), TransactItems: items }), deadline); return true; }
-        catch (error) { if (conflict(error, items.length)) { return false; } throw unavailable(); }
+        catch (error) { if (conditionalConflict(error, items.length)) { return false; } throw unavailable(); }
     }
     private absentPut(key: { pk: string; sk: string }, value: unknown): NonNullable<TransactWriteCommandInput['TransactItems']>[number] {
         return { Put: { TableName: this.options.tableName, Item: { ...key, record: value }, ConditionExpression: 'attribute_not_exists(#pk)', ExpressionAttributeNames: { '#pk': 'pk' } } };
     }
-    private async getStoredOperation(key: OperationKey, deadline: number): Promise<MailOperationRecord | undefined> {
+    private async getStoredOperation(key: OperationKey, deadline: DynamoBudget): Promise<MailOperationRecord | undefined> {
         const value = await this.read(opKey(key), deadline);
         if (value === undefined) { return undefined; }
         const wrapper = parse(z.strictObject({ record: z.unknown() }), value);
         return operation(wrapper.record, key);
     }
-    private async getGuard(key: DraftGuardKey, deadline: number): Promise<DraftGuardRecord | undefined> {
+    private async getGuard(key: DraftGuardKey, deadline: DynamoBudget): Promise<DraftGuardRecord | undefined> {
         const value = await this.read(guardKey(key), deadline);
         if (value === undefined) { return undefined; }
         const wrapper = parse(z.strictObject({ record: guardSchema }), value);

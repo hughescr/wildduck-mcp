@@ -3,8 +3,8 @@ import { createHash } from 'node:crypto';
 import libmime from 'libmime';
 import Builder from 'nodemailer/lib/mime-node';
 import { encode as qpEncode, wrap as qpWrap } from 'nodemailer/lib/qp';
-import { createMime, inspectSource, preparePatch, verifyCandidate, textTransfer, MIME_LIMITS, MimeError, type MimeCreate } from '../src/mail/mime';
-import { draftContentSchema } from '../src/mail/schemas';
+import { createMime, inspectSource, preparePatch, verifyCandidate, textTransfer, retainedAttachmentBytes, attachmentBodyBytes, base64Bytes, MAX_MESSAGE_BYTES, MIME_LIMITS, MimeError, type MimeCreate } from '../src/mail/mime';
+import { draftContentSchema, MAX_INLINE_ATTACHMENT_BYTES, MAX_UPLOAD_BYTES } from '../src/mail/schemas';
 import { authoredParts, authoredText, decodeTransfer } from './mime-text';
 import { xorshift } from './mime-fields';
 
@@ -131,8 +131,8 @@ describe('MIME lossless supported subset', () => {
     test('additions preserve existing parts and introduce inline related and regular mixed wrappers', async () => {
         const source = await inspectSource(Buffer.from(rootHeaders + plain('hello')));
         const candidate = await preparePatch(source, { body: { text: 'hello', html: '<img src="cid:new@example.test">' }, attachments: [
-            { filename: 'Résumé.pdf', contentType: 'application/pdf', contentBase64: pdfBody, disposition: 'attachment' },
-            { filename: 'new.png', contentType: 'image/png', contentBase64: 'AAEC', disposition: 'inline', cid: 'new@example.test' },
+            { filename: 'Résumé.pdf', contentType: 'application/pdf', bytes: Buffer.from(pdfBody, 'base64'), disposition: 'attachment' },
+            { filename: 'new.png', contentType: 'image/png', bytes: Buffer.from('AAEC', 'base64'), disposition: 'inline', cid: 'new@example.test' },
         ] });
         const checked = await inspectSource(candidate.raw);
         expect(checked.attachments).toHaveLength(2);
@@ -143,8 +143,8 @@ describe('MIME lossless supported subset', () => {
     });
     test('additions append within an existing related group and mixed container', async () => {
         const candidate = await preparePatch(await inspectSource(rich()), { attachments: [
-            { filename: 'a.txt', contentType: 'text/plain', contentBase64: '', disposition: 'attachment' },
-            { filename: 'a.png', contentType: 'image/png', contentBase64: 'AA==', disposition: 'inline', cid: 'second@example.test' },
+            { filename: 'a.txt', contentType: 'text/plain', bytes: new Uint8Array(0), disposition: 'attachment' },
+            { filename: 'a.png', contentType: 'image/png', bytes: new Uint8Array([0]), disposition: 'inline', cid: 'second@example.test' },
         ] });
         const text = candidate.raw.toString();
         expect(text.indexOf('Content-ID: <second@example.test>')).toBeLessThan(text.indexOf('--related-B--'));
@@ -159,7 +159,7 @@ describe('MIME lossless supported subset', () => {
         expect(bodyOf(candidate.raw).equals(bodyOf(rich()))).toBe(true);
     });
     test('create explicit HTML, empty plaintext and zero-byte attachment; no auto-text/asset extraction', async () => {
-        const candidate = await createMime({ ...fresh, body: { text: '', html: '<img src="data:image/png;base64,AA=="><img src="https://example.test/a">' }, attachments: [{ filename: 'empty.bin', contentType: 'application/octet-stream', contentBase64: '', disposition: 'attachment' }] });
+        const candidate = await createMime({ ...fresh, body: { text: '', html: '<img src="data:image/png;base64,AA=="><img src="https://example.test/a">' }, attachments: [{ filename: 'empty.bin', contentType: 'application/octet-stream', bytes: new Uint8Array(0), disposition: 'attachment' }] });
         expect((await inspectSource(candidate.raw)).attachments).toHaveLength(1);
         expect(candidate.envelope.bcc).toHaveLength(1);
         verifyCandidate(candidate, Buffer.from(candidate.raw));
@@ -173,7 +173,7 @@ describe('MIME lossless supported subset', () => {
             { bytes: Buffer.concat([embeddedHeaders, Buffer.alloc(1000, 65)]), encoding: 'binary' },
         ];
         for (const fixture of fixtures) {
-            const attachment = { filename: 'new.eml', contentType: 'message/rfc822', contentBase64: fixture.bytes.toString('base64'), disposition: 'attachment' as const };
+            const attachment = { filename: 'new.eml', contentType: 'message/rfc822', bytes: fixture.bytes, disposition: 'attachment' as const };
             const added = await preparePatch(await inspectSource(rich()), { attachments: [attachment] });
             const created = await createMime({ ...fresh, attachments: [attachment] });
             for (const candidate of [created, added]) {
@@ -191,17 +191,20 @@ describe('MIME lossless supported subset', () => {
     });
     test('new .eml rejects line-ending normalization and existing-boundary collisions before upload', async () => {
         const bytes = Buffer.from('From: attached@example.test\n\nbody');
-        const attachment = { filename: 'new.eml', contentType: 'message/rfc822', contentBase64: bytes.toString('base64'), disposition: 'attachment' as const };
-        await expect(createMime({ ...fresh, attachments: [attachment] })).rejects.toBeInstanceOf(MimeError);
+        const attachment = { filename: 'new.eml', contentType: 'message/rfc822', bytes, disposition: 'attachment' as const };
+        // The caller's own bytes break the rule (as the schema reports for contentBase64), whatever their source.
+        await expect(createMime({ ...fresh, attachments: [attachment] })).rejects.toMatchObject({ code: 'invalid_attachment' });
         const source = await inspectSource(rich());
-        await expect(preparePatch(source, { attachments: [attachment] })).rejects.toBeInstanceOf(MimeError);
+        await expect(preparePatch(source, { attachments: [attachment] })).rejects.toMatchObject({ code: 'invalid_attachment' });
         const collision = Buffer.from('From: attached@example.test\r\n\r\nbody\r\n--mixed-B\r\nContent-Type: application/octet-stream\r\n\r\nfake sibling');
-        await expect(preparePatch(source, { attachments: [{ ...attachment, contentBase64: collision.toString('base64') }] })).rejects.toBeInstanceOf(MimeError);
+        await expect(preparePatch(source, { attachments: [{ ...attachment, bytes: collision }] })).rejects.toBeInstanceOf(MimeError);
+        // Bytes are never rewritten: the rejected file is unchanged afterwards.
+        expect(bytes.equals(Buffer.from('From: attached@example.test\n\nbody'))).toBe(true);
     });
     test('unsupported new message subtypes reject during create and add preflight', async () => {
         const source = await inspectSource(rich());
         for (const contentType of ['message/partial', 'message/external-body', 'message/global', 'message/delivery-status', 'message/x-unknown', 'MeSsAgE/PaRtIaL']) {
-            const attachment = { filename: 'message.dat', contentType, contentBase64: Buffer.from('opaque bytes').toString('base64'), disposition: 'attachment' as const };
+            const attachment = { filename: 'message.dat', contentType, bytes: Buffer.from('opaque bytes'), disposition: 'attachment' as const };
             await expect(createMime({ ...fresh, attachments: [attachment] })).rejects.toMatchObject({ code: 'invalid_mime_patch' });
             await expect(preparePatch(source, { attachments: [attachment] })).rejects.toMatchObject({ code: 'invalid_mime_patch' });
         }
@@ -254,7 +257,7 @@ describe('MIME rejects ambiguous or unsupported semantics before any candidate',
         await rejects(rich([logo]));
         const source = await inspectSource(rich(), [{ attachmentId: 'ATT00001', hash: digest('iVBORw0KGgo=') }]);
         await expect(preparePatch(source, { deleteAttachmentIds: ['ATT00001'] })).rejects.toBeInstanceOf(MimeError);
-        await expect(preparePatch(source, { attachments: [{ filename: 'duplicate.png', contentType: 'image/png', contentBase64: 'AA==', disposition: 'inline', cid: 'logo@example.test' }] })).rejects.toBeInstanceOf(MimeError);
+        await expect(preparePatch(source, { attachments: [{ filename: 'duplicate.png', contentType: 'image/png', bytes: new Uint8Array([0]), disposition: 'inline', cid: 'logo@example.test' }] })).rejects.toBeInstanceOf(MimeError);
         await expect(preparePatch(source, { body: { text: 'new', html: '<img src="cid:logo@example.test">' }, deleteAttachmentIds: ['ATT00001'] })).rejects.toBeInstanceOf(MimeError);
         const authored = await preparePatch(source, { body: { text: 'new', html: '<p>New HTML with no image</p>' }, deleteAttachmentIds: ['ATT00001'] });
         expect(authored.raw.includes(Buffer.from(logo))).toBe(false);
@@ -271,10 +274,11 @@ describe('MIME rejects ambiguous or unsupported semantics before any candidate',
             { inReplyTo: '<parent@example.test>', references: ['<parent@example.test>', '<parent@example.test>'] },
         ]) { await expect(createMime({ ...fresh, threading })).rejects.toMatchObject({ code: 'invalid_mime_patch' }); }
     });
-    test('header injection and noncanonical base64 fail, including nonzero pad bits', async () => {
+    test('header injection and non-byte attachment content fail', async () => {
         const source = await inspectSource(rich());
         for (const patch of [{ subject: 'bad\r\nBcc: evil@example.test' }, { from: { address: 'x@example.test\r\nX: bad' } }, { to: [{ address: 'x@example.test', name: 'bad\nName' }] }]) {await expect(preparePatch(source, patch)).rejects.toBeInstanceOf(MimeError);}
-        for (const contentBase64 of ['AA', 'AB==', 'AA==\n', '!!!!', 'AAA=AAAA']) {await expect(createMime({ ...fresh, attachments: [{ filename: 'x', contentType: 'application/octet-stream', contentBase64, disposition: 'attachment' }] })).rejects.toBeInstanceOf(MimeError);}
+        // The layer takes bytes, never text to decode: base64 is the schema's to check (and decode, once).
+        for (const bytes of ['AA==', [0, 1], null, undefined]) {await expect(createMime({ ...fresh, attachments: [{ filename: 'x', contentType: 'application/octet-stream', bytes: bytes as unknown as Uint8Array, disposition: 'attachment' }] })).rejects.toMatchObject({ code: 'invalid_mime_patch' });}
         await expect(preparePatch(source, { body: { text: 'x', html: '<img src="attachment:ATT00001">' } })).rejects.toBeInstanceOf(MimeError);
     });
     test('unsupported From syntax fails closed instead of generating a fallback Message-ID', async () => {
@@ -282,14 +286,23 @@ describe('MIME rejects ambiguous or unsupported semantics before any candidate',
             await expect(createMime({ ...fresh, from: { address } })).rejects.toMatchObject({ code: 'invalid_mime_patch' });
         }
     });
-    test('source, decoded attachments, header, node and nesting caps', async () => {
-        await rejects(Buffer.alloc(MIME_LIMITS.sourceBytes + 1));
+    test('message, encoded attachments, header, node and nesting caps', async () => {
+        expect(MIME_LIMITS.messageBytes).toBe(MAX_MESSAGE_BYTES);
+        await expect(inspectSource(Buffer.alloc(MIME_LIMITS.messageBytes + 1))).rejects.toMatchObject({ code: 'mime_limit' });
         await rejects(rootHeaders + 'X-Long: ' + 'x'.repeat(MIME_LIMITS.headerBytes) + '\r\n' + plain());
         await rejects(rich(Array.from({ length: 130 }, () => pdf())));
         let nested = Buffer.from(plain()); for (let i = 0; i < 14; i++) {nested = multi('mixed', 'deep-' + i, [nested]);}
         await rejects(Buffer.concat([Buffer.from(rootHeaders), nested]));
-        const big = Buffer.alloc(MIME_LIMITS.attachmentBytes + 1).toString('base64');
-        await expect(createMime({ ...fresh, attachments: [{ filename: 'big', contentType: 'application/octet-stream', contentBase64: big, disposition: 'attachment' }] })).rejects.toBeInstanceOf(MimeError);
+        // The one cap is on the encoded message: a file whose base64 cannot fit fails before it is
+        // encoded, while the same bytes as an identity-encoded message/rfc822 still fit.
+        const big = Buffer.alloc(MIME_LIMITS.messageBytes * 3 / 4, 65);
+        await expect(createMime({ ...fresh, attachments: [{ filename: 'big', contentType: 'application/octet-stream', bytes: big, disposition: 'attachment' }] })).rejects.toMatchObject({ code: 'mime_limit' });
+        const half = big.subarray(0, big.length / 2);
+        await expect(createMime({ ...fresh, attachments: [{ filename: 'a', contentType: 'application/octet-stream', bytes: half, disposition: 'attachment' }, { filename: 'b', contentType: 'application/octet-stream', bytes: half, disposition: 'attachment' }] })).rejects.toMatchObject({ code: 'mime_limit' });
+        const eml = await createMime({ ...fresh, attachments: [{ filename: 'big.eml', contentType: 'message/rfc822', bytes: big, disposition: 'attachment' }] });
+        expect(eml.raw.length).toBeLessThanOrEqual(MIME_LIMITS.messageBytes);
+        // An update counts its retained parts: the same file cannot be added a second time.
+        await expect(preparePatch(await inspectSource(eml.raw), { attachments: [{ filename: 'again.eml', contentType: 'message/rfc822', bytes: big, disposition: 'attachment' }] })).rejects.toMatchObject({ code: 'mime_limit' });
     });
     test('body replacement rejects loss of unrecognized body metadata', async () => {
         const raw = Buffer.concat([Buffer.from(rootHeaders), multi('alternative', 'a', [plain().replace('Content-Transfer-Encoding', 'X-Body-Meaning: special\r\nContent-Transfer-Encoding'), html('no image')])]);
@@ -395,21 +408,24 @@ describe('authored text parts use canonical CRLF line breaks', () => {
         ['CJK (base64 worst case)', '你', 'base64'],
         ['mostly ASCII Latin (quoted-printable)', 'é' + 'a'.repeat(20), 'quoted-printable'],
         ['8-bit-free controls', '\u0001', 'base64'],
-    ] as const)('maximal %s bodies plus maximal attachments stay inside the MIME source limit', async (_name, unit, encoding) => {
-        const attachment = Buffer.alloc(MIME_LIMITS.attachmentBytes, 0x0a);
+    ] as const)('maximal %s bodies plus all inline attachment bytes stay inside the message cap; the largest upload needs a smaller body', async (_name, unit, encoding) => {
         const fill = (bytes: number) => unit.repeat(Math.floor(bytes / Buffer.byteLength(unit)));
         const body = { text: fill(128 * 1024), html: fill(256 * 1024) };
-        const attachments = [{ filename: 'big.bin', contentType: 'application/octet-stream', contentBase64: attachment.toString('base64'), disposition: 'attachment' as const }];
+        const attachments = [{ filename: 'inline.bin', contentType: 'application/octet-stream', bytes: Buffer.alloc(MAX_INLINE_ATTACHMENT_BYTES, 0x0a), disposition: 'attachment' as const }];
         const created = await createMime({ ...fresh, body, attachments });
-        expect(created.raw.length).toBeLessThan(MIME_LIMITS.sourceBytes);
+        expect(created.raw.length).toBeLessThan(MIME_LIMITS.messageBytes);
         expect(authoredParts(created.raw).map(part => part.encoding)).toEqual([encoding, encoding]);
         const patched = await preparePatch(await inspectSource(Buffer.from(rootHeaders + plain())), { body, attachments });
-        expect(patched.raw.length).toBeLessThan(MIME_LIMITS.sourceBytes);
+        expect(patched.raw.length).toBeLessThan(MIME_LIMITS.messageBytes);
+        // An 18 MiB upload's base64 leaves about 377 KiB, less than a maximal body takes once encoded.
+        const upload = [{ filename: 'big.bin', contentType: 'application/octet-stream', bytes: Buffer.alloc(MAX_UPLOAD_BYTES, 0x0a), disposition: 'attachment' as const }];
+        await expect(createMime({ ...fresh, body, attachments: upload })).rejects.toMatchObject({ code: 'mime_limit' });
+        expect((await createMime({ ...fresh, attachments: upload })).raw.length).toBeLessThan(MIME_LIMITS.messageBytes);
     });
     test('attachments, including text attachments with bare LF or CR, keep their exact bytes', async () => {
         const bytes = Buffer.from('line one\nline two\rline three\r\nlast\n');
         const wrapped = bytes.toString('base64').match(/.{1,76}/gu)?.join('\r\n') ?? '';
-        const created = await createMime({ ...fresh, body: { text: 'x\ny', html: null }, attachments: [{ filename: 'notes.txt', contentType: 'text/plain', contentBase64: bytes.toString('base64'), disposition: 'attachment' }] });
+        const created = await createMime({ ...fresh, body: { text: 'x\ny', html: null }, attachments: [{ filename: 'notes.txt', contentType: 'text/plain', bytes, disposition: 'attachment' }] });
         expect(created.raw.includes(Buffer.from(wrapped))).toBe(true);
         expect(authoredText(created.raw, 'text/plain').filter(text => text === 'x\r\ny')).toHaveLength(1);
         const stored = await inspectSource(created.raw);
@@ -629,7 +645,7 @@ describe('authored text transfer encodings', () => {
             const replaced = await preparePatch(await inspectSource(empty), { body: { text, html: null } });
             expect(authoredText(replaced.raw, 'text/plain')).toEqual([expected]);
             expect((await inspectSource(replaced.raw)).attachments).toHaveLength(1);
-            const wrapped = await preparePatch(await inspectSource(Buffer.from(rootHeaders + plain())), { body: { text, html: null }, attachments: [{ filename: 'a.bin', contentType: 'application/octet-stream', contentBase64: 'AA==', disposition: 'attachment' }] });
+            const wrapped = await preparePatch(await inspectSource(Buffer.from(rootHeaders + plain())), { body: { text, html: null }, attachments: [{ filename: 'a.bin', contentType: 'application/octet-stream', bytes: new Uint8Array([0]), disposition: 'attachment' }] });
             expect(authoredText(wrapped.raw, 'text/plain')).toEqual([expected]);
         }
     });
@@ -667,5 +683,60 @@ describe('drafts authored by 0.6.x (base64 text parts, B-encoded subject)', () =
         const again = await preparePatch(await inspectSource(body.raw), { body: { text: 'Third', html: null } });
         expect(authoredText(again.raw, 'text/plain')).toEqual(['Third']);
         for (const candidate of [headerOnly, renamed, body, again]) { verifyCandidate(candidate, Buffer.from(candidate.raw)); }
+    });
+});
+
+describe('MIME attachments from bytes at the 25 MiB message size', () => {
+    const lines = (bytes: Buffer) => Buffer.from(bytes.toString('base64').match(/.{1,76}/gu)?.join('\r\n') ?? '');
+    const partBody = (raw: Buffer, filename: string) => { const at = raw.indexOf(`filename=${filename}`); const start = raw.indexOf('\r\n\r\n', at) + 4; return raw.subarray(start, raw.indexOf('\r\n--', start)); };
+    test('base64 bodies are 76-character CRLF lines across encoder slices, and their size is predicted exactly', async () => {
+        const slice = 57 * 16 * 1024;
+        for (const size of [0, 1, 56, 57, 58, slice - 1, slice, slice + 1, 2 * slice + 3]) {
+            const bytes = Buffer.from(Array.from({ length: size }, (_, index) => (index * 7919) & 255));
+            const created = await createMime({ ...fresh, attachments: [{ filename: 'file.bin', contentType: 'application/octet-stream', bytes, disposition: 'attachment' }] });
+            const body = partBody(created.raw, 'file.bin');
+            expect(body.equals(lines(bytes))).toBe(true);
+            expect(body.length).toBe(base64Bytes(size)); expect(attachmentBodyBytes(size, 'application/pdf')).toBe(base64Bytes(size)); expect(attachmentBodyBytes(size, 'Message/RFC822')).toBe(size);
+        }
+    });
+    test('one byte array may back several parts, and a view into a larger buffer is encoded alone', async () => {
+        const backing = Buffer.from('xxxxPAYLOADyyyy'); const bytes = backing.subarray(4, 11);
+        const created = await createMime({ ...fresh, attachments: [{ filename: 'a.bin', contentType: 'application/octet-stream', bytes, disposition: 'attachment' }, { filename: 'b.bin', contentType: 'application/octet-stream', bytes, disposition: 'attachment' }] });
+        for (const name of ['a.bin', 'b.bin']) { expect(partBody(created.raw, name).toString()).toBe(Buffer.from('PAYLOAD').toString('base64')); }
+        expect(backing.toString()).toBe('xxxxPAYLOADyyyy');
+    });
+    test('a stored base64 body is checked in slices: canonical across slice boundaries, any padding or pad bits mid-body refused', async () => {
+        const header = Buffer.from(rootHeaders + 'Content-Type: multipart/mixed; boundary="b"\r\n\r\n--b\r\n' + plain('x') + '\r\n--b\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename="f.bin"\r\nContent-Transfer-Encoding: base64\r\n\r\n');
+        const tail = Buffer.from('\r\n--b--\r\n');
+        const file = Buffer.alloc(3 * 1024 * 1024 + 2, 0x5a);
+        const source = (body: Buffer) => Buffer.concat([header, body, tail]);
+        expect((await inspectSource(source(lines(file)))).attachments).toHaveLength(1);
+        // Unwrapped, and wrapped at an odd width, the slices still split inside quanta.
+        expect((await inspectSource(source(Buffer.from(file.toString('base64'))))).attachments).toHaveLength(1);
+        expect((await inspectSource(source(Buffer.from(file.toString('base64').match(/.{1,61}/gu)?.join('\r\n') ?? '')))).attachments).toHaveLength(1);
+        const encoded = lines(file).toString('latin1');
+        await rejects(source(Buffer.from(encoded.slice(0, 2_000_000) + '=' + encoded.slice(2_000_001), 'latin1')));
+        await rejects(source(Buffer.from(encoded.slice(0, -2) + 'b=', 'latin1')));
+        await rejects(source(Buffer.from(encoded.slice(0, 1_500_000) + '*' + encoded.slice(1_500_001), 'latin1')));
+    });
+    test('retained attachment bytes count every kept part and none of the removed ones', async () => {
+        const bound = await inspectSource(rich(), [{ attachmentId: 'ATT00002', hash: digest(pdfBody) }]);
+        const all = retainedAttachmentBytes(bound);
+        expect(all).toBe(bound.attachments.reduce((total, part) => total + part.rawBytes, 0));
+        expect(retainedAttachmentBytes(bound, ['ATT00002'])).toBe(all - Buffer.byteLength(pdf()));
+        expect(() => retainedAttachmentBytes(bound, ['ATT00009'])).toThrow(MimeError);
+    });
+    test('a 25 MiB message composes, inspects and verifies within the cap, and its patch keeps every retained byte', async () => {
+        const file = Buffer.alloc(MAX_UPLOAD_BYTES, 0x41);
+        const created = await createMime({ ...fresh, attachments: [{ filename: 'big.bin', contentType: 'application/octet-stream', bytes: file, disposition: 'attachment' }] });
+        expect(created.raw.length).toBeGreaterThan(24 * 1024 * 1024); expect(created.raw.length).toBeLessThanOrEqual(MAX_MESSAGE_BYTES);
+        verifyCandidate(created, Buffer.from(created.raw));
+        const inspected = await inspectSource(created.raw, [{ attachmentId: 'ATT00001', hash: digest(partBody(created.raw, 'big.bin')) }]);
+        const patched = await preparePatch(inspected, { subject: 'Renamed', attachments: [{ filename: 'small.txt', contentType: 'text/plain', bytes: Buffer.from('small'), disposition: 'attachment' }] });
+        expect(patched.retainedAttachments).toHaveLength(1);
+        expect(patched.raw.includes(lines(file))).toBe(true);
+        const replaced = await preparePatch(inspected, { deleteAttachmentIds: ['ATT00001'], attachments: [{ filename: 'other.bin', contentType: 'application/octet-stream', bytes: file, disposition: 'attachment' }] });
+        expect(replaced.retainedAttachments).toHaveLength(0);
+        await expect(preparePatch(inspected, { attachments: [{ filename: 'other.bin', contentType: 'application/octet-stream', bytes: Buffer.alloc(1024 * 1024), disposition: 'attachment' }] })).rejects.toMatchObject({ code: 'mime_limit' });
     });
 });

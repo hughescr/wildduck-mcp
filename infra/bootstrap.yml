@@ -201,8 +201,18 @@ Resources:
             ExpirationInDays: 1
             AbortIncompleteMultipartUpload:
               DaysAfterInitiation: 1
-      # Browser clients holding the bearer URL can read/range-fetch it; no cookie
-      # credentials, uploads, bucket listing or public object access are enabled.
+          # Files a client PUT to a presigned URL for create_attachment_upload; the records
+          # in DynamoDB expire after 15 minutes, this removes the objects (eventually).
+          - Id: ExpireStagedUploads
+            Status: Enabled
+            Prefix: uploads/
+            ExpirationInDays: 1
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      # Browser clients holding the bearer URL can read/range-fetch a download; uploads
+      # to the uploads/ prefix come from non-browser clients through presigned PUT URLs,
+      # so no CORS rule allows them. No cookie credentials, bucket listing or public
+      # object access are enabled.
       CorsConfiguration:
         CorsRules:
           - AllowedOrigins: ['*']
@@ -251,8 +261,8 @@ Resources:
                 Action: [logs:CreateLogStream, logs:PutLogEvents]
                 Resource:
                   Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/wildduck-mcp-prod-api:*
-              # HEAD must distinguish a missing object (404) from access denial.
-              # This dedicated bucket contains only temporary MCP downloads.
+              # HEAD and GET must distinguish a missing object (404) from access denial.
+              # This dedicated bucket contains only temporary MCP downloads and staged uploads.
               - Effect: Allow
                 Action: s3:ListBucket
                 Resource:
@@ -261,12 +271,17 @@ Resources:
                 Action: [s3:PutObject, s3:GetObject, s3:AbortMultipartUpload]
                 Resource:
                   Fn::Sub: ${DownloadBucket.Arn}/downloads/*
+              # Presigning a PUT needs s3:PutObject; reading a staged file back needs s3:GetObject.
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]
+                Resource:
+                  Fn::Sub: ${DownloadBucket.Arn}/uploads/*
               - Effect: Allow
                 Action: ssm:GetParameter
                 Resource:
                   Fn::Sub: arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/wildduck-mcp/prod/auth-keyring
               - Effect: Allow
-                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:ConditionCheckItem]
+                Action: [dynamodb:GetItem, dynamodb:BatchGetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:ConditionCheckItem]
                 Resource:
                   Fn::Sub: arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/wildduck-mcp-prod-state
                 Condition:

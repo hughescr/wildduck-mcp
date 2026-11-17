@@ -7,14 +7,15 @@ import { Splitter, Streamer } from '@zone-eu/mailsplit';
 import { createMailBackend, type SearchDiagnostic, type DraftVerificationDiagnostic, type MailBackendOptions } from '../src/mail/backend';
 import { withRequestBudget } from '../src/request-budget';
 import { createMailService } from '../src/mail/service';
-import { MailError, MAIL_OPERATION_METADATA_KEY, type BackendMailSession, type DraftContent, type DraftPatch, type MailFailureCode, type MailOperationMarker, type MailOperationRecord, type MailOperationStore, type OperationKey, type AuthoredSourceDescriptor } from '../src/mail/contracts';
+import { MailError, MAIL_OPERATION_METADATA_KEY, type DraftMailSession, type DraftContent, type DraftPatch, type MailFailureCode, type MailOperationMarker, type AuthoredSourceDescriptor } from '../src/mail/contracts';
 import { mailOutputSchemas, MAX_READ_TEXT_BYTES } from '../src/mail/schemas';
 import { WILDDUCK_ORIGIN } from '../src/wildduck';
 import { createMime } from '../src/mail/mime';
 import { authoredParts, authoredText } from './mime-text';
 import { decodedAddresses, partViews } from './mime-fields';
+import { memoryOperations } from './wildduck-fake';
 const accountId = 'a'.repeat(24); const mailboxId = 'b'.repeat(24); const token = 'c'.repeat(40);
-const session: BackendMailSession = { accountId, accessToken: token }; const target = { mailboxId, uid: 12 };
+const clientIdHash = 'h'.repeat(43); const session: DraftMailSession = { accountId, accessToken: token, clientIdHash }; const target = { mailboxId, uid: 12 };
 const content: DraftContent = { to: [], cc: [], bcc: [{ address: 'bcc@example.com' }], subject: 'A draft', body: { text: 'Body' }, attachments: [] };
 const marker: MailOperationMarker = { accountId, clientIdHash: 'x'.repeat(43), payloadDigest: 'y'.repeat(43), operationId: 'operation-1234567', tool: 'create_draft' };
 const fastSearch = { mode: 'fast', strategy: 'fulltext_prefilter', complete: false, verified: true, retryWith: { searchMode: 'exhaustive' } } as const;
@@ -264,7 +265,7 @@ test('global and mailbox searches skip exact totals on initial, next and previou
 });
 test('all adapter entry points reject missing token and invalid account before any request', async () => {
     const f = fixture([]);
-    for (const bad of [{ accountId, accessToken: '' }, { accountId: '../escape', accessToken: token }, { accountId, accessToken: token + '\n' }]) {
+    for (const bad of [{ accountId, accessToken: '', clientIdHash }, { accountId: '../escape', accessToken: token, clientIdHash }, { accountId, accessToken: token + '\n', clientIdHash }]) {
         for (const action of [() => f.backend.listMailboxes(bad), () => f.backend.listMessages(bad, { mailboxId, limit: 20 }), () => f.backend.searchMessages(bad, { subject: 'x', limit: 20 }), () => f.backend.readMessage(bad, target), () => f.backend.resolveDraftMailbox(bad), () => f.backend.inspectMessage(bad, target), () => f.backend.prepareCreate(bad, content, marker), () => f.backend.deleteDraft(bad, target), () => f.backend.submitDraft(bad, target), () => f.backend.readAttachment(bad, { ...target, attachmentId: 'ATT00001' })]) { await errorCode(action(), 'invalid_input'); }
     }
     expect(f.calls).toHaveLength(0);
@@ -952,7 +953,7 @@ test('text form is a single text/plain part byte-identical to the former html:nu
     const expected = `Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 7bit\r\n\r\n${canonicalText}`;
     expect(raw.slice(raw.lastIndexOf('\r\nContent-Type:', separator) + 2)).toBe(expected);
     expect(raw).not.toContain('multipart'); expect(raw).not.toContain('text/html');
-    const legacy = await createMime({ ...content, from: { address: 'sender@example.com', name: 'Sender' }, body: { text, html: null } });
+    const legacy = await createMime({ ...content, attachments: [], from: { address: 'sender@example.com', name: 'Sender' }, body: { text, html: null } });
     const volatile = (value: Buffer) => value.toString('latin1').replace(/^(?:Date|Message-ID): .*\r\n/gmu, '');
     expect(volatile(prepared.mime.raw)).toBe(volatile(legacy.raw));
 });
@@ -1127,23 +1128,6 @@ test('a draft authored by 0.6.x (base64 text parts, B-encoded subject) can be in
     const stamped = await f.backend.stampSendMarker(session, snapshot, { ...marker, tool: 'send_draft' }, { grade: 'mcp_authored', accountId, ...key, contentDigest: bodyPatch.mime.sha256 });
     expect(await f.backend.submitDraft(session, stamped)).toMatchObject({ queueId: 'queue-accepted' });
 });
-function memoryOperations(): MailOperationStore {
-    const records = new Map<string, MailOperationRecord>();
-    const keyOf = (key: OperationKey) => JSON.stringify([key.accountId, key.clientIdHash, key.operationId]);
-    const operations: MailOperationStore = {
-        getOperation: async key => { const record = records.get(keyOf(key)); return record && structuredClone(record); },
-        reserve: async (intent, ownerToken) => {
-            const existing = records.get(keyOf(intent)); if (existing) { return JSON.stringify(existing.intent) === JSON.stringify(intent) ? { kind: 'replay', record: structuredClone(existing) } : { kind: 'conflict', reason: 'operation_conflict' }; }
-            const key = { accountId: intent.accountId, clientIdHash: intent.clientIdHash, operationId: intent.operationId }; records.set(keyOf(key), { key, intent, ownerToken, revision: 0, state: 'reserved' });
-            return { kind: 'acquired', claim: { key, ownerToken, revision: 0, state: 'reserved' } };
-        },
-        markDispatched: async claim => { const record = records.get(keyOf(claim.key)); if (!record) { throw new Error('missing'); } records.set(keyOf(claim.key), { ...record, state: 'dispatched', revision: record.revision + 1 }); return { ...claim, state: 'dispatched', revision: record.revision + 1 }; },
-        failPreflight: async (claim, receipt) => { const record = records.get(keyOf(claim.key)); if (!record) { throw new Error('missing'); } records.set(keyOf(claim.key), { ...record, state: 'settled', revision: record.revision + 1, receipt }); },
-        complete: async (claim, receipt) => { const record = records.get(keyOf(claim.key)); if (!record) { throw new Error('missing'); } records.set(keyOf(claim.key), { ...record, state: 'settled', revision: record.revision + 1, receipt }); },
-        markOutcomeUnknown: async (claim, receipt) => { const record = records.get(keyOf(claim.key)); if (!record) { throw new Error('missing'); } records.set(keyOf(claim.key), { ...record, state: 'settled', revision: record.revision + 1, receipt }); },
-    };
-    return operations;
-}
 const serviceContext = { ...session, clientId: 'client-one', scopes: ['mail:read', 'mail:draft'], connectionStatus: 'active' } as const;
 const posts = (f: ReturnType<typeof model>) => f.calls.filter(call => call.init.method === 'POST');
 test('identical Markdown retry through the service replays the settled result without re-rendering or another upload', async () => {

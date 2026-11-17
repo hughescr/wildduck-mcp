@@ -1,13 +1,14 @@
 import { createHash } from 'node:crypto';
 import { DynamoDBClient, type DynamoDBClientConfig } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, TransactWriteCommand, type GetCommandOutput, type TransactWriteCommandInput } from '@aws-sdk/lib-dynamodb';
+import { conditionalConflict, DEFAULT_THROTTLE_TIMEOUT_MS, DynamoRetrier, MAX_THROTTLE_TIMEOUT_MS, retryEnv, type DynamoRetryEnv, type DynamoSender } from '../dynamo-retry';
 import { TemporaryUnavailable, type AtomicStore, type AtomicWrite, type AuthRecord } from './contracts';
 
-export interface DynamoSender {
-    send(command: GetCommand | TransactWriteCommand, options?: { abortSignal?: AbortSignal }): Promise<unknown>;
-}
+export type { DynamoSender };
 export interface DynamoStoreOptions {
     tableName: string; client?: DynamoSender; timeoutMs?: number;
+    /** Total time one call may wait once DynamoDB has throttled it (default 10 s); timeoutMs bounds an unthrottled call. */
+    throttleTimeoutMs?: number; retry?: Partial<DynamoRetryEnv>;
     /** Resolve identity, region and transport at SDK construction; retries remain adapter-owned. */
     clientConfig?: Pick<DynamoDBClientConfig, 'region' | 'credentials' | 'requestHandler'>;
 }
@@ -44,37 +45,21 @@ function key(kind: AuthRecord['kind'], id: string): { pk: string; sk: string } {
     if (!['connection', 'grant', 'code'].includes(kind) || !safeId(id)) { throw new Error('Invalid auth record key'); }
     return { pk: `wildduck-mcp#${kind}#${id}`, sk: SK };
 }
-function conditionalConflict(error: unknown, count: number): boolean {
-    return object(error) && error.name === 'TransactionCanceledException' && Array.isArray(error.CancellationReasons) && error.CancellationReasons.length === count && error.CancellationReasons.every(reason => object(reason) && ['None', 'ConditionalCheckFailed'].includes(String(reason.Code))) && error.CancellationReasons.some(reason => object(reason) && reason.Code === 'ConditionalCheckFailed');
-}
 /** Dedicated table: pk + sk strings, expiresAt Unix seconds TTL; no indexes required. */
 export class DynamoAtomicStore implements AtomicStore {
-    private readonly client: DynamoSender;
-    private readonly timeoutMs: number;
+    private readonly retrier: DynamoRetrier;
     constructor(private readonly options: DynamoStoreOptions) {
         if (!/^[A-Za-z0-9_.-]{3,255}$/.test(options.tableName)) { throw new Error('Invalid auth table name'); }
-        this.timeoutMs = options.timeoutMs ?? 5000;
-        if (!Number.isInteger(this.timeoutMs) || this.timeoutMs < 1 || this.timeoutMs > 10000) { throw new Error('Invalid auth timeout'); }
+        const timeoutMs = options.timeoutMs ?? 5000;
+        if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 10000) { throw new Error('Invalid auth timeout'); }
+        const throttleTimeoutMs = options.throttleTimeoutMs ?? DEFAULT_THROTTLE_TIMEOUT_MS;
+        if (!Number.isInteger(throttleTimeoutMs) || throttleTimeoutMs < 1 || throttleTimeoutMs > MAX_THROTTLE_TIMEOUT_MS) { throw new Error('Invalid auth throttle timeout'); }
         // The outer transaction loop owns retries; nested SDK retries multiply writes.
-        this.client = options.client ?? DynamoDBDocumentClient.from(new DynamoDBClient({ ...options.clientConfig, maxAttempts: 1 }), { marshallOptions: { removeUndefinedValues: false } });
+        const client = options.client ?? DynamoDBDocumentClient.from(new DynamoDBClient({ ...options.clientConfig, maxAttempts: 1 }), { marshallOptions: { removeUndefinedValues: false } });
+        // Throttled reads and writes are retried (the table is 1/1 provisioned); other errors only for the transaction, whose fixed token makes that safe.
+        this.retrier = new DynamoRetrier({ store: 'auth', client, unavailable: () => new TemporaryUnavailable(), env: retryEnv(options.retry), timeoutMs, throttleTimeoutMs, retryTransient: command => command instanceof TransactWriteCommand });
     }
-    private async send(command: GetCommand | TransactWriteCommand): Promise<unknown> {
-        const controller = new AbortController();
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        try {
-            const request = async () => {
-                for (let attempt = 0; ; attempt++) {
-                    try { return await this.client.send(command, { abortSignal: controller.signal }); }
-                    catch (error) {
-                        if (!(command instanceof TransactWriteCommand) || attempt >= 2 || controller.signal.aborted || conditionalConflict(error, command.input.TransactItems?.length ?? 0) || (object(error) && error.name === 'IdempotentParameterMismatchException')) { throw error; }
-                        await new Promise(resolve => setTimeout(resolve, 25 * 2 ** attempt));
-                        if (controller.signal.aborted) { throw new TemporaryUnavailable(); }
-                    }
-                }
-            };
-            return await Promise.race([request(), new Promise<never>((_resolve, reject) => { timer = setTimeout(() => { controller.abort(); reject(new TemporaryUnavailable()); }, this.timeoutMs); })]);
-        } finally { clearTimeout(timer); }
-    }
+    private send(command: GetCommand | TransactWriteCommand): Promise<unknown> { return this.retrier.send(command, this.retrier.begin()); }
     async get(kind: AuthRecord['kind'], id: string): Promise<AuthRecord | undefined> {
         const expectedKey = key(kind, id);
         try {

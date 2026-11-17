@@ -4,16 +4,37 @@ import libmime from 'libmime';
 import { WILDDUCK_ORIGIN } from '../wildduck';
 import { remainingRequestTimeMs, withRequestBudget } from '../request-budget';
 import { currentRequestId } from '../request-id';
-import { MailError, MAIL_OPERATION_METADATA_KEY, type BackendMailSession, type MailBackendReader, type MailBackendWriter, type Mailbox, type MailInput, type MailInputRaw, type MailOutput, type MessageKey, type DraftContent, type DraftPatch, type MessageSnapshot, type PreparedDraft, type MailOperationMarker, type MessageRef, type MessageSummary, type MailAddress, type AttachmentMetadata, type AttachmentDownload, type AttachmentDownloadLink, type VerifiedMessageMutation, type AuthoredSourceDescriptor } from './contracts';
-import { draftContentSchema, namedAddress, mailboxIdSchema, messageKeySchema, mailInputSchemas, mailOutputSchemas, canonicalReadMessageOutputSchema, attachmentDownloadLinkSchema, mailOperationMarkerSchema, addFlagSchema, labelSchema, MAX_READ_TEXT_BYTES, MAX_HTML_BYTES, MAX_ATTACHMENT_BYTES, MAX_SNIPPET_BYTES, MAX_SEARCH_TEXT_CHARACTERS } from './schemas';
+import { MailError, MAIL_OPERATION_METADATA_KEY, ATTACHMENT_UPLOAD_KEY_PREFIX, type BackendMailSession, type DraftMailSession, type MailBackendReader, type MailBackendWriter, type Mailbox, type MailInput, type MailInputRaw, type MailOutput, type MessageKey, type DraftContent, type DraftPatch, type MessageSnapshot, type PreparedDraft, type MailOperationMarker, type MessageRef, type MessageSummary, type MailAddress, type AttachmentMetadata, type AttachmentDownload, type AttachmentDownloadLink, type VerifiedMessageMutation, type AuthoredSourceDescriptor, type AttachmentUploadStore, type AttachmentUploadStager, type AttachmentUploadRecord, type AttachmentSource, type NewAttachment, type ResolvedAttachment } from './contracts';
+import { draftContentSchema, namedAddress, mailboxIdSchema, messageKeySchema, mailInputSchemas, mailOutputSchemas, canonicalReadMessageOutputSchema, attachmentDownloadLinkSchema, mailOperationMarkerSchema, addFlagSchema, labelSchema, attachmentFilenameSchema, attachmentContentTypeSchema, MAX_READ_TEXT_BYTES, MAX_HTML_BYTES, MAX_ATTACHMENT_BYTES, MAX_SNIPPET_BYTES, MAX_SEARCH_TEXT_CHARACTERS, MAX_UPLOAD_BYTES } from './schemas';
 import { MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS, type AttachmentDownloadStager } from './downloads';
 import { deriveReply, sanitizeHeaderText } from './reply';
 import { ownedIdentityMatcher } from './identities';
-import { createMime, inspectSource, preparePatch, verifyCandidate, AUTHORED_LIMITS, MimeError, MIME_LIMITS, type MimeEnvelope } from './mime';
+import { createMime, inspectSource, preparePatch, retainedAttachmentBytes, verifyCandidate, attachmentBodyBytes, AMBIGUOUS_INLINE, AUTHORED_LIMITS, MAX_MESSAGE_BYTES, MimeError, type MimeEnvelope } from './mime';
 import { renderBody } from './render';
 
 const META_BYTES = 512 * 1024;
+// The message JSON (text, HTML and attachment metadata, never attachment content), so it does
+// not grow with the 25 MiB message cap; WildDuck itself caps its text and HTML fields.
 const MESSAGE_BYTES = 4 * 1024 * 1024;
+/** Large bodies (a draft upload, a source or attachment read) get the base timeout plus 1 ms per
+ * this many bytes: 1 MiB/s (~8 Mbit/s), a floor below which a transfer counts as stalled, not an
+ * estimate of throughput. Always within the request's remaining time. */
+const TIMEOUT_BYTES_PER_MS = 1024;
+/** Attachment resolution (issue #2) runs under one deadline: what is left of the request less
+ * RESOLVE_RESERVE_MS, and never more than RESOLVE_MAX_MS. Called from a write, "the request" is its
+ * preflight window, which already ends PREFLIGHT_RESERVE_MS (mail/service.ts, with the whole timeline)
+ * before the Lambda's, keeping the upload, read-back and ledger writes. This reserve is only what still
+ * follows inside that window once every byte is here, for a 25 MiB message: composing and inspecting
+ * it (~2 s) and an update's identity and reference reads, plus margin. get_attachment_download
+ * likewise keeps 2 s of its 32 s for its own epilogue. */
+const RESOLVE_RESERVE_MS = 5000;
+const RESOLVE_MAX_MS = 30_000;
+/** Concurrent metadata reads and byte fetches while resolving: a few overlap latency, more would only
+ * hold more bytes in memory at once. */
+const RESOLVE_CONCURRENCY = 3;
+const CLIENT_ID_HASH = /^[A-Za-z0-9_-]{43}$/u;
+// The schema's own validators for a final file name and media type, applied to the values a
+// source attachment supplies: the rules are those of a caller's value, not a second copy of them.
 const ACCOUNT = /^[a-f0-9]{24}$/u;
 const TOKEN = /^[a-fA-F0-9]{40}$/u;
 const API_EMAIL_OPTIONS = { tlds: false } as unknown as Parameters<typeof isEmailValid>[1];
@@ -26,11 +47,12 @@ class MultipartUpload {
     readonly bytes: Buffer<ArrayBuffer>;
     constructor(raw: Buffer, fields: Json) {
         const parts = Object.entries(fields).map(([name, value]) => Buffer.from(`Content-Disposition: form-data; name="${name}"\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(value)}\r\n`));
-        parts.push(Buffer.concat([Buffer.from('Content-Disposition: form-data; name="raw"; filename="message.eml"\r\nContent-Type: message/rfc822\r\n\r\n'), raw, Buffer.from('\r\n')]));
+        const file = Buffer.from('Content-Disposition: form-data; name="raw"; filename="message.eml"\r\nContent-Type: message/rfc822\r\n\r\n');
         let boundary: string;
-        do { boundary = `wildduck-mcp-${randomUUID()}`; } while (parts.some(part => part.includes(boundary)));
+        do { boundary = `wildduck-mcp-${randomUUID()}`; } while ([...parts, file, raw].some(part => part.includes(boundary)));
         this.contentType = `multipart/form-data; boundary=${boundary}`;
-        this.bytes = Buffer.concat([...parts.flatMap(part => [Buffer.from(`--${boundary}\r\n`), part]), Buffer.from(`--${boundary}--\r\n`)]);
+        // One join, so the message is copied once into the request body (at 25 MiB, not twice).
+        this.bytes = Buffer.concat([...parts.flatMap(part => [Buffer.from(`--${boundary}\r\n`), part]), Buffer.from(`--${boundary}\r\n`), file, raw, Buffer.from(`\r\n--${boundary}--\r\n`)]);
     }
 }
 type SearchCategory = import('./contracts').SearchFailureCause;
@@ -38,7 +60,9 @@ export interface SearchDiagnostic { requestId?: string; event: 'wildduck_search'
 type DraftVerificationCheck = 'target' | 'message' | 'mime' | 'draft_state' | 'envelope' | 'metadata' | 'received_at' | 'reference' | 'files' | 'flags' | 'labels';
 export interface DraftVerificationDiagnostic { requestId?: string; event: 'wildduck_draft_verification_failed'; check: DraftVerificationCheck; code: 'mime_verification_failed' | 'verification_failed' | 'upstream_failure' }
 interface SearchTiming { category: SearchCategory; headersMs?: number; bodyMs?: number; status?: number; timeoutMs?: number }
-export interface MailBackendOptions { fetch?: typeof globalThis.fetch; timeoutMs?: number; searchTimeoutMs?: number; dotAsPlus?: boolean; stripReplySuffix?: boolean; downloadStager?: AttachmentDownloadStager; onSearchDiagnostic?: (diagnostic: SearchDiagnostic) => void; onDraftVerificationDiagnostic?: (diagnostic: DraftVerificationDiagnostic) => void }
+export interface MailBackendOptions { fetch?: typeof globalThis.fetch; timeoutMs?: number; searchTimeoutMs?: number; dotAsPlus?: boolean; stripReplySuffix?: boolean; downloadStager?: AttachmentDownloadStager; onSearchDiagnostic?: (diagnostic: SearchDiagnostic) => void; onDraftVerificationDiagnostic?: (diagnostic: DraftVerificationDiagnostic) => void;
+    /** Staged uploads (issue #2). Without both, uploadId attachments fail closed with temporarily_unavailable. */
+    uploadStore?: AttachmentUploadStore; uploadStager?: AttachmentUploadStager }
 const fail = (): never => { throw new MailError('temporarily_unavailable'); };
 function object(value: unknown): value is Json { return value !== null && typeof value === 'object' && !Array.isArray(value); }
 function string(value: unknown): string { return typeof value === 'string' ? value : fail(); }
@@ -72,8 +96,81 @@ function markerOf(raw: Json): MailOperationMarker | undefined {
 }
 function mimeError(error: unknown): never {
     if (error instanceof MailError) { throw error; }
-    if (error instanceof MimeError) { throw new MailError(error.code === 'mime_limit' ? 'too_large' : error.code === 'mime_verification_failed' ? 'verification_failed' : 'unsupported_content'); }
+    if (error instanceof MimeError) { throw new MailError(error.code === 'mime_limit' ? 'too_large' : error.code === 'mime_verification_failed' ? 'verification_failed' : error.code === 'invalid_attachment' ? 'invalid_input' : 'unsupported_content'); }
     return fail();
+}
+interface TransportExtra {
+    /** Aborts the request (as upstream_timeout), e.g. when attachment resolution stops. */
+    readonly signal?: AbortSignal | undefined;
+    /** Told the bytes of a 200 body so far (its declared length first); throws to stop the read. */
+    readonly meter?: ((bytes: number) => void) | undefined;
+}
+/** The request's attachments sorted by source, before any I/O. */
+interface AttachmentPlan {
+    readonly items: readonly NewAttachment[];
+    /** contentBase64 bytes by item index, decoded once (the schema proved them canonical). */
+    readonly inline: ReadonlyMap<number, Buffer>;
+    readonly uploadIds: readonly string[];
+    /** Distinct source messages, by mailbox:uid, with the indices of the items that copy from each. */
+    readonly messages: ReadonlyMap<string, { readonly target: MessageKey; readonly indices: number[] }>;
+}
+/** What resolution uses of one source attachment, for the item at its index: the final name and type and the least
+ * decoded size (decodedLowerBound). */
+interface SourceFile { readonly filename: string; readonly contentType: string; readonly lower: number; readonly exact: boolean }
+const messageKeyOf = (key: MessageKey) => `${key.mailboxId}:${key.uid}`;
+const sourceKeyOf = (source: AttachmentSource) => `${messageKeyOf(source)}:${source.attachmentId}`;
+/** The final file name and type of an attachment by the schema's own rules for a caller's value,
+ * the inline text rule included, so a default taken from a source attachment is held to exactly
+ * what the caller could have written. */
+function authoredAttachment(filename: unknown, contentType: unknown, disposition: 'attachment' | 'inline'): { filename: string; contentType: string } {
+    const name = attachmentFilenameSchema.safeParse(filename); const type = attachmentContentTypeSchema.safeParse(contentType);
+    if (!name.success || !type.success || (disposition === 'inline' && AMBIGUOUS_INLINE.test(type.data))) { throw new MailError('invalid_input'); }
+    return { filename: name.data, contentType: type.data };
+}
+/** The least decoded size of a stored attachment, and whether it is exact. WildDuck's size counts
+ * the transfer-encoded body, so it is exact only for identity encodings. Any other encoding may be
+ * nearly all line breaks or soft breaks, so its only sure lower bound is 0: such a file is budgeted
+ * by its bytes as they arrive (ByteBudget's meter), never refused on an estimate. */
+function decodedLowerBound(raw: Json): { bytes: number; exact: boolean } {
+    const metadata = attachment(raw);
+    return metadata.size !== null && !metadata.sizeIsApproximate ? { bytes: metadata.size, exact: true } : { bytes: 0, exact: false };
+}
+/** The SourceFile of each item (by index) that copies from the message whose JSON is `raw`, validated at once. Only
+ * these small records may outlive the read: a message's JSON is up to MESSAGE_BYTES (a value unrelated to the files,
+ * such as one long header, can fill it) and a draft may copy from a hundred messages. */
+function sourceFiles(items: readonly NewAttachment[], indices: readonly number[], raw: Json, into = new Map<number, SourceFile>()): Map<number, SourceFile> {
+    const listed = raw['attachments']; if (!Array.isArray(listed)) { return fail(); }
+    for (const index of indices) {
+        const item = items[index]; if (!item || !('source' in item)) { return fail(); }
+        const { source } = item;
+        const found = listed.find((entry: unknown) => object(entry) && entry['id'] === source.attachmentId);
+        if (!object(found)) { throw new MailError('not_found'); }
+        const metadata = attachment(found); const size = decodedLowerBound(found);
+        // The caller's name and type, else the source's; disposition and cid are always the caller's.
+        into.set(index, { ...authoredAttachment(item.filename ?? metadata.filename, item.contentType ?? metadata.contentType, item.disposition), lower: size.bytes, exact: size.exact });
+    }
+    return into;
+}
+/** What the resolved attachments add to the message once encoded, kept against MAX_MESSAGE_BYTES:
+ * first at declared or least sizes, before any bytes are fetched, then as bytes arrive. */
+class ByteBudget {
+    private total: number;
+    constructor(fixedBytes: number) { this.total = fixedBytes; this.add(0); }
+    /** One file at `lower` bytes, attached once per entry of contentTypes; the returned meter raises
+     * the charge to the bytes seen so far and throws too_large once the total no longer fits. */
+    charge(lower: number, contentTypes: readonly string[]): (bytes: number) => void {
+        const cost = (bytes: number) => contentTypes.reduce((sum, type) => sum + attachmentBodyBytes(bytes, type), 0);
+        let charged = lower; this.add(cost(lower));
+        return bytes => { if (bytes > charged) { this.add(cost(bytes) - cost(charged)); charged = bytes; } };
+    }
+    private add(bytes: number): void { this.total += bytes; if (this.total > MAX_MESSAGE_BYTES) { throw new MailError('too_large'); } }
+}
+/** Runs task over items, at most `limit` at a time, and starts none once signal is aborted. */
+async function pooled<T, R>(items: readonly T[], limit: number, signal: AbortSignal, task: (item: T) => Promise<R>): Promise<R[]> {
+    const results: R[] = []; let next = 0;
+    const worker = async () => { while (next < items.length && !signal.aborted) { const index = next++; results[index] = await task(items[index] as T); } };
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+    return results;
 }
 function same(left: unknown, right: unknown): boolean { return stable(left ?? null) === stable(right ?? null); }
 function assertSame(left: unknown, right: unknown): void { if (!same(left, right)) { throw new MailError('verification_failed'); } }
@@ -204,6 +301,8 @@ function normalizeMailbox(raw: unknown): Mailbox {
 }
 class MailBackend implements MailBackendReader, MailBackendWriter {
     private readonly downloadStager: AttachmentDownloadStager | undefined;
+    private readonly uploadStore: AttachmentUploadStore | undefined;
+    private readonly uploadStager: AttachmentUploadStager | undefined;
     private readonly fetcher: typeof globalThis.fetch;
     private readonly timeoutMs: number;
     private readonly searchTimeoutMs: number;
@@ -215,6 +314,7 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
     private readonly preparations = new WeakMap<PreparedDraft, PreparationState>();
     constructor(options: MailBackendOptions) {
         this.downloadStager = options.downloadStager;
+        this.uploadStore = options.uploadStore; this.uploadStager = options.uploadStager;
         this.fetcher = options.fetch ?? globalThis.fetch; this.timeoutMs = options.timeoutMs ?? 10_000;
         this.searchTimeoutMs = options.searchTimeoutMs ?? options.timeoutMs ?? 45_000;
         this.dotAsPlus = options.dotAsPlus ?? false;
@@ -231,14 +331,24 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         if (!Number.isSafeInteger(this.timeoutMs) || this.timeoutMs < 1 || this.timeoutMs > 30_000) { throw new MailError('invalid_input'); }
         if (!Number.isSafeInteger(this.searchTimeoutMs) || this.searchTimeoutMs < 1 || this.searchTimeoutMs > 120_000) { throw new MailError('invalid_input'); }
     }
-    private async transport(session: BackendMailSession, path: string, method: 'GET' | 'POST' | 'PUT' | 'DELETE', body: Json | MultipartUpload | undefined, cap: number, kind: 'json' | 'source' | 'attachment' = 'json', timing?: SearchTiming): Promise<{ bytes: Buffer; headers: Headers }> {
+    private async transport(session: BackendMailSession, path: string, method: 'GET' | 'POST' | 'PUT' | 'DELETE', body: Json | MultipartUpload | undefined, cap: number, kind: 'json' | 'source' | 'attachment' = 'json', timing?: SearchTiming, extra: TransportExtra = {}): Promise<{ bytes: Buffer; headers: Headers }> {
         sessionValid(session);
         const controller = new AbortController(); let timer: ReturnType<typeof setTimeout> | undefined; let deadline = false;
         const started = performance.now();
         const remaining = remainingRequestTimeMs();
-        const timeoutMs = Math.max(0, Math.min(timing ? this.searchTimeoutMs : this.timeoutMs, remaining === undefined ? Infinity : remaining - 2000));
+        // A large body's time scales with its size (TIMEOUT_BYTES_PER_MS): an upload's from the
+        // start, a download's once its length is known. Never past the request's own deadline.
+        const base = timing ? this.searchTimeoutMs : this.timeoutMs;
+        const ceiling = remaining === undefined ? Infinity : remaining - 2000;
+        const within = (bytes: number, elapsed = 0) => Math.max(0, Math.floor(Math.min(base + Math.ceil(bytes / TIMEOUT_BYTES_PER_MS), ceiling - elapsed)));
+        const timeoutMs = within(body instanceof MultipartUpload ? body.bytes.length : 0);
         if (timing) { timing.timeoutMs = timeoutMs; }
-        if (timeoutMs === 0) { if (timing) { timing.category = 'deadline'; } throw new MailError('upstream_timeout'); }
+        if (timeoutMs === 0 || extra.signal?.aborted) { if (timing) { timing.category = 'deadline'; } throw new MailError('upstream_timeout'); }
+        let expire: (error: MailError) => void = () => {};
+        const expired = new Promise<never>((_, reject) => { expire = reject; });
+        const stop = () => { deadline = true; if (timing) { timing.category = 'deadline'; } controller.abort(); expire(new MailError('upstream_timeout')); };
+        const arm = (ms: number) => { if (timer !== undefined) { clearTimeout(timer); } timer = setTimeout(stop, ms); };
+        extra.signal?.addEventListener('abort', stop, { once: true });
         const operation = async () => {
             const response = await this.fetcher(`${WILDDUCK_ORIGIN}/users/${session.accountId}${path}`, { method, redirect: 'error', signal: controller.signal,
                 headers: { Accept: kind === 'json' ? 'application/json' : kind === 'source' ? 'message/rfc822' : '*/*', 'Accept-Encoding': 'identity', 'X-Access-Token': session.accessToken, ...(body === undefined ? {} : { 'Content-Type': body instanceof MultipartUpload ? body.contentType : 'application/json' }) },
@@ -256,13 +366,24 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
             if (declared !== null && (!/^\d+$/u.test(declared) || Number(declared) > cap)) { discard(); throw new MailError('too_large'); }
             if (kind === 'source' && response.status === 200 && declared === null) { discard(); throw new MailError('source_integrity_unavailable'); }
             if (!response.body) { return fail(); }
+            const success = response.status === 200;
+            if (success && declared !== null) { try { extra.meter?.(Number(declared)); } catch (error) { discard(); throw error; } }
+            if (success && kind !== 'json') { arm(within(declared === null ? cap : Number(declared), performance.now() - started)); }
+            // A declared identity body is read straight into one buffer of its length: joining the
+            // chunks afterwards would hold a second copy of a 25 MiB source at the peak.
+            const into = success && kind !== 'json' && declared !== null && !encoded ? Buffer.allocUnsafe(Number(declared)) : undefined;
             const reader = response.body.getReader(); const chunks: Uint8Array[] = []; let size = 0;
-            if (timing && response.status === 200) { timing.category = 'network'; }
+            if (timing && success) { timing.category = 'network'; }
             const cancel = () => { void reader.cancel().catch(() => {}); }; controller.signal.addEventListener('abort', cancel, { once: true });
             try {
-                while (true) { const chunk = await reader.read(); if (chunk.done) { break; } size += chunk.value.byteLength; if (size > cap) { throw new MailError('too_large'); } chunks.push(chunk.value); }
+                while (true) {
+                    const chunk = await reader.read(); if (chunk.done) { break; }
+                    size += chunk.value.byteLength; if (size > cap) { throw new MailError('too_large'); }
+                    if (success) { extra.meter?.(size); }
+                    if (into) { if (size > into.length) { return fail(); } into.set(chunk.value, size - chunk.value.byteLength); } else { chunks.push(chunk.value); }
+                }
                 if (declared !== null && !encoded && size !== Number(declared)) { return fail(); }
-                const bytes = Buffer.concat(chunks);
+                const bytes = into ?? Buffer.concat(chunks);
                 if (timing) { timing.bodyMs = Math.round(performance.now() - headersAt); }
                 if (response.status === 200) { return { bytes, headers: response.headers }; }
                 const result = json(bytes);
@@ -275,18 +396,21 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
                 throw new MailError('temporarily_unavailable', retryAfter);
             } finally { controller.signal.removeEventListener('abort', cancel); cancel(); }
         };
-        try { return await Promise.race([operation(), new Promise<never>((_, reject) => { timer = setTimeout(() => { deadline = true; if (timing) { timing.category = 'deadline'; } controller.abort(); reject(new MailError('upstream_timeout')); }, timeoutMs); })]); }
+        arm(timeoutMs);
+        try { return await Promise.race([operation(), expired]); }
         catch (error) { if (deadline) { throw new MailError('upstream_timeout'); } if (timing && error instanceof MailError && error.code === 'too_large') { timing.category = 'too_large'; } if (error instanceof MailError) { throw error; } return fail(); }
-        finally { if (timer !== undefined) { clearTimeout(timer); } controller.abort(); }
+        finally { if (timer !== undefined) { clearTimeout(timer); } extra.signal?.removeEventListener('abort', stop); controller.abort(); }
     }
-    private async request(session: BackendMailSession, path: string, method: 'GET' | 'POST' | 'PUT' | 'DELETE', body?: Json | MultipartUpload, cap = META_BYTES): Promise<Json> {
-        const result = json((await this.transport(session, path, method, body, cap)).bytes);
+    private async request(session: BackendMailSession, path: string, method: 'GET' | 'POST' | 'PUT' | 'DELETE', body?: Json | MultipartUpload, cap = META_BYTES, extra: TransportExtra = {}): Promise<Json> {
+        const result = json((await this.transport(session, path, method, body, cap, 'json', undefined, extra)).bytes);
         if (result['success'] !== true || result['error'] !== undefined || result['code'] !== undefined) { return fail(); }
         return result;
     }
+    /** Every source this server reads (an authored draft, a read-back, a message before a move) is
+     * bounded by the one message cap. */
     private async source(session: BackendMailSession, target: MessageKey): Promise<Buffer> {
         sessionValid(session); targetValid(target);
-        return (await this.transport(session, `/mailboxes/${target.mailboxId}/messages/${target.uid}/message.eml`, 'GET', undefined, MIME_LIMITS.sourceBytes, 'source')).bytes;
+        return (await this.transport(session, `/mailboxes/${target.mailboxId}/messages/${target.uid}/message.eml`, 'GET', undefined, MAX_MESSAGE_BYTES, 'source')).bytes;
     }
     async listMailboxes(session: BackendMailSession): Promise<MailOutput<'list_mailboxes'>> { return this.mailboxListing(session, true); }
     private async mailboxListing(session: BackendMailSession, counters: boolean): Promise<MailOutput<'list_mailboxes'>> {
@@ -388,9 +512,9 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
             try { this.onSearchDiagnostic(diagnostic); } catch { /* Diagnostics must not alter mail results. */ }
         }
     }
-    private async rawMessage(session: BackendMailSession, target: MessageKey): Promise<{ raw: Json; version: string }> {
+    private async rawMessage(session: BackendMailSession, target: MessageKey, signal?: AbortSignal): Promise<{ raw: Json; version: string }> {
         sessionValid(session); targetValid(target);
-        const raw = await this.request(session, `/mailboxes/${target.mailboxId}/messages/${target.uid}?markAsSeen=false&replaceCidLinks=false`, 'GET', undefined, MESSAGE_BYTES);
+        const raw = await this.request(session, `/mailboxes/${target.mailboxId}/messages/${target.uid}?markAsSeen=false&replaceCidLinks=false`, 'GET', undefined, MESSAGE_BYTES, { signal });
         if (id(raw['user']) !== session.accountId || id(raw['mailbox']) !== target.mailboxId || uid(raw['id']) !== target.uid) { return fail(); }
         // Validate the full shape before authorizing a draft operation; never digest only public/truncated fields.
         if (raw['text'] !== undefined && typeof raw['text'] !== 'string' || raw['html'] !== undefined && (!Array.isArray(raw['html']) || raw['html'].some(html => typeof html !== 'string')) ||
@@ -538,22 +662,130 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
     private async ownedFrom(session: BackendMailSession, desired?: { address: string; name?: string | undefined }) {
         return this.selectFrom(await this.ownedIdentities(session), desired);
     }
-    async prepareReply(session: BackendMailSession, input: MailInput<'create_reply_draft'>, marker: MailOperationMarker): Promise<PreparedDraft> {
+    /** Sorts the request's attachments by source without I/O, and refuses what can never resolve:
+     * upload records are bound to account AND client, so without the service's verified client
+     * digest there is no owner to look them up for. That digest is server wiring, not the caller's
+     * input, so its absence fails closed like a missing upload store: temporarily_unavailable. */
+    private planAttachments(session: DraftMailSession, items: readonly NewAttachment[] = []): AttachmentPlan {
+        const inline = new Map<number, Buffer>(); const uploadIds = new Set<string>(); const messages = new Map<string, { target: MessageKey; indices: number[] }>();
+        items.forEach((item, index) => {
+            if ('contentBase64' in item) { inline.set(index, Buffer.from(item.contentBase64, 'base64')); }
+            else if ('uploadId' in item) { uploadIds.add(item.uploadId); }
+            else {
+                const key = messageKeyOf(item.source); const entry = messages.get(key) ?? { target: { mailboxId: item.source.mailboxId, uid: item.source.uid }, indices: [] };
+                entry.indices.push(index); messages.set(key, entry);
+            }
+        });
+        if (uploadIds.size) {
+            if (typeof session.clientIdHash !== 'string' || !CLIENT_ID_HASH.test(session.clientIdHash) || !this.uploadStore || !this.uploadStager) { throw new MailError('temporarily_unavailable'); }
+        }
+        return { items, inline, uploadIds: [...uploadIds], messages };
+    }
+    /** Every attachment as final bytes, name and type, in preflight (before the service marks the
+     * operation dispatched). Batch-first: one getUploads for all upload ids, one metadata read per
+     * distinct source message (`known` holds the SourceFiles of items whose message was already read,
+     * such as a reply's original), each reduced to its SourceFiles inside the read so at most
+     * RESOLVE_CONCURRENCY message JSONs are alive at once, and each distinct file fetched once however
+     * often it is attached. One deadline, one byte budget
+     * (`fixedBytes`, what the message keeps besides these, plus every encoded attachment within
+     * MAX_MESSAGE_BYTES, checked at declared sizes before any fetch and on actual bytes as they
+     * arrive) and RESOLVE_CONCURRENCY bound the whole phase; the first failure cancels the rest.
+     * Request-local: nothing is logged, cached or persisted. */
+    private async resolveAttachments(session: DraftMailSession, plan: AttachmentPlan, fixedBytes: number, known: ReadonlyMap<number, SourceFile> = new Map()): Promise<ResolvedAttachment[]> {
+        const { items } = plan;
+        const finish = (index: number, bytes: Uint8Array, final: { filename: string; contentType: string }): ResolvedAttachment => {
+            const item = items[index] ?? fail();
+            return { ...final, bytes, disposition: item.disposition, ...(item.cid === undefined ? {} : { cid: item.cid }) };
+        };
+        const inlineFinal = (index: number) => { const item = items[index]; return item && 'contentBase64' in item ? { filename: item.filename, contentType: item.contentType } : fail(); };
+        // Inline bytes alone need no I/O, so no deadline; the MIME layer applies the size cap.
+        if (!plan.uploadIds.length && !plan.messages.size) { return items.map((_, index) => finish(index, plan.inline.get(index) ?? fail(), inlineFinal(index))); }
+        const remaining = remainingRequestTimeMs();
+        const budgetMs = Math.min(RESOLVE_MAX_MS, remaining === undefined ? RESOLVE_MAX_MS : remaining - RESOLVE_RESERVE_MS);
+        if (budgetMs <= 0) { throw new MailError('upstream_timeout'); }
+        const deadline = performance.now() + budgetMs;
+        const controller = new AbortController(); const { signal } = controller; let failure: MailError | undefined;
+        const halted = new Promise<never>((_, reject) => { signal.addEventListener('abort', () => { reject(failure ?? new MailError('upstream_timeout')); }, { once: true }); });
+        halted.catch(() => {});
+        const timer = setTimeout(() => { failure ??= new MailError('upstream_timeout'); controller.abort(); }, budgetMs);
+        const store = this.uploadStore, stager = this.uploadStager;
+        const owner = { accountId: session.accountId, clientIdHash: session.clientIdHash };
+        const work = async (): Promise<ResolvedAttachment[]> => {
+            // Metadata first: the upload batch and the distinct source messages, all bounded together.
+            let records: ReadonlyMap<string, AttachmentUploadRecord> = new Map();
+            const files = new Map(known);
+            // The message JSON is dropped as soon as its SourceFiles are taken: nothing else of it is kept.
+            const reads: Array<() => Promise<void>> = [...plan.messages.values()].filter(({ indices }) => !indices.every(index => files.has(index)))
+                .map(({ target, indices }) => async () => { sourceFiles(items, indices, (await this.rawMessage(session, target, signal)).raw, files); });
+            if (plan.uploadIds.length) { reads.unshift(async () => { records = await (store ?? fail()).getUploads(owner, plan.uploadIds); }); }
+            await pooled(reads, RESOLVE_CONCURRENCY, signal, read => read());
+            if (signal.aborted) { throw failure ?? new MailError('upstream_timeout'); }
+            // Every final name, type and size is known before a single byte is fetched.
+            const nowSeconds = Date.now() / 1000;
+            interface Slot { readonly lower: number; readonly exact: boolean; readonly types: string[]; readonly fetch: (meter: (bytes: number) => void) => Promise<Uint8Array> }
+            const slots = new Map<string, Slot>();
+            const finals = items.map((item, index): { slot?: string; filename: string; contentType: string } => {
+                if ('contentBase64' in item) { return inlineFinal(index); }
+                if ('uploadId' in item) {
+                    const record = records.get(item.uploadId);
+                    // The store already filters by owner and expiry; checked again, so no other record supplies bytes.
+                    if (!record || record.uploadId !== item.uploadId || record.accountId !== owner.accountId || record.clientIdHash !== owner.clientIdHash || !(record.expiresAt > nowSeconds) || record.objectKey !== ATTACHMENT_UPLOAD_KEY_PREFIX + record.uploadId) { throw new MailError('not_found'); }
+                    if (!Number.isSafeInteger(record.sizeBytes) || record.sizeBytes < 1) { return fail(); }
+                    if (record.sizeBytes > MAX_UPLOAD_BYTES) { throw new MailError('too_large'); }
+                    const key = 'upload:' + item.uploadId;
+                    const slot: Slot = slots.get(key) ?? { lower: record.sizeBytes, exact: true, types: [], fetch: async () => (stager ?? fail()).readStaged(record, { maxBytes: MAX_UPLOAD_BYTES, signal }) };
+                    slot.types.push(item.contentType); slots.set(key, slot);
+                    return { slot: key, filename: item.filename, contentType: item.contentType };
+                }
+                const { source } = item; const file = files.get(index) ?? fail();
+                const key = 'source:' + sourceKeyOf(source);
+                const path = `/mailboxes/${source.mailboxId}/messages/${source.uid}/attachments/${source.attachmentId}`;
+                // WildDuck's attachment hash covers the transfer-encoded body, not these decoded bytes: never compared.
+                const slot: Slot = slots.get(key) ?? { lower: file.lower, exact: file.exact, types: [], fetch: async meter => (await this.transport(session, path, 'GET', undefined, MAX_MESSAGE_BYTES, 'attachment', undefined, { signal, meter })).bytes };
+                slot.types.push(file.contentType); slots.set(key, slot);
+                return { slot: key, filename: file.filename, contentType: file.contentType };
+            });
+            const budget = new ByteBudget(fixedBytes);
+            finals.forEach((final, index) => { const bytes = plan.inline.get(index); if (bytes) { budget.charge(bytes.length, [final.contentType]); } });
+            const meters = new Map([...slots].map(([key, slot]) => [key, budget.charge(slot.lower, slot.types)]));
+            const fetched = new Map<string, Uint8Array>();
+            await pooled([...slots], RESOLVE_CONCURRENCY, signal, async ([key, slot]) => {
+                const meter = meters.get(key) ?? fail();
+                const bytes = await slot.fetch(meter);
+                // The stager verifies an upload's size and SHA-256; its length is checked again here.
+                if (!(bytes instanceof Uint8Array) || (slot.exact && bytes.byteLength !== slot.lower)) { throw new MailError('verification_failed'); }
+                meter(bytes.byteLength); fetched.set(key, bytes);
+            });
+            if (signal.aborted) { throw failure ?? new MailError('upstream_timeout'); }
+            return finals.map((final, index) => finish(index, final.slot === undefined ? plan.inline.get(index) ?? fail() : fetched.get(final.slot) ?? fail(), { filename: final.filename, contentType: final.contentType }));
+        };
+        try {
+            // The nested budget makes every request of this phase end by its deadline (transport keeps 2 s back).
+            return await withRequestBudget(() => Math.max(0, deadline - performance.now() + 2000), () => Promise.race([work(), halted]));
+        } catch (error) { throw failure ?? error; }
+        finally { clearTimeout(timer); controller.abort(); }
+    }
+    async prepareReply(session: DraftMailSession, input: MailInput<'create_reply_draft'>, marker: MailOperationMarker): Promise<PreparedDraft> {
         sessionValid(session); this.checkMarker(session, marker);
         const parsed = mailInputSchemas.create_reply_draft.safeParse(input); if (!parsed.success) { throw new MailError('invalid_input'); }
         const data = parsed.data;
         try {
             // Render first: a renderer failure stays preflight and needs no upstream I/O.
             // Any quote is appended to the rendered parts by deriveReply, never to Markdown.
+            const plan = this.planAttachments(session, data.attachments);
             const body = renderBody(data.body);
-            const [snapshot, identities, mailbox] = await Promise.all([this.rawMessage(session, data.original), this.ownedIdentities(session), this.resolveDraftMailbox(session)]);
-            const original = this.projectMessage(snapshot, data.original);
+            // The original's JSON is reduced inside its read to what the reply uses: the projected message (capped text
+            // and HTML), its SMTP recipients and, since its own attachments are the usual source of a reply's, the
+            // SourceFiles of those it copies. The raw JSON never reaches attachment resolution.
+            const [{ original, delivered, files }, identities, mailbox] = await Promise.all([this.rawMessage(session, data.original).then(snapshot => ({
+                original: this.projectMessage(snapshot, data.original), delivered: ((snapshot.raw['envelope'] as Json)['rcpt'] as Json[]).map(item => string(item['value'])),
+                files: sourceFiles(plan.items, plan.messages.get(messageKeyOf(data.original))?.indices ?? [], snapshot.raw),
+            })), this.ownedIdentities(session), this.resolveDraftMailbox(session)]);
             // Continuing the account's own sent mail keeps the identity that sent it:
             // an owned original From comes first. Otherwise SMTP recipient evidence
             // handles Bcc delivery and takes precedence over untrusted visible
             // recipients. None of it is copied to output.
-            const delivered = (snapshot.raw['envelope'] as Json)['rcpt'] as Json[];
-            const candidates = [...original.message.from.map(item => item.address), ...delivered.map(item => string(item['value'])), ...original.message.to.map(item => item.address), ...original.message.cc.map(item => item.address)];
+            const candidates = [...original.message.from.map(item => item.address), ...delivered, ...original.message.to.map(item => item.address), ...original.message.cc.map(item => item.address)];
             // Routing recognition and reply identity are independent. Stripping
             // selects the registered identity behind the tag, never a guessed
             // substring. Skip bases that the resolver cannot use as a sender.
@@ -563,7 +795,8 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
             }).find(address => address !== undefined && identities.match(address) !== undefined);
             const from = this.selectFrom(identities, data.from ?? (selected ? namedAddress(selected, identities.name) : undefined));
             const reply = deriveReply({ original: original.message, ownedAddresses: identities.ownedAddresses, isOwnedAddress: address => identities.match(address) !== undefined, mode: data.mode, body, quoteOriginal: data.quoteOriginal, ...(data.to === undefined && data.cc === undefined ? {} : { recipients: { to: data.to ?? [], cc: data.cc ?? [] } }) });
-            const mime = await createMime({ ...reply, from, attachments: data.attachments });
+            const attachments = await this.resolveAttachments(session, plan, 0, files);
+            const mime = await createMime({ ...reply, from, attachments });
             const envelope = outbound(mime.envelope); if (envelope.from !== from.address) { throw new MailError('unsupported_content'); }
             const prepared: PreparedDraft = { mailboxId: mailbox.mailboxId, mime, marker };
             // WildDuck marks the original Answered when submitting this reference,
@@ -573,13 +806,15 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
             return prepared;
         } catch (error) { return mimeError(error); }
     }
-    async prepareCreate(session: BackendMailSession, input: DraftContent, marker: MailOperationMarker): Promise<PreparedDraft> {
+    async prepareCreate(session: DraftMailSession, input: DraftContent, marker: MailOperationMarker): Promise<PreparedDraft> {
         sessionValid(session); this.checkMarker(session, marker);
         const parsed = draftContentSchema.safeParse(input); if (!parsed.success) { throw new MailError('invalid_input'); }
         try {
+            const plan = this.planAttachments(session, parsed.data.attachments);
             const body = renderBody(parsed.data.body);
             const [mailbox, from] = await Promise.all([this.resolveDraftMailbox(session), this.ownedFrom(session, parsed.data.from)]);
-            const mime = await createMime({ ...parsed.data, from, body });
+            const attachments = await this.resolveAttachments(session, plan, 0);
+            const mime = await createMime({ ...parsed.data, from, body, attachments });
             const envelope = outbound(mime.envelope); if (envelope.from !== from.address) { throw new MailError('unsupported_content'); }
             const prepared: PreparedDraft = { mailboxId: mailbox.mailboxId, mime, marker };
             this.preparations.set(prepared, { accountId: session.accountId, envelope,
@@ -587,13 +822,14 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
             return prepared;
         } catch (error) { return mimeError(error); }
     }
-    async prepareUpdate(session: BackendMailSession, snapshot: MessageSnapshot, patch: DraftPatch, marker: MailOperationMarker, trusted: AuthoredSourceDescriptor): Promise<PreparedDraft> {
+    async prepareUpdate(session: DraftMailSession, snapshot: MessageSnapshot, patch: DraftPatch, marker: MailOperationMarker, trusted: AuthoredSourceDescriptor): Promise<PreparedDraft> {
         const state = this.state(session, snapshot); this.checkMarker(session, marker);
         if (!snapshot.isDraft) { throw new MailError('unsupported_draft'); }
         const parsed = mailInputSchemas.update_draft.safeParse({ ...patch, uid: snapshot.message.uid, expectedVersion: snapshot.message.version, operationId: marker.operationId });
         if (!parsed.success) { throw new MailError('invalid_input'); }
         try {
             // A body patch replaces the whole body; only the rendered parts are stored.
+            const plan = this.planAttachments(session, parsed.data.attachments);
             const body = parsed.data.body === undefined ? undefined : renderBody(parsed.data.body);
             const bytes = await this.authoredBytes(session, snapshot, trusted);
             const mailbox = await this.resolveDraftMailbox(session); if (mailbox.mailboxId !== snapshot.message.mailboxId) { throw new MailError('unsupported_draft'); }
@@ -604,7 +840,9 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
             const source = await inspectSource(bytes, (state.raw['attachments'] as Json[]).map(item => ({ attachmentId: string(item['id']), hash: string(item['hash']) })));
             // The parsed patch: its names and subject carry the schema's normalisation.
             const { uid: _uid, expectedVersion: _version, operationId: _operation, ...fields } = parsed.data;
-            const mime = await preparePatch(source, { ...fields, body });
+            // Resolved only now, so the retained parts count against the message cap before any fetch.
+            const attachments = await this.resolveAttachments(session, plan, retainedAttachmentBytes(source, fields.deleteAttachmentIds));
+            const mime = await preparePatch(source, { ...fields, body, attachments });
             const envelope = outbound(mime.envelope); await this.ownedFrom(session, { address: envelope.from });
             const flags = strings(state.raw['flags']); const labels = strings(state.raw['labels']);
             if (flags.some(flag => !/^\\(?:draft|deleted)$/iu.test(flag) && !addFlagSchema.safeParse(flag).success) || labels.some(label => !labelSchema.safeParse(label).success)) { throw new MailError('unsupported_content'); }

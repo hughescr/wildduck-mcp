@@ -6,14 +6,21 @@ import { mailWriteToolSchema } from './schemas';
  * never from message content, subjects, names or addresses. */
 const writeTools: readonly string[] = mailWriteToolSchema.options;
 export const isWriteTool = (name: MailToolName): name is MailWriteTool => writeTools.includes(name);
-const composes = (name: MailToolName) => name === 'create_draft' || name === 'create_reply_draft' || name === 'update_draft';
+export const composes = (name: MailToolName) => name === 'create_draft' || name === 'create_reply_draft' || name === 'update_draft';
+/** Why a draft's attachment can be missing: an upload that cannot be used, or a source that is gone. */
+const attachmentNotFound = 'an attachment uploadId is unknown, has expired, was not uploaded yet, or belongs to another connection (upload the file again with create_attachment_upload and use the new uploadId), or an attachment source message or attachment does not exist (read the message for current ids)';
+const uploadMismatch = 'an uploaded file does not have the sizeBytes and sha256 you declared (upload the right file with a new create_attachment_upload call and use its new uploadId)';
 /** Plain-language meaning of an error code for this tool, and what to do next. */
 export function errorText(code: MailFailureCode, name: MailToolName): string {
     const write = isWriteTool(name);
     const messages: Record<MailFailureCode, string> = {
-        forbidden: composes(name) ? 'Refused: the from address is not one of the account\'s own addresses, or the mail server refused the request. Use an address the account owns, or omit from.' : 'The mail server refused this request for this account.',
+        forbidden: composes(name) ? 'Refused: the from address is not one of the account\'s own addresses, or an attachment uses source and this connection lacks the mail:read permission, or the mail server refused the request. Use an address the account owns (or omit from), or ask the user to reconnect the mail account and approve mail:read.'
+            : name === 'create_attachment_upload' ? 'Refused: staging an upload needs the mail:draft permission. Ask the user to reconnect the mail account and approve it.' : 'The mail server refused this request for this account.',
         reconnect_required: 'The mail account connection has expired or was revoked. Ask the user to reconnect the mail account, then try again.',
-        not_found: name === 'create_draft' || name === 'create_reply_draft' ? 'Not found: the original message, or the account\'s Drafts mailbox, does not exist.' : 'The mailbox, message or attachment was not found; it may have been moved or deleted. List or search again for current ids.',
+        not_found: name === 'create_draft' ? `Not found: ${attachmentNotFound}, or the account has no Drafts mailbox.`
+            : name === 'create_reply_draft' ? `Not found: the original message does not exist (list or search again), or ${attachmentNotFound}.`
+            : name === 'update_draft' ? `Not found: the draft no longer exists (list the Drafts mailbox again), or ${attachmentNotFound}.`
+            : 'The mailbox, message or attachment was not found; it may have been moved or deleted. List or search again for current ids.',
         version_conflict: write ? 'The message has changed since you read it, so expectedVersion no longer matches. Read it again, check what changed, and retry with its new version.' : 'The message changed while it was being read. Read it again.',
         unsupported_draft: write ? 'This works only on a draft in the account\'s Drafts mailbox, and this message is not one.' : 'This message cannot be read by this tool.',
         unsupported_content: composes(name) || name === 'send_draft' ? 'This server cannot do this safely. Usually the draft was not created by this server, or was changed elsewhere since; only drafts created by this server and unchanged since can be edited or sent here, so create a new draft instead. Otherwise the message has content this server cannot keep or reply to.'
@@ -21,20 +28,25 @@ export function errorText(code: MailFailureCode, name: MailToolName): string {
             : name === 'get_attachment_download' ? 'This attachment cannot be offered as a download link. Use read_attachment instead (up to 2 MiB).'
             : name === 'get_thread' ? 'This message has no thread id, or has content this tool cannot return.' : 'This message or attachment has content this tool cannot return.',
         source_integrity_unavailable: 'The mail server did not return the complete message, so this cannot be done safely. Try again later.',
-        too_large: write ? 'The request is larger than allowed, for example more than 2 MiB of attachments in total, or a body or header over its size limit. Make it smaller.'
+        too_large: composes(name) ? 'Too large: the whole message, with all its attachments, is limited to 25 MiB (each file counts about 37% larger than its size), or a body or header is over its size limit. Attach fewer or smaller files, or shorten the text.'
+            : write ? 'The request is larger than allowed. Make it smaller.'
             : name === 'read_attachment' ? 'The attachment is larger than 2 MiB. Use get_attachment_download instead (up to 20 MiB).'
             : name === 'get_attachment_download' ? 'The attachment is larger than 20 MiB, so this server cannot provide it.'
             : name === 'read_messages' ? 'This message did not fit in this result, which is capped at 1 MiB. Read it alone with read_message.'
             : name === 'list_messages' || name === 'search_messages' || name === 'get_thread' ? 'The result is larger than this tool can return. Use a smaller limit.' : 'The message is larger than this tool can return; nothing was cut short.',
-        verification_failed: name === 'create_draft' || name === 'create_reply_draft' ? 'The new message could not be checked: a header did not read back exactly, or the original message could not be confirmed. Simplify the subject, names or file names and try again.'
+        verification_failed: name === 'create_draft' ? `The new draft could not be checked: a header did not read back exactly (simplify the subject, names or file names), or ${uploadMismatch}.`
+            : name === 'create_reply_draft' ? `The new draft could not be checked: a header did not read back exactly (simplify the subject, names or file names), the original message could not be confirmed, or ${uploadMismatch}.`
+            : name === 'update_draft' ? `The draft could not be changed safely: its current state could not be confirmed (an earlier change to it may be unfinished or uncertain, or it was changed outside this server; read it again and check managedOperation), or ${uploadMismatch}.`
             : write ? 'The current state of the message could not be confirmed: an earlier change to it may be unfinished or uncertain, or it was changed outside this server. Read it again (see managedOperation) before deciding what to do.' : 'The mail server returned data that could not be checked. Try again later.',
         no_recipients: write ? 'The draft has no recipients in to, cc or bcc. Add one with update_draft, then send it.' : 'The message has no recipient information.',
-        invalid_input: 'The request was rejected as invalid. Check the arguments against the tool\'s input schema.',
+        invalid_input: composes(name) ? 'The request was rejected as invalid. Check the arguments against the tool\'s input schema. If an attachment uses source, its own file name or type may not be usable here: give filename and contentType yourself.'
+            : name === 'create_attachment_upload' ? 'The request was rejected: sizeBytes must be a whole number from 1 to 18 MiB (18874368), and sha256 must be 64 lowercase hex digits of the exact file.' : 'The request was rejected as invalid. Check the arguments against the tool\'s input schema.',
         upstream_timeout: 'The mail server did not answer in time. Try again later.',
-        temporarily_unavailable: name === 'search_messages' ? 'Mail search is temporarily unavailable. Try again later.' : 'The mail service is temporarily unavailable. Try again later.',
+        temporarily_unavailable: name === 'search_messages' ? 'Mail search is temporarily unavailable. Try again later.' : name === 'create_attachment_upload' ? 'Staging uploads is temporarily unavailable. Try again later.' : 'The mail service is temporarily unavailable. Try again later.',
     };
     return messages[code] ?? messages.temporarily_unavailable;
 }
+const temporaryReasons: readonly MailFailureCode[] = ['temporarily_unavailable', 'upstream_timeout', 'source_integrity_unavailable'];
 /** The new copy's uid and version for a partial result, when the copy was confirmed. */
 const savedAs = (result: object): string => {
     const saved = 'candidateVerified' in result && result.candidateVerified === true && 'candidate' in result ? result.candidate as { uid?: unknown; version?: unknown } : undefined;
@@ -73,7 +85,9 @@ function successText(name: MailWriteTool, result: MailOutput<MailWriteTool>): st
 export function receiptSummary(name: MailWriteTool, result: MailOutput<MailWriteTool>): string | undefined {
     switch (result.status) {
         case 'completed': case 'queued': return successText(name, result);
-        case 'failed': return `Not done: ${errorText(result.reason, name)} Nothing was changed; to try again, use a new operationId.`;
+        // A failure is recorded under its operationId and replayed for any identical retry, so a retry needs a new one. When the
+        // cause is in the request or the files, say it must be fixed first; waiting is enough for a temporary fault.
+        case 'failed': return `Not done: ${errorText(result.reason, name)} ${temporaryReasons.includes(result.reason) ? 'Nothing was changed; to try again, use a new operationId.' : 'Nothing was changed. Fix the cause above, then try again with a new operationId: this one now only returns this failure.'}`;
         case 'conflict': return result.reason === 'operation_conflict'
             ? 'Conflict: this operationId was already used for a request with other arguments. Nothing was changed. Use a new operationId for a new action.'
             : 'Conflict: another change to this message is unfinished or uncertain, or the message was already moved, replaced, sent or deleted. Nothing was changed. List or read again to find the message and its current uid.';
@@ -105,6 +119,10 @@ export function readSummary(name: MailToolName, result: MailOutput<MailToolName>
     if ((name === 'list_messages' || name === 'search_messages' || name === 'get_thread') && 'messages' in result) {
         const unchecked = result.messages.filter(message => message.managedOperation?.verification === 'not_checked').length;
         if (unchecked) { notes.push(`${unchecked} of these messages ${unchecked === 1 ? 'was' : 'were'} created or changed through this server; managedOperation.verification is not_checked in lists, so read the message to find out whether it can be edited or sent here.`); }
+    }
+    // The result carries no link: it is only in the resource_link item, so it appears in no text and no log.
+    if (name === 'create_attachment_upload' && 'uploadId' in result) {
+        notes.push(`Upload ready (uploadId ${result.uploadId}). Send the file with HTTP ${result.method} to the link in the resource_link item: the file's bytes as the body and exactly the headers listed in this result, before expiresAt. For example: curl --fail -T <file> -H '<name>: <value>' '<link>' (one -H per header). Then, before expiresAt, pass uploadId in attachments of create_draft, create_reply_draft or update_draft. The draft is created only if the uploaded bytes match sizeBytes and sha256, so a successful draft call confirms the attachment equals your file. The link is a secret: do not show or store it.`);
     }
     if (name === 'search_messages' && 'search' in result && !result.search.complete) { notes.push('Fast search returned only confirmed matches and may have missed some. To find every match, repeat the same search from the first page with searchMode: "exhaustive" (slower).'); }
     // read_messages is not handled here: the service supplies its summary, because it counts toward the result's 1 MiB.

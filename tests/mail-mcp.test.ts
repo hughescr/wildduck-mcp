@@ -22,7 +22,7 @@ const summaryText = (result: { structuredContent: { summary?: string } }): strin
 const firstKey = (result: { content: TextItem[] }) => Object.keys(jsonOf(result))[0];
 /** A read_messages result as the service returns it: its summary is already in place, because the service counts it in bytesReturned. */
 const batchOf = (includeHtml: boolean, results: MailOutput<'read_messages'>['results']): MailOutput<'read_messages'> => { const summary = batchSummary(results); return { ...summary === undefined ? {} : { summary }, includeHtml, results, byteBudget: 1048576, bytesReturned: 100 }; };
-const toolNames = ['list_mailboxes', 'list_messages', 'search_messages', 'read_message', 'read_attachment', 'get_attachment_download', 'get_thread', 'read_messages', 'create_draft', 'create_reply_draft', 'update_draft', 'delete_draft', 'send_draft', 'move_message', 'update_message_flags'];
+const toolNames = ['list_mailboxes', 'list_messages', 'search_messages', 'read_message', 'read_attachment', 'get_attachment_download', 'get_thread', 'read_messages', 'create_attachment_upload', 'create_draft', 'create_reply_draft', 'update_draft', 'delete_draft', 'send_draft', 'move_message', 'update_message_flags'];
 function fixture() {
     const calls: { tool: string; input: unknown }[] = [];
     const mail: BoundMailService = {
@@ -35,6 +35,7 @@ function fixture() {
         update_message_flags: async input => { calls.push({ tool: 'update_message_flags', input }); const message = { mailboxId, uid: input.uid, version }; return { status: 'completed', operationId: input.operationId, message, verified: true, proof: { ...message, accountId: mailboxId, contentDigest: 'a'.repeat(64), sourceGrade: 'observed' } }; },
         get_attachment_download: async input => ({ metadata: { ...input, filename: null, contentType: 'text/plain', size: 5, expiresAt: '2026-10-26T10:00:00.000Z' }, url: 'https://example.s3.amazonaws.com/file?X-Amz-Signature=synthetic-secret' }),
         get_thread: async () => ({ threadId: mailboxId, messages: [] }),
+        create_attachment_upload: async input => { calls.push({ tool: 'create_attachment_upload', input }); return { metadata: { uploadId: '0b5e7c1a-3f2d-4c8b-9a6e-1d2c3b4a5f60', sizeBytes: input.sizeBytes, sha256: input.sha256, expiresAt: '2026-10-26T10:15:00.000Z', method: 'PUT' as const, headers: { 'Content-Length': String(input.sizeBytes) } }, url: 'https://example.s3.amazonaws.com/uploads/v1/x?X-Amz-Signature=synthetic-upload-secret' }; },
         read_messages: async input => ({ includeHtml: input.includeHtml, results: [{ status: 'failed', mailboxId, uid: 1, error: { code: 'not_found', message: 'not_found' } }], byteBudget: 1048576, bytesReturned: 200 }),
         create_reply_draft: async input => ({ status: 'failed', operationId: input.operationId, reason: 'unsupported_content' }),
         create_draft: async input => { calls.push({ tool: 'create_draft', input }); return { status: 'completed', operationId: input.operationId, draft: { mailboxId, uid: 2, version }, verified: true, proof: { mailboxId, uid: 2, version, accountId: mailboxId, contentDigest: 'a'.repeat(64), sourceGrade: 'mcp_authored' } }; },
@@ -84,6 +85,16 @@ test('mail exceptions redact backend messages and uncertain sends never trigger 
     f.mail.list_mailboxes = async () => { throw new MailError('reconnect_required'); }; expect((await f.call('list_mailboxes')).result.content[0].text).toContain('reconnect the mail account');
     let submissions = 0; f.mail.send_draft = async input => { submissions++; return { status: 'outcome_unknown', operationId: input.operationId, reason: 'dispatch_uncertain' }; };
     const unknown = await f.call('send_draft', { uid: 1, expectedVersion: version, operationId }); expect(unknown.result.isError).toBe(true); expect(unknown.result.structuredContent.status).toBe('outcome_unknown'); expect(summaryText(unknown.result)).toContain('Do not repeat the change under a new operationId'); expect(submissions).toBe(1);
+});
+test('create_attachment_upload needs mail:draft, is not idempotent, and puts the upload link only in a resource_link item', async () => {
+    const f = fixture(); const tool = (await f.rpc('tools/list')).result.tools.find((item: { name: string }) => item.name === 'create_attachment_upload');
+    expect(tool.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: false, idempotentHint: false });
+    const denied = await f.call('create_attachment_upload', { sizeBytes: 5, sha256: 'e'.repeat(64) }, ['mail:read']); expect(denied.result.content[0].text).toContain('needs the mail:draft permission'); expect(f.calls).toHaveLength(0);
+    const result = (await f.call('create_attachment_upload', { sizeBytes: 5, sha256: 'e'.repeat(64) })).result;
+    expect(result.isError).toBeUndefined(); expect(firstKey(result)).toBe('summary'); expect(jsonOf(result)).toEqual(result.structuredContent);
+    expect(result.structuredContent).toMatchObject({ uploadId: '0b5e7c1a-3f2d-4c8b-9a6e-1d2c3b4a5f60', sizeBytes: 5, method: 'PUT', headers: { 'Content-Length': '5' } });
+    expect(result.content[1].type).toBe('resource_link'); expect(result.content[1].uri).toContain('synthetic-upload-secret');
+    expect(JSON.stringify(result).split('synthetic-upload-secret')).toHaveLength(2); expect(JSON.stringify(result.structuredContent)).not.toContain('https:');
 });
 test('attachment binary appears once in embedded resource; metadata stays binary-free and size is checked', async () => {
     const f = fixture(); const result = (await f.call('read_attachment', { mailboxId, uid: 1, attachmentId: 'ATT1' })).result;
@@ -677,7 +688,7 @@ test('tool descriptions stay short in total, keep the clauses an agent needs and
 });
 test('output schemas allow an optional bounded summary on every result that can carry one, and nowhere else', async () => {
     const f = fixture(); const tools: { name: string; outputSchema: JsonSchema & { required?: string[]; additionalProperties?: boolean } }[] = (await f.rpc('tools/list')).result.tools;
-    const carriers = ['list_messages', 'search_messages', 'read_message', 'read_messages', 'get_thread', 'create_draft', 'create_reply_draft', 'update_draft', 'delete_draft', 'send_draft', 'move_message', 'update_message_flags'];
+    const carriers = ['list_messages', 'search_messages', 'read_message', 'read_messages', 'get_thread', 'create_attachment_upload', 'create_draft', 'create_reply_draft', 'update_draft', 'delete_draft', 'send_draft', 'move_message', 'update_message_flags'];
     const objects = (schema: JsonSchema): JsonSchema[] => (schema.anyOf ?? schema.oneOf)?.flatMap(objects) ?? [schema];
     for (const tool of tools) {
         for (const variant of objects(tool.outputSchema)) {
@@ -758,4 +769,72 @@ test('get_thread bodies count themselves exactly, and the thread summary is outs
     const counted = tools.find(tool => tool.name === 'read_messages')?.outputSchema.properties['bytesReturned']?.description; const nested = tools.find(tool => tool.name === 'get_thread')?.outputSchema.properties['bodies']?.properties?.['bytesReturned']?.description;
     expect(counted).toBe('Exact size in bytes of this whole structured result as JSON, summary included; never more than byteBudget.');
     expect(nested).toBe('Exact size in bytes of this bodies object as JSON. It does not count the rest of the get_thread result (messages, next, previous, summary).');
+});
+const draftTools = ['create_draft', 'create_reply_draft', 'update_draft'] as const;
+const uploadId = '0b5e7c1a-3f2d-4c8b-9a6e-1d2c3b4a5f60';
+const draftArguments = (name: (typeof draftTools)[number], attachments: unknown[]) => name === 'create_draft' ? { operationId, subject: '', body: { text: 'x' }, attachments } : name === 'create_reply_draft' ? { operationId, original: { mailboxId, uid: 1 }, body: { text: 'x' }, attachments } : { operationId, uid: 1, expectedVersion: version, attachments };
+test('an attachment taken from a stored message needs mail:read on every draft tool, and the refusal says which permission is missing and what else works', async () => {
+    const copied = { source: { mailboxId, uid: 3, attachmentId: 'ATT1' } }; const uploaded = { filename: 'a.pdf', contentType: 'application/pdf', uploadId };
+    for (const name of draftTools) {
+        const f = fixture(); const text = (await f.call(name, draftArguments(name, [copied]), ['mail:draft'])).result.content[0].text as string;
+        expect({ name, needs: text.includes('needs the mail:read and mail:draft permissions, which this connection was not granted.') }).toEqual({ name, needs: true });
+        expect({ name, reconnect: text.includes('Ask the user to reconnect the mail account and approve it') }).toEqual({ name, reconnect: true });
+        // Only a missing mail:read on a call that copies an attachment gets the alternative: a reply always needs mail:read anyway.
+        expect({ name, alternative: text.includes('(source) needs mail:read as well as mail:draft') && text.includes('or attach the file with uploadId or contentBase64 instead') }).toEqual({ name, alternative: name !== 'create_reply_draft' });
+        expect(f.calls).toHaveLength(0);
+        // uploadId and contentBase64 files never need mail:read, except that a reply does.
+        const plain = await f.call(name, draftArguments(name, [uploaded]), ['mail:draft']); expect({ name, refused: plain.result.isError === true && plain.result.content[0].text.includes('needs the') }).toEqual({ name, refused: name === 'create_reply_draft' });
+        // mail:read alone does not allow drafts at all.
+        const readOnly = (await f.call(name, draftArguments(name, [copied]), ['mail:read'])).result.content[0].text as string; expect({ name, text: readOnly.includes('needs the mail:read and mail:draft permissions') && !readOnly.includes('(source)') }).toEqual({ name, text: true });
+    }
+    const f = fixture(); expect((await f.call('create_draft', draftArguments('create_draft', [copied]))).result.isError).toBeUndefined(); expect(f.calls).toHaveLength(1);
+});
+test('the upload result tells a model how to send the file, what to do next and that the link is secret, without the link', async () => {
+    const f = fixture(); const result = (await f.call('create_attachment_upload', { sizeBytes: 5, sha256: 'e'.repeat(64) })).result; const summary = summaryText(result) ?? '';
+    expect(summary.length).toBeGreaterThan(0); expect(summary.length).toBeLessThanOrEqual(MAX_SUMMARY_CHARACTERS); expect(firstKey(result)).toBe('summary');
+    for (const phrase of ['uploadId 0b5e7c1a-3f2d-4c8b-9a6e-1d2c3b4a5f60', 'HTTP PUT', 'resource_link item', 'exactly the headers listed', 'before expiresAt', "curl --fail -T <file> -H '<name>: <value>' '<link>'", 'create_draft, create_reply_draft or update_draft', 'only if the uploaded bytes match sizeBytes and sha256', 'confirms the attachment equals your file', 'The link is a secret']) {
+        expect({ phrase, found: summary.includes(phrase) }).toEqual({ phrase, found: true });
+    }
+    expect(summary).not.toMatch(BANNED); expect(summary).not.toContain('https:'); expect(JSON.stringify(result.content[0])).not.toContain('synthetic-upload-secret');
+    expect(result.structuredContent.method).toBe('PUT'); expect(result.structuredContent.headers).toEqual({ 'Content-Length': '5' });
+    const refused = (await f.call('create_attachment_upload', { sizeBytes: 0, sha256: 'e'.repeat(64) })); expect(Boolean(refused.error || refused.result?.isError)).toBe(true); expect(JSON.stringify(refused)).not.toContain('synthetic-upload-secret');
+    f.mail.create_attachment_upload = async () => { throw new MailError('temporarily_unavailable'); };
+    const unavailable = (await f.call('create_attachment_upload', { sizeBytes: 5, sha256: 'e'.repeat(64) })).result;
+    expect(unavailable.isError).toBe(true); expect(unavailable.content[0].text).toContain('Staging uploads is temporarily unavailable. Try again later.'); expect(unavailable.content[0].text).not.toContain('operationId');
+});
+test('draft failures from uploads and copied attachments say what is wrong and how to fix it, and retry advice never contradicts itself', async () => {
+    const causes = { not_found: ['uploadId is unknown, has expired, was not uploaded yet, or belongs to another connection', 'create_attachment_upload', 'attachment source message or attachment does not exist'], verification_failed: ['sizeBytes and sha256 you declared', 'new create_attachment_upload call'], too_large: ['25 MiB', 'about 37% larger'], invalid_input: ['source, its own file name or type may not be usable', 'give filename and contentType yourself'], forbidden: ['mail:read permission', 'reconnect the mail account and approve mail:read'] } as const;
+    for (const name of draftTools) {
+        for (const [code, phrases] of Object.entries(causes)) {
+            const text = errorText(code as never, name);
+            for (const phrase of phrases) { expect({ name, code, phrase, found: text.includes(phrase) }).toEqual({ name, code, phrase, found: true }); }
+            expect({ name, code, banned: text.match(BANNED)?.[0] }).toEqual({ name, code, banned: undefined });
+            // Stored failure (a preflight failure is a receipt): fix the cause, then a NEW operationId. It fits the summary field.
+            const f = fixture(); f.mail[name] = async input => ({ status: 'failed', operationId: input.operationId, reason: code as never });
+            const summary = summaryText((await f.call(name, draftArguments(name, [{ filename: 'a.pdf', contentType: 'application/pdf', uploadId }]))).result) ?? '';
+            expect({ name, code, fits: summary.length <= MAX_SUMMARY_CHARACTERS, fix: summary.includes('Fix the cause above, then try again with a new operationId'), keeps: summary.includes(text) }).toEqual({ name, code, fits: true, fix: true, keeps: true });
+            expect(summary).not.toMatch(/reuse the same operationId/u);
+        }
+        expect(errorText('too_large', name)).not.toContain('2 MiB of attachments');
+    }
+    // Temporary faults keep the earlier wording, and no tool but the drafts claims the new causes.
+    expect(receiptSummary('create_draft', { status: 'failed', operationId, reason: 'temporarily_unavailable' })).toBe('Not done: The mail service is temporarily unavailable. Try again later. Nothing was changed; to try again, use a new operationId.');
+    for (const name of ['delete_draft', 'send_draft', 'move_message', 'update_message_flags'] as const) { expect(errorText('not_found', name)).not.toContain('uploadId'); expect(errorText('too_large', name)).not.toContain('25 MiB'); }
+    // A thrown error carries no stored failure: the same operationId stays right for the same arguments, a changed one needs a new id.
+    for (const name of draftTools) {
+        const f = fixture(); f.mail[name] = async () => { throw new MailError('verification_failed'); };
+        const text = (await f.call(name, draftArguments(name, [{ filename: 'a.pdf', contentType: 'application/pdf', uploadId }]))).result.content[0].text as string;
+        expect({ name, same: text.includes('To retry, reuse the same operationId.'), changed: text.includes('If you change the arguments, for example to a new uploadId, use a new operationId.') }).toEqual({ name, same: true, changed: true });
+        f.mail[name] = async () => { throw new MailError('not_found'); };
+        const missing = (await f.call(name, draftArguments(name, [{ filename: 'a.pdf', contentType: 'application/pdf', uploadId }]))).result.content[0].text as string; expect({ name, reuse: missing.includes('reuse the same operationId') }).toEqual({ name, reuse: false });
+    }
+    const f = fixture(); f.mail.delete_draft = async () => { throw new MailError('verification_failed'); };
+    const deleted = (await f.call('delete_draft', { uid: 1, expectedVersion: version, operationId })).result.content[0].text as string; expect(deleted).toContain('To retry, reuse the same operationId.'); expect(deleted).not.toContain('uploadId');
+});
+test('the server instructions and tool descriptions say how to attach a file', async () => {
+    const f = fixture(); const tools: { name: string; description: string }[] = (await f.rpc('tools/list')).result.tools;
+    expect(SERVER_INSTRUCTIONS).toContain('create_attachment_upload'); expect(SERVER_INSTRUCTIONS.length).toBeLessThanOrEqual(1000);
+    const description = tools.find(tool => tool.name === 'create_attachment_upload')?.description ?? '';
+    for (const phrase of ['PUT', 'resource_link', 'exactly the returned headers', 'expiresAt', 'uploadId in attachments', 'SHA-256', 'The link is a secret']) { expect({ phrase, found: description.includes(phrase) }).toEqual({ phrase, found: true }); }
+    expect(description).not.toMatch(BANNED);
 });

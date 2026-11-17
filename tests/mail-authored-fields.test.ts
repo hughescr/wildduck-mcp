@@ -7,14 +7,20 @@ import { describe, expect, test } from 'bun:test';
 import { isEmailValid } from '@hapi/address';
 import libmime from 'libmime';
 import { createMime, inspectSource, preparePatch, hasAttachmentReference, MIME_LIMITS, type MimeAddress, type MimeAttachment, type MimeCreate } from '../src/mail/mime';
-import { mailInputSchemas, draftContentSchema, createReplyDraftInputSchema, updateDraftInputSchema, inputAddressSchema, newAttachmentSchema, draftBodySchema } from '../src/mail/schemas';
+import { mailInputSchemas, draftContentSchema, createReplyDraftInputSchema, updateDraftInputSchema, inputAddressSchema, base64AttachmentSchema, draftBodySchema, type NewAttachment } from '../src/mail/schemas';
 import { decodedAddresses, partViews, rawParameters, rootHeaderLines, unfold, xorshift, type PartView } from './mime-fields';
 
 const operationId = 'operation-id-0123456789';
 const target = { uid: 1, expectedVersion: 'a'.repeat(43), operationId };
 const body = { text: 'Body' };
 const fresh = (over: Partial<MimeCreate> = {}): MimeCreate => ({ from: { address: 'sender@example.test' }, to: [{ address: 'to@example.test' }], cc: [], bcc: [], subject: 'S', body: { text: 'Body', html: null }, ...over });
-const attach = (over: Partial<MimeAttachment> = {}): MimeAttachment => ({ filename: 'a.bin', contentType: 'application/octet-stream', contentBase64: 'aGk=', disposition: 'attachment', ...over });
+/** A contentBase64 attachment as the schema takes it. */
+interface SchemaAttachment { filename: string; contentType: string; contentBase64: string; disposition: 'attachment' | 'inline'; cid?: string | undefined }
+const attach = (over: Partial<SchemaAttachment> = {}): SchemaAttachment => ({ filename: 'a.bin', contentType: 'application/octet-stream', contentBase64: 'aGk=', disposition: 'attachment', ...over });
+/** The same attachment as the MIME layer takes it: its bytes decoded once, as the backend does. */
+const toMime = ({ contentBase64, ...rest }: SchemaAttachment): MimeAttachment => ({ ...rest, bytes: Buffer.from(contentBase64, 'base64') });
+/** These cases use only contentBase64, the source that needs no I/O to resolve. */
+const inline = (values: readonly NewAttachment[] | undefined): MimeAttachment[] | undefined => values?.map(item => { if (!('contentBase64' in item)) { throw new Error('contentBase64 attachments only'); } return toMime(item); });
 const messages = (result: { success: boolean; error?: { issues: { message: string }[] } }) => [...new Set(result.error?.issues.map(issue => issue.message) ?? [])];
 const headerNames = (raw: Buffer) => raw.subarray(0, raw.indexOf('\r\n\r\n')).toString('latin1').split('\r\n').filter(line => !/^[ \t]/u.test(line)).map(line => line.slice(0, line.indexOf(':')));
 const rootLines = (raw: Buffer) => raw.subarray(0, raw.indexOf('\r\n\r\n')).toString('latin1').split('\r\n');
@@ -146,8 +152,8 @@ const FILENAMES = [
     'sin gle.txt', "it's.txt", '100%.txt', '50%25.txt', 'a,b.txt', '-x', '..', '.', 'x\\', '"', '\\', "'", '*', 'a*b', 'n=v', 'a=b.txt', 'x"; filename="evil.exe', 'x"\\"', 'a\u200fb.txt', 'nbsp\u00a0.txt', 'a\u2028b', 'x?=y', '=', '?',
     'x'.repeat(255), 'é'.repeat(127), '日'.repeat(85), '😀'.repeat(63), 'my report '.repeat(25).trim(), 'Q"'.repeat(127), '%'.repeat(255), '\\'.repeat(255), 'a_b '.repeat(60).trim(), 'x'.repeat(80) + '=41_?y',
 ];
-async function onlyAttachment(filename: string, over: Partial<MimeAttachment> = {}): Promise<{ raw: Buffer; view: PartView }> {
-    const raw = (await createMime(fresh({ attachments: [attach({ filename, ...over })] }))).raw;
+async function onlyAttachment(filename: string, over: Partial<SchemaAttachment> = {}): Promise<{ raw: Buffer; view: PartView }> {
+    const raw = (await createMime(fresh({ attachments: [toMime(attach({ filename, ...over }))] }))).raw;
     const views = await partViews(raw);
     const view = views.find(item => item.contentType === (over.contentType ?? 'application/octet-stream').toLowerCase() && item.disposition === (over.disposition ?? 'attachment'));
     if (view === undefined) { throw new Error('attachment part missing'); }
@@ -156,7 +162,7 @@ async function onlyAttachment(filename: string, over: Partial<MimeAttachment> = 
 describe('attachment filenames', () => {
     test('every accepted filename reads back exactly through mailsplit and libmime, with only its own parameters', async () => {
         for (const filename of FILENAMES) {
-            expect(newAttachmentSchema.parse(attach({ filename })).filename).toBe(filename);
+            expect(base64AttachmentSchema.parse(attach({ filename })).filename).toBe(filename);
             const { raw, view } = await onlyAttachment(filename);
             expect(view.filename).toBe(filename);
             // Both the Content-Disposition filename and the Content-Type name decode to the caller's name.
@@ -171,23 +177,23 @@ describe('attachment filenames', () => {
     });
     test('the schema rejects controls, unpaired surrogates, "=?", edge whitespace, empty and oversized names with specific messages', () => {
         for (const filename of ['a\tb', 'a\u0001b', 'a\u007fb', 'a\nb', 'a\rb', 'a\0b', '../file\nInjected', 'x"\r\nContent-Type: text/html']) {
-            expect(messages(newAttachmentSchema.safeParse(attach({ filename })))).toEqual(['Control characters are forbidden.']);
+            expect(messages(base64AttachmentSchema.safeParse(attach({ filename })))).toEqual(['Control characters are forbidden.']);
         }
-        for (const filename of ['\ud800', 'a\udc00']) { expect(messages(newAttachmentSchema.safeParse(attach({ filename })))).toEqual(['Unpaired UTF-16 surrogates are forbidden.']); }
-        for (const filename of ['=?', 'a=?utf-8?q?x?=.txt', '=?UTF-8?B?eA==?=.txt']) { expect(messages(newAttachmentSchema.safeParse(attach({ filename })))).toEqual(['The sequence "=?" is not supported in this field.']); }
-        for (const filename of [' lead.txt', 'trail.txt ', ' ', '\u00a0x', 'x\u2028']) { expect(messages(newAttachmentSchema.safeParse(attach({ filename })))).toEqual(['File names must not start or end with whitespace.']); }
+        for (const filename of ['\ud800', 'a\udc00']) { expect(messages(base64AttachmentSchema.safeParse(attach({ filename })))).toEqual(['Unpaired UTF-16 surrogates are forbidden.']); }
+        for (const filename of ['=?', 'a=?utf-8?q?x?=.txt', '=?UTF-8?B?eA==?=.txt']) { expect(messages(base64AttachmentSchema.safeParse(attach({ filename })))).toEqual(['The sequence "=?" is not supported in this field.']); }
+        for (const filename of [' lead.txt', 'trail.txt ', ' ', '\u00a0x', 'x\u2028']) { expect(messages(base64AttachmentSchema.safeParse(attach({ filename })))).toEqual(['File names must not start or end with whitespace.']); }
         // A long name may be folded inside a whitespace run, which every reader unfolds to one space.
-        for (const filename of ['dou  ble.txt', 'a \u00a0b', 'x'.repeat(60) + '   y']) { expect(messages(newAttachmentSchema.safeParse(attach({ filename })))).toEqual(['File names must not contain repeated whitespace.']); }
-        expect(messages(newAttachmentSchema.safeParse(attach({ filename: '   ' })))).toEqual(['File names must not start or end with whitespace.', 'File names must not contain repeated whitespace.']);
-        expect(newAttachmentSchema.safeParse(attach({ filename: '' })).success).toBe(false);
-        expect(messages(newAttachmentSchema.safeParse(attach({ filename: 'é'.repeat(128) })))).toEqual(['At most 255 UTF-8 bytes.']);
-        expect(newAttachmentSchema.safeParse(attach({ filename: 'x'.repeat(255) })).success).toBe(true);
+        for (const filename of ['dou  ble.txt', 'a \u00a0b', 'x'.repeat(60) + '   y']) { expect(messages(base64AttachmentSchema.safeParse(attach({ filename })))).toEqual(['File names must not contain repeated whitespace.']); }
+        expect(messages(base64AttachmentSchema.safeParse(attach({ filename: '   ' })))).toEqual(['File names must not start or end with whitespace.', 'File names must not contain repeated whitespace.']);
+        expect(base64AttachmentSchema.safeParse(attach({ filename: '' })).success).toBe(false);
+        expect(messages(base64AttachmentSchema.safeParse(attach({ filename: 'é'.repeat(128) })))).toEqual(['At most 255 UTF-8 bytes.']);
+        expect(base64AttachmentSchema.safeParse(attach({ filename: 'x'.repeat(255) })).success).toBe(true);
     });
     test('defence in depth rejects the same names in the MIME layer', async () => {
         // The read-back check catches what the schema refuses: an encoded-word look-alike, edge
         // whitespace that readers trim, and a whitespace run that the library folds inside.
         for (const filename of ['', 'a\tb', 'a\nb', '\ud800', 'x'.repeat(256), 'a=?utf-8?q?x?=.txt', 'Tc>FuQ$u:wk😀QéfhB1^  `P  f.😀z&Li[";qtkFnY日<‏&IZvB&E[L Q   ZCyx9']) {
-            await expect(createMime(fresh({ attachments: [attach({ filename })] }))).rejects.toMatchObject({ code: 'invalid_mime_patch' });
+            await expect(createMime(fresh({ attachments: [toMime(attach({ filename }))] }))).rejects.toMatchObject({ code: 'invalid_mime_patch' });
         }
     });
     test('property: seeded random schema-valid filenames never fail and read back exactly', async () => {
@@ -201,7 +207,7 @@ describe('attachment filenames', () => {
             let filename = '';
             for (let count = next() % 120; count > 0; count--) { filename += pool[next() % pool.length]; }
             if (next() % 25 === 0) { const at = next() % (filename.length + 1); filename = filename.slice(0, at) + (['\t', '\u0001', '\u007f', '\ud800', '=?'][next() % 5] ?? '\t') + filename.slice(at); }
-            if (!newAttachmentSchema.safeParse(attach({ filename })).success) { rejected++; continue; }
+            if (!base64AttachmentSchema.safeParse(attach({ filename })).success) { rejected++; continue; }
             const { view } = await onlyAttachment(filename);
             expect(view.filename).toBe(filename);
             expect(libmime.decodeWords(rawParameters(view).name)).toBe(filename);
@@ -216,7 +222,7 @@ const CONTENT_TYPES = ['application/pdf', 'APPLICATION/PDF', 'Image/PNG', 'image
 describe('content types', () => {
     test('every accepted type is written lower case and read back; PGP and S/MIME files attach like any other', async () => {
         for (const contentType of CONTENT_TYPES) {
-            expect(newAttachmentSchema.safeParse(attach({ contentType })).success).toBe(true);
+            expect(base64AttachmentSchema.safeParse(attach({ contentType })).success).toBe(true);
             const { raw, view } = await onlyAttachment('f.bin', { contentType });
             expect(view.contentType).toBe(contentType.toLowerCase());
             foldedWell(view.headerLines);
@@ -227,30 +233,34 @@ describe('content types', () => {
     test('the schema rejects what has no safe single-part form, with one message', () => {
         const message = 'Content type must be type/subtype without parameters; multipart/* and message/* other than message/rfc822 are not supported.';
         for (const contentType of ['multipart/mixed', 'MULTIPART/related', 'message/partial', 'message/external-body', 'message/delivery-status', 'Message/Global', 'text/plain; charset=utf-8', 'text', 'a/b/c', '/b', 'a/', 'a b/c', 'application/pdf\r\nX: y', 'é/x', '']) {
-            expect(messages(newAttachmentSchema.safeParse(attach({ contentType })))).toEqual([message]);
+            expect(messages(base64AttachmentSchema.safeParse(attach({ contentType })))).toEqual([message]);
         }
-        expect(messages(newAttachmentSchema.safeParse(attach({ contentType: 'a/' + 'b'.repeat(254) })))).toContain('Too big: expected string to have <=255 characters');
-        for (const disposition of ['', 'Attachment', 'form-data', 'attachment; filename=x']) { expect(newAttachmentSchema.safeParse(attach({ disposition: disposition as 'inline' })).success).toBe(false); }
-        expect(newAttachmentSchema.parse({ filename: 'a', contentType: 'a/b', contentBase64: '' }).disposition).toBe('attachment');
+        expect(messages(base64AttachmentSchema.safeParse(attach({ contentType: 'a/' + 'b'.repeat(254) })))).toContain('Too big: expected string to have <=255 characters');
+        for (const disposition of ['', 'Attachment', 'form-data', 'attachment; filename=x']) { expect(base64AttachmentSchema.safeParse(attach({ disposition: disposition as 'inline' })).success).toBe(false); }
+        expect(base64AttachmentSchema.parse({ filename: 'a', contentType: 'a/b', contentBase64: '' }).disposition).toBe('attachment');
     });
     test('text/plain and text/html inline parts are rejected up front because readers take them for the body', async () => {
         const message = 'Inline text/plain and text/html attachments cannot be told from the body; use disposition attachment.';
         for (const contentType of ['text/plain', 'TEXT/HTML']) {
-            expect(messages(newAttachmentSchema.safeParse(attach({ contentType, disposition: 'inline', cid: 'x@y' })))).toEqual([message]);
-            await expect(createMime(fresh({ attachments: [attach({ contentType, disposition: 'inline', cid: 'x@y' })] }))).rejects.toMatchObject({ code: 'invalid_mime_patch' });
-            expect(newAttachmentSchema.safeParse(attach({ contentType, disposition: 'attachment', cid: 'x@y' })).success).toBe(true);
+            expect(messages(base64AttachmentSchema.safeParse(attach({ contentType, disposition: 'inline', cid: 'x@y' })))).toEqual([message]);
+            await expect(createMime(fresh({ attachments: [toMime(attach({ contentType, disposition: 'inline', cid: 'x@y' }))] }))).rejects.toMatchObject({ code: 'invalid_mime_patch' });
+            expect(base64AttachmentSchema.safeParse(attach({ contentType, disposition: 'attachment', cid: 'x@y' })).success).toBe(true);
         }
-        expect(newAttachmentSchema.safeParse(attach({ contentType: 'text/calendar', disposition: 'inline', cid: 'x@y' })).success).toBe(true);
+        expect(base64AttachmentSchema.safeParse(attach({ contentType: 'text/calendar', disposition: 'inline', cid: 'x@y' })).success).toBe(true);
     });
     test('message/rfc822 needs CRLF line endings because it is stored with an identity encoding', async () => {
         const message = 'message/rfc822 content must use CRLF line endings.';
         const eml = (text: string) => Buffer.from(text).toString('base64');
-        for (const content of ['From: a@b.c\nSubject: x\n\nbody\n', 'a\r\nb\n', '\n']) { expect(messages(newAttachmentSchema.safeParse(attach({ contentType: 'message/rfc822', contentBase64: eml(content) })))).toEqual([message]); }
+        for (const content of ['From: a@b.c\nSubject: x\n\nbody\n', 'a\r\nb\n', '\n']) { expect(messages(base64AttachmentSchema.safeParse(attach({ contentType: 'message/rfc822', contentBase64: eml(content) })))).toEqual([message]); }
         for (const content of ['From: a@b.c\r\nSubject: x\r\n\r\nbody\r\n', '', 'no line breaks', 'a\r\nb\r\n']) {
-            expect(newAttachmentSchema.safeParse(attach({ contentType: 'message/rfc822', contentBase64: eml(content) })).success).toBe(true);
-            await createMime(fresh({ attachments: [attach({ contentType: 'message/rfc822', contentBase64: eml(content) })] }));
+            expect(base64AttachmentSchema.safeParse(attach({ contentType: 'message/rfc822', contentBase64: eml(content) })).success).toBe(true);
+            await createMime(fresh({ attachments: [toMime(attach({ contentType: 'message/rfc822', contentBase64: eml(content) }))] }));
         }
-        expect(newAttachmentSchema.safeParse(attach({ contentType: 'application/octet-stream', contentBase64: eml('a\nb\n') })).success).toBe(true);
+        // The MIME layer applies the same rule to bytes from any source, as the caller's error.
+        for (const content of ['From: a@b.c\nSubject: x\n\nbody\n', 'a\r\nb\n', '\n']) {
+            await expect(createMime(fresh({ attachments: [toMime(attach({ contentType: 'message/rfc822', contentBase64: eml(content) }))] }))).rejects.toMatchObject({ code: 'invalid_attachment' });
+        }
+        expect(base64AttachmentSchema.safeParse(attach({ contentType: 'application/octet-stream', contentBase64: eml('a\nb\n') })).success).toBe(true);
     });
 });
 
@@ -258,7 +268,7 @@ const CIDS = ['x', 'logo@example.test', 'a.b.c', 'a..b', '!#$%&\'*+-/=?^_`{|}~',
 describe('content ids', () => {
     test('every accepted cid is written as one Content-ID and read back, long ones on a continuation line', async () => {
         for (const cid of CIDS) {
-            expect(newAttachmentSchema.safeParse(attach({ contentType: 'image/png', disposition: 'inline', cid })).success).toBe(true);
+            expect(base64AttachmentSchema.safeParse(attach({ contentType: 'image/png', disposition: 'inline', cid })).success).toBe(true);
             const { raw, view } = await onlyAttachment('i.png', { contentType: 'image/png', disposition: 'inline', cid });
             expect(view.contentId).toBe(`<${cid}>`);
             expect(view.headerLines.join('\r\n')).toContain(`<${cid}>`);
@@ -268,11 +278,11 @@ describe('content ids', () => {
     test('the schema rejects every character a Content-ID cannot carry, with one message', () => {
         const message = 'CID may contain only letters, digits and ! # $ % & \' * + - . / = ? ^ _ ` { | } ~ @.';
         for (const cid of ['a b', 'a<b>', '<x>', 'a"b', 'a(b)', 'a,b', 'a:b', 'a;b', 'a[b]', 'a\\b', 'é', '日本', '😀', 'a\tb', 'a\nb', 'a\r\nX: y', 'a\0b', 'a\u007fb', 'a\u00a0b', '\ud800']) {
-            expect(messages(newAttachmentSchema.safeParse(attach({ contentType: 'image/png', disposition: 'inline', cid })))).toContain(message);
+            expect(messages(base64AttachmentSchema.safeParse(attach({ contentType: 'image/png', disposition: 'inline', cid })))).toContain(message);
         }
-        expect(newAttachmentSchema.safeParse(attach({ cid: '' })).success).toBe(false);
-        expect(newAttachmentSchema.safeParse(attach({ cid: 'x'.repeat(256) })).success).toBe(false);
-        expect(messages(newAttachmentSchema.safeParse(attach({ disposition: 'inline' })))).toEqual(['Inline attachments require a CID.']);
+        expect(base64AttachmentSchema.safeParse(attach({ cid: '' })).success).toBe(false);
+        expect(base64AttachmentSchema.safeParse(attach({ cid: 'x'.repeat(256) })).success).toBe(false);
+        expect(messages(base64AttachmentSchema.safeParse(attach({ disposition: 'inline' })))).toEqual(['Inline attachments require a CID.']);
     });
     test('property: seeded random cids from the accepted alphabet never fail and read back exactly', async () => {
         const next = xorshift(0x1234abcd);
@@ -280,7 +290,7 @@ describe('content ids', () => {
         for (let round = 0; round < 200; round++) {
             let cid = '';
             for (let count = 1 + next() % 255; count > 0; count--) { cid += alphabet[next() % alphabet.length]; }
-            expect(newAttachmentSchema.safeParse(attach({ contentType: 'image/png', disposition: 'inline', cid })).success).toBe(true);
+            expect(base64AttachmentSchema.safeParse(attach({ contentType: 'image/png', disposition: 'inline', cid })).success).toBe(true);
             expect((await onlyAttachment('i.png', { contentType: 'image/png', disposition: 'inline', cid })).view.contentId).toBe(`<${cid}>`);
         }
     });
@@ -366,7 +376,7 @@ describe('injection', () => {
             const parsed = draftContentSchema.safeParse({ to: [{ address: 'to@example.test', name }], cc: [{ address: 'cc@example.test', name }], subject: name, body, attachments: [attach({ filename: name })] });
             if (/[\r\n]|=\?/u.test(name)) { expect(parsed.success).toBe(false); continue; }
             if (!parsed.success) { throw new Error('schema rejected a legal value'); }
-            const raw = (await createMime({ ...parsed.data, from: { address: 'sender@example.test' }, body: { text: 'Body', html: null } })).raw;
+            const raw = (await createMime({ ...parsed.data, attachments: inline(parsed.data.attachments), from: { address: 'sender@example.test' }, body: { text: 'Body', html: null } })).raw;
             expect(decodedAddresses(raw, 'To')).toEqual([{ address: 'to@example.test', name }]);
             expect(decodedAddresses(raw, 'Cc')).toEqual([{ address: 'cc@example.test', name }]);
             expect(headerNames(raw).filter(header => /^bcc$/iu.test(header))).toEqual([]);
@@ -391,7 +401,7 @@ describe('limits', () => {
         expect(messages(parsed)).toEqual([]);
         const input = parsed.data;
         if (input === undefined) { throw new Error('schema rejected the maximal draft'); }
-        const created = await createMime({ ...input, from: input.from ?? { address: 'a@example.test' }, body: { text: 'x', html: null } });
+        const created = await createMime({ ...input, attachments: inline(input.attachments), from: input.from ?? { address: 'a@example.test' }, body: { text: 'x', html: null } });
         const root = created.raw.indexOf('\r\n\r\n') + 4;
         expect(root).toBeGreaterThan(170_000); expect(root).toBeLessThan(MIME_LIMITS.headerBytes);
         const views = await partViews(created.raw);
@@ -405,10 +415,10 @@ describe('limits', () => {
 
 describe('patches author the same bytes', () => {
     test('update_draft patch writes Unicode names and filenames and preserves everything else', async () => {
-        const original = await createMime(fresh({ to: [{ address: 'to@example.test', name: 'Old' }], subject: 'Subject', attachments: [attach({ filename: 'keep.bin' })] }));
+        const original = await createMime(fresh({ to: [{ address: 'to@example.test', name: 'Old' }], subject: 'Subject', attachments: [toMime(attach({ filename: 'keep.bin' }))] }));
         const inspected = await inspectSource(original.raw);
         const patch = updateDraftInputSchema.parse({ ...target, to: [{ address: 'new@example.test', name: 'Zoë "Z", 日本 😀' }], from: { address: 'sender@example.test', name: 'a ?= b' }, replyTo: [{ address: 'r@example.test', name: ' padded ' }], attachments: [{ filename: 'résumé "final"; 100%.pdf', contentType: 'application/pdf', contentBase64: 'aGk=' }] });
-        const patched = await preparePatch(inspected, { to: patch.to, from: patch.from, replyTo: patch.replyTo, attachments: patch.attachments });
+        const patched = await preparePatch(inspected, { to: patch.to, from: patch.from, replyTo: patch.replyTo, attachments: inline(patch.attachments) });
         expect(decodedAddresses(patched.raw, 'To')).toEqual([{ address: 'new@example.test', name: 'Zoë "Z", 日本 😀' }]);
         expect(decodedAddresses(patched.raw, 'From')).toEqual([{ address: 'sender@example.test', name: 'a ?= b' }]);
         expect(decodedAddresses(patched.raw, 'Reply-To')).toEqual([{ address: 'r@example.test', name: 'padded' }]);

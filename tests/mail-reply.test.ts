@@ -184,7 +184,7 @@ describe('reply derivation', () => {
         expect(raw).not.toContain('Bcc:');
         const patched = await preparePatch(await inspectSource(created.raw), {
             subject: 'Edited reply', body: { text: 'Edited body', html: null },
-            to: [{ address: 'new@example.test' }], attachments: [{ filename: 'new.txt', contentType: 'text/plain', contentBase64: 'bmV3', disposition: 'attachment' }],
+            to: [{ address: 'new@example.test' }], attachments: [{ filename: 'new.txt', contentType: 'text/plain', bytes: Buffer.from('new'), disposition: 'attachment' }],
         });
         expect(patched.raw.toString()).toContain('In-Reply-To: <original@example.test>\r\n');
         expect(patched.raw.toString()).toContain('References: <first@example.test> <prior@example.test>\r\n <original@example.test>\r\n');

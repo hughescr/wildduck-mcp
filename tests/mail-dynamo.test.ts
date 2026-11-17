@@ -1,4 +1,4 @@
-import { describe, expect, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { isDeepStrictEqual } from 'node:util';
 import { GetCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import type { DynamoSender } from '../src/auth/dynamo-store';
@@ -6,8 +6,15 @@ import type { AuthInfo } from '@modelcontextprotocol/server';
 import { digest as hashOf } from '../src/auth/crypto';
 import { handleMcp } from '../src/mcp';
 import { DynamoMailOperationStore } from '../src/mail/dynamo-store';
-import { createMailService } from '../src/mail/service';
-import type { BoundMailService, ConfirmedReceipt, MailContext, MailOperationStore, OperationClaim, OperationKey, SourceGrade, WriteIntent } from '../src/mail/contracts';
+import { createMailService, PREFLIGHT_RESERVE_MS, RESERVE_ADMISSION_MS } from '../src/mail/service';
+import { MailError, type BoundMailService, type ConfirmedReceipt, type MailContext, type MailOperationStore, type MailService, type OperationClaim, type OperationKey, type SourceGrade, type WriteIntent } from '../src/mail/contracts';
+import { DEFAULT_THROTTLE_TIMEOUT_MS, RESPONSE_RESERVE_MS } from '../src/dynamo-retry';
+import { remainingRequestTimeMs, withRequestBudget } from '../src/request-budget';
+import { cancelled, captureWarnings, steppedClock, throttleError, virtualRetry } from './dynamo-virtual';
+let logs: Record<string, unknown>[] = [];
+let restoreWarnings = () => {};
+beforeEach(() => { const captured = captureWarnings(); logs = captured.lines; restoreWarnings = captured.restore; });
+afterEach(() => { restoreWarnings(); });
 const mailboxId = 'a'.repeat(24); const digest = 'd'.repeat(43); const owner = 'owner-token-'.padEnd(43, 'a');
 const key = (operationId = 'operation-00000001', clientIdHash = 'c'.repeat(43), accountId = '1'.repeat(24)): OperationKey => ({ accountId, clientIdHash, operationId });
 const intent = (operationId = 'operation-00000001', tool: Exclude<WriteIntent['tool'], 'create_draft' | 'create_reply_draft'> = 'send_draft'): Exclude<WriteIntent, { tool: 'create_draft' | 'create_reply_draft' }> => ({ ...key(operationId), tool, payloadDigest: digest, target: { mailboxId, uid: 1 }, expectedVersion: digest });
@@ -20,8 +27,12 @@ class ModelSender implements DynamoSender {
     readonly committed = new Map<string, string>();
     fault: 'none' | 'lost_once' | 'unknown_always' | 'lost_persistent' = 'none';
     beforeTransaction: (() => void) | undefined;
+    /** Errors thrown by the next calls of each kind, before the command is applied (throttles, conflicts). */
+    readonly failures: { get: unknown[]; transact: unknown[] } = { get: [], transact: [] };
     async send(command: GetCommand | TransactWriteCommand): Promise<unknown> {
         this.calls.push(command);
+        const failure = (command instanceof GetCommand ? this.failures.get : this.failures.transact).shift();
+        if (failure !== undefined) { throw failure; }
         if (command instanceof GetCommand) { return { Item: structuredClone(this.records.get(String(command.input.Key?.pk))) }; }
         if (this.fault === 'unknown_always') { throw new Error('ambiguous socket outcome'); }
         const token = String(command.input.ClientRequestToken); const payload = JSON.stringify(command.input.TransactItems);
@@ -47,7 +58,9 @@ class ModelSender implements DynamoSender {
         return {};
     }
 }
-function fixture(timeoutMs = 5000) { const client = new ModelSender(); return { client, store: new DynamoMailOperationStore({ tableName: 'MailTable', client, timeoutMs }) }; }
+// A virtual clock: backoff waits cost no real time, and the longest jitter makes the schedule deterministic.
+function fixture(timeoutMs = 5000) { const client = new ModelSender(); const virtual = virtualRetry(); return { client, virtual, store: new DynamoMailOperationStore({ tableName: 'MailTable', client, timeoutMs, retry: virtual.retry }) }; }
+const throttled = (attempt: number, operation: string) => ({ event: 'dynamodb_throttled', store: 'mail', operation, attempt });
 async function lifecycleMatrix(store: MailOperationStore): Promise<void> {
     const send = intent();
     const reserved = await claim(store, send);
@@ -275,6 +288,47 @@ describe('Dynamo mail operation adapter', () => {
         delete record.receipt.proof.sourceGrade;
         await expect(store.getOperation(key(value.operationId))).rejects.toThrow('temporarily_unavailable');
     });
+    test('throttled reads and a throttled transaction are retried with backoff; the transaction keeps one token and applies once', async () => {
+        const { client, store, virtual } = fixture();
+        client.failures.get.push(throttleError(), throttleError('ThrottlingException'));
+        client.failures.transact.push(cancelled('None', 'ThrottlingError'));
+        await claim(store, intent());
+        expect(client.calls.filter(command => command instanceof GetCommand)).toHaveLength(3);
+        const writes = client.calls.filter(command => command instanceof TransactWriteCommand);
+        expect(writes).toHaveLength(2); expect(writes[1]).toBe(writes[0]);
+        expect(writes[0]?.input.ClientRequestToken).toHaveLength(36);
+        expect([...client.records.keys()].filter(pk => pk.includes('#mail-operation#'))).toHaveLength(1);
+        expect(virtual.sleeps).toEqual([200, 400, 200]);
+        expect(logs).toEqual([throttled(1, 'get'), throttled(2, 'get'), throttled(1, 'transact')]);
+        expect((await store.reserve(intent(), owner)).kind).toBe('replay');
+    });
+    test('throttling that outlasts the throttle budget is temporarily_unavailable, never a conflict or success, and nothing is applied', async () => {
+        const reads = fixture(); reads.client.failures.get.push(...Array.from({ length: 50 }, () => throttleError()));
+        await expect(reads.store.reserve(intent(), owner)).rejects.toThrow('temporarily_unavailable');
+        // Waits of 200, 400, 800, 1600 ms, then 1600 each, the last cut to the 10 s deadline.
+        expect(reads.virtual.sleeps).toEqual([200, 400, 800, 1600, 1600, 1600, 1600, 1600, 600]);
+        expect(reads.client.calls).toHaveLength(9); expect(logs).toHaveLength(9);
+        logs.length = 0;
+        const writes = fixture(); writes.client.failures.transact.push(...Array.from({ length: 50 }, () => cancelled('ProvisionedThroughputExceeded', 'ProvisionedThroughputExceeded')));
+        await expect(writes.store.reserve(intent(), owner)).rejects.toThrow('temporarily_unavailable');
+        const sent = writes.client.calls.filter(command => command instanceof TransactWriteCommand);
+        expect(sent).toHaveLength(9); expect(new Set(sent).size).toBe(1);
+        expect(writes.client.records.size).toBe(0); expect(writes.virtual.clock.ms).toBe(10000);
+        expect(logs.filter(line => line.operation === 'transact')).toHaveLength(9);
+    });
+    test('a condition conflict is not retried or logged as throttling', async () => {
+        const { client, store, virtual } = fixture();
+        client.failures.transact.push(cancelled('ConditionalCheckFailed', 'None'));
+        await expect(store.reserve(intent(), owner)).rejects.toThrow('temporarily_unavailable');
+        expect(client.calls.filter(command => command instanceof TransactWriteCommand)).toHaveLength(1);
+        expect(virtual.sleeps).toEqual([]); expect(logs).toEqual([]);
+    });
+    test('an unthrottled call keeps the short timeout; the throttle budget must be a sane duration', async () => {
+        for (const throttleTimeoutMs of [0, 1.5, 50_001]) { expect(() => new DynamoMailOperationStore({ tableName: 'MailTable', client: new ModelSender(), throttleTimeoutMs })).toThrow('Invalid mail store throttle timeout'); }
+        const { client, store, virtual } = fixture(); client.failures.get.push(new Error('socket closed'), new Error('socket closed'), new Error('socket closed'));
+        await expect(store.reserve(intent(), owner)).rejects.toThrow('temporarily_unavailable');
+        expect(client.calls).toHaveLength(3); expect(virtual.sleeps).toEqual([25, 50]); expect(logs).toEqual([]);
+    });
     test('whole request deadline bounds stalled SDK transport and aborts it', async () => {
 
 
@@ -456,5 +510,246 @@ describe('receipts stored by 0.6.x', () => {
         const progress = await call('send_draft', { uid: 22, expectedVersion: digest, operationId: pending.operationId });
         expect(progress.isError).toBe(true); expect(Object.keys(progress.structuredContent)).toEqual(['summary', 'status', 'operationId']); expect(String(progress.structuredContent['summary'])).toContain('Retry the identical request');
         expect(JSON.stringify([...f.client.records.values()])).not.toContain('summary');
+    });
+});
+
+describe('the preflight window of a write', () => {
+    const context: MailContext = { accountId: key().accountId, accessToken: 'c'.repeat(40), clientId: 'client-one', scopes: ['mail:draft', 'mail:send', 'mail:modify'], connectionStatus: 'active' };
+    const clientHash = hashOf(context.clientId);
+    const draft = (operationId: string) => ({ to: [{ address: 'to@example.com' }], cc: [], bcc: [], subject: 'x', body: { text: 'x' }, attachments: [], operationId });
+    const drafts = { mailboxId, path: 'Drafts', specialUse: '\\Drafts' };
+    /** A writer whose draft preparation is `prepare`: by default it never finishes, whatever its budget. */
+    const writer = (prepare: () => Promise<never> = () => new Promise(() => {})) => ({ resolveDraftMailbox: async () => drafts, prepareCreate: prepare }) as never;
+    /** A writer that records every call by name: the Drafts lookup answers, any other read or write fails invalid_input. */
+    const recording = (called: string[]) => new Proxy({}, { get: (_target, name) => name === 'then' ? undefined : async () => {
+        called.push(String(name)); if (name === 'resolveDraftMailbox') { return drafts; } throw new MailError('invalid_input');
+    } }) as never;
+    /** The store, observed: every call by name and the request time left when failPreflight starts; `over` replaces methods. */
+    const observed = (store: MailOperationStore, seen: { calls: string[]; atFailure?: number | undefined }, over: Partial<MailOperationStore> = {}): MailOperationStore => {
+        const methods: MailOperationStore = {
+            getOperation: value => store.getOperation(value), reserve: (value, token) => store.reserve(value, token), markDispatched: value => store.markDispatched(value),
+            failPreflight: async (value, receipt) => { seen.atFailure = remainingRequestTimeMs(); await store.failPreflight(value, receipt); },
+            complete: (value, receipt) => store.complete(value, receipt), markOutcomeUnknown: (value, receipt) => store.markOutcomeUnknown(value, receipt), ...over,
+        };
+        return Object.fromEntries(Object.entries(methods).map(([name, method]: [string, (...args: unknown[]) => Promise<unknown>]) => [name, (...args: unknown[]) => { seen.calls.push(name); return method(...args); }])) as unknown as MailOperationStore;
+    };
+    let clock: ReturnType<typeof steppedClock>;
+    beforeEach(() => { clock = steppedClock(); }); afterEach(() => { clock.restore(); });
+    /** The window's clock moved on by ms: a step that took that long. */
+    const advance = (ms: number) => { if (clock.state.frozen === undefined) { clock.state.skew += ms; } else { clock.state.frozen += ms; } };
+    /** A reservation that takes ms. */
+    const taking = (store: MailOperationStore, ms: number): Partial<MailOperationStore> => ({ reserve: async (value, token) => { const result = await store.reserve(value, token); advance(ms); return result; } });
+    /** The first reservation commits while every answer to its transaction is lost; later ones are answered. */
+    const unanswered = (f: ReturnType<typeof fixture>): Partial<MailOperationStore> => {
+        let first = true;
+        return { reserve: async (value, token) => { if (first) { first = false; f.client.fault = 'lost_persistent'; } try { return await f.store.reserve(value, token); } finally { f.client.fault = 'none'; } } };
+    };
+    const transacts = (client: ModelSender) => client.calls.filter(call => call instanceof TransactWriteCommand).length;
+    const states = (client: ModelSender) => [...client.records.values()].map(item => (item['record'] as { state: string }).state);
+    test('the reserve covers one throttled ledger operation and the response; admission covers a whole reservation, and a fresh request is admitted', async () => {
+        expect(PREFLIGHT_RESERVE_MS).toBeGreaterThanOrEqual(DEFAULT_THROTTLE_TIMEOUT_MS + RESPONSE_RESERVE_MS);
+        // Exact for the store's default: a reservation throttled for as long as it can be ends after RESERVE_ADMISSION_MS.
+        expect(RESERVE_ADMISSION_MS).toBe(DEFAULT_THROTTLE_TIMEOUT_MS);
+        const f = fixture(); f.client.failures.get.push(...Array.from({ length: 50 }, () => throttleError()));
+        await expect(f.store.reserve(intent(), owner)).rejects.toThrow('temporarily_unavailable');
+        expect(f.virtual.clock.ms).toBe(RESERVE_ADMISSION_MS);
+        // A fresh 60 s request whose getOperation was throttled for its whole 10 s and whose Drafts lookup took 10 s still reserves.
+        expect(60_000 - PREFLIGHT_RESERVE_MS - DEFAULT_THROTTLE_TIMEOUT_MS - 10_000).toBeGreaterThanOrEqual(RESERVE_ADMISSION_MS);
+        const g = fixture(); let prepared = false; clock.state.frozen = 1_000_000;
+        const slow = { resolveDraftMailbox: async () => { advance(10_000); return drafts; }, prepareCreate: async () => { prepared = true; throw new MailError('invalid_input'); } } as never;
+        const service = createMailService({ reader: {} as never, writer: slow, operations: observed(g.store, { calls: [] }, { getOperation: async value => { const record = await g.store.getOperation(value); advance(DEFAULT_THROTTLE_TIMEOUT_MS); return record; } }) });
+        expect(await withRequestBudget(() => 60_000 - (performance.now() - 1_000_000), () => service.create_draft(context, draft('fresh-request-0001')))).toMatchObject({ status: 'failed', reason: 'invalid_input' });
+        expect(prepared).toBe(true); expect(states(g.client)).toEqual(['settled']);
+    });
+    test('a preflight that would overrun is cut off at the window end, under its own budget, and its failure is recorded with the reserve left', async () => {
+        const f = fixture(); const seen: { calls: string[]; atFailure?: number | undefined; inside?: number | undefined } = { calls: [] };
+        const service = createMailService({ reader: {} as never, writer: writer(() => { seen.inside = remainingRequestTimeMs(); return new Promise(() => {}); }), operations: observed(f.store, seen, taking(f.store, RESERVE_ADMISSION_MS)) });
+        // Admitted with 10.3 s of window; the reservation takes 10 s of it, leaving 0.3 s of preflight.
+        const started = performance.now(); const real = Date.now(); const window = RESERVE_ADMISSION_MS + 300;
+        const result = await withRequestBudget(() => PREFLIGHT_RESERVE_MS + window - (performance.now() - started), () => service.create_draft(context, draft('late-preflight-0001')));
+        expect(result).toMatchObject({ status: 'failed', reason: 'upstream_timeout' });
+        expect(Date.now() - real).toBeLessThan(1500);
+        // Inside, the backend sees only the window; the failure is written with the full reserve of the request.
+        expect(seen.inside).toBeLessThanOrEqual(300); expect(seen.inside).toBeGreaterThan(0);
+        expect(seen.atFailure).toBeGreaterThan(PREFLIGHT_RESERVE_MS - 1000);
+        expect(await f.store.getOperation(key('late-preflight-0001', clientHash))).toMatchObject({ state: 'settled', receipt: { status: 'failed', reason: 'upstream_timeout' } });
+    });
+    test('a late failure is recorded even when DynamoDB throttles it for nearly its whole throttle budget', async () => {
+        const f = fixture();
+        const throttles = () => { for (let i = 0; i < 5; i++) { f.client.failures.get.push(throttleError()); f.client.failures.transact.push(throttleError()); } };
+        const service = createMailService({ reader: {} as never, writer: writer(() => { throttles(); return new Promise(() => {}); }), operations: observed(f.store, { calls: [] }, taking(f.store, RESERVE_ADMISSION_MS)) });
+        const started = performance.now(); const window = RESERVE_ADMISSION_MS + 300;
+        const result = await withRequestBudget(() => PREFLIGHT_RESERVE_MS + window - (performance.now() - started), () => service.create_draft(context, draft('late-throttled-0001')));
+        expect(result).toMatchObject({ status: 'failed', reason: 'upstream_timeout' });
+        // Five throttled reads and five throttled writes: 2 x (200 + 400 + 800 + 1600 + 1600) ms of backoff, inside 10 s.
+        expect(f.virtual.clock.ms).toBe(9200); expect(f.virtual.clock.ms).toBeLessThan(DEFAULT_THROTTLE_TIMEOUT_MS);
+        expect(states(f.client)).toEqual(['settled']);
+    });
+    test('a reservation that ends exactly at the window end leaves no preflight: it fails at once, before any backend call, with the whole reserve to record it', async () => {
+        const f = fixture(); const seen: { calls: string[]; atFailure?: number | undefined } = { calls: [] }; let prepared = false; clock.state.frozen = 1_000_000;
+        const service = createMailService({ reader: {} as never, writer: writer(() => { prepared = true; return new Promise(() => {}); }), operations: observed(f.store, seen, taking(f.store, RESERVE_ADMISSION_MS)) });
+        const result = await withRequestBudget(() => PREFLIGHT_RESERVE_MS + RESERVE_ADMISSION_MS - (performance.now() - 1_000_000), () => service.create_draft(context, draft('edge-window-00001')));
+        expect(result).toMatchObject({ status: 'failed', reason: 'upstream_timeout' });
+        expect(prepared).toBe(false); expect(seen.atFailure).toBe(PREFLIGHT_RESERVE_MS); expect(states(f.client)).toEqual(['settled']);
+    });
+    test('a write reserves only with a whole reservation\'s time left in its window; below that nothing is stored or written', async () => {
+        clock.state.frozen = 1_000_000;
+        for (const window of [-1000, 0, RESPONSE_RESERVE_MS, RESERVE_ADMISSION_MS - 1, RESERVE_ADMISSION_MS, RESERVE_ADMISSION_MS + 1]) {
+            const f = fixture(); const seen = { calls: [] as string[] }; let prepared = false;
+            const service = createMailService({ reader: {} as never, writer: writer(async () => { prepared = true; throw new MailError('invalid_input'); }), operations: observed(f.store, seen) });
+            const outcome = await withRequestBudget(() => PREFLIGHT_RESERVE_MS + window, () => service.create_draft(context, draft('admission-0000001'))).catch((error: unknown) => error);
+            if (window < RESERVE_ADMISSION_MS) {
+                expect(outcome).toMatchObject({ code: 'temporarily_unavailable' });
+                expect({ window, records: f.client.records.size, transacts: transacts(f.client), prepared, calls: seen.calls }).toEqual({ window, records: 0, transacts: 0, prepared: false, calls: ['getOperation'] });
+            } else {
+                expect(outcome).toMatchObject({ status: 'failed', reason: 'invalid_input' });
+                expect({ window, prepared, states: states(f.client) }).toEqual({ window, prepared: true, states: ['settled'] });
+            }
+        }
+    });
+    test('a write that starts with too little time left stores nothing, even with DynamoDB slow to answer, so its retry is not fenced', async () => {
+        // The reviewer's case: send_draft with 22.2 s of the request left; DynamoDB commits a transaction at once but answers after 300 ms.
+        const records = new Map<string, Record<string, unknown>>(); let transactions = 0; const called: string[] = [];
+        const client: DynamoSender = { async send(command) {
+            if (command instanceof GetCommand) { return { Item: structuredClone(records.get(String(command.input.Key?.pk))) }; }
+            if (!(command instanceof TransactWriteCommand)) { throw new Error('unexpected command'); }
+            transactions++;
+            for (const item of command.input.TransactItems ?? []) {
+                if (item.Put?.Item) { records.set(String(item.Put.Item.pk), structuredClone(item.Put.Item)); }
+                if (item.Delete?.Key) { records.delete(String(item.Delete.Key.pk)); }
+            }
+            await Bun.sleep(300); return {};
+        } };
+        const service = createMailService({ reader: {} as never, writer: recording(called), operations: new DynamoMailOperationStore({ tableName: 'MailTable', client }) });
+        const args = { uid: 1, expectedVersion: digest, operationId: 'ambiguous-reserve-0001' };
+        const started = performance.now();
+        await expect(withRequestBudget(() => 22_200 - (performance.now() - started), () => service.send_draft(context, args))).rejects.toMatchObject({ code: 'temporarily_unavailable' });
+        expect({ transactions, records: records.size, called }).toEqual({ transactions: 0, records: 0, called: ['resolveDraftMailbox'] });
+        // Nothing was left reserved: the identical retry, with time enough, reserves the draft and records its preflight failure.
+        expect(await service.send_draft(context, args)).toMatchObject({ status: 'failed', reason: 'invalid_input' });
+        expect([...records.values()].map(item => (item['record'] as { state: string }).state)).toEqual(['settled']);
+    });
+    test('a reservation that committed but whose answer was lost or aborted is proved ours by its owner token and settled as a failure that releases the draft', async () => {
+        for (const { budget, fault } of [undefined, 60_000].flatMap(budget => (['lost', 'aborted'] as const).map(fault => ({ budget, fault })))) {
+            const f = fixture(); const seen = { calls: [] as string[] }; const called: string[] = []; const reads: (number | undefined)[] = [];
+            // Aborted: the store gives up on its transaction after 50 ms; DynamoDB has committed it and answers after 300 ms.
+            let late = true;
+            const slow: DynamoSender = { async send(command) { const result = await f.client.send(command as GetCommand | TransactWriteCommand); if (command instanceof TransactWriteCommand && late) { late = false; await Bun.sleep(300); } return result; } };
+            const store = fault === 'lost' ? f.store : new DynamoMailOperationStore({ tableName: 'MailTable', client: slow, timeoutMs: 50 });
+            const reading = { getOperation: (value: OperationKey) => { reads.push(remainingRequestTimeMs()); return store.getOperation(value); } };
+            const service = createMailService({ reader: {} as never, writer: recording(called), operations: observed(store, seen, { ...(fault === 'lost' ? unanswered(f) : {}), ...reading }) });
+            const args = { uid: 1, expectedVersion: digest, operationId: 'unanswered-reserve-01' };
+            const run = () => service.send_draft(context, args);
+            const first = await (budget === undefined ? run() : withRequestBudget(() => budget, run));
+            expect({ fault, first }).toMatchObject({ fault, first: { status: 'failed', reason: 'temporarily_unavailable' } });
+            expect(seen.calls).toEqual(['getOperation', 'reserve', 'getOperation', 'failPreflight']);
+            // Without a request budget the read-back has none; with one, it ends a whole settlement before the request.
+            if (budget === undefined) { expect(reads).toEqual([undefined, undefined]); } else { expect(reads[1]).toBeLessThanOrEqual(budget - DEFAULT_THROTTLE_TIMEOUT_MS - RESPONSE_RESERVE_MS); expect(reads[1]).toBeGreaterThan(budget - DEFAULT_THROTTLE_TIMEOUT_MS - RESPONSE_RESERVE_MS - 1000); }
+            // Settled, and the guard released with it; no backend call but the Drafts lookup was made.
+            expect(states(f.client)).toEqual(['settled']); expect(called).toEqual(['resolveDraftMailbox']);
+            // The identical retry replays the failure, not in_progress; a new operation on the same draft reserves it.
+            expect(await service.send_draft(context, args)).toMatchObject({ status: 'failed', reason: 'temporarily_unavailable' });
+            expect(await service.send_draft(context, { ...args, operationId: 'after-settled-0002' })).toMatchObject({ status: 'failed', reason: 'invalid_input' });
+            expect(called).toEqual(['resolveDraftMailbox', 'resolveDraftMailbox', 'inspectMessage']);
+        }
+    });
+    test('recovering an owned reservation keeps a whole throttled settlement: a slow read-back is cut short instead, and nothing is touched', async () => {
+        // The reviewer's case: admitted with exactly 30 s left; the reservation commits, throttled, and its answer is lost
+        // after 9.475 s; the read-back is throttled `throttles` times; failPreflight then is throttled for 9.4 s.
+        const settlement = DEFAULT_THROTTLE_TIMEOUT_MS + RESPONSE_RESERVE_MS; clock.state.frozen = 1_000_000;
+        const outcomes: Record<number, string> = {};
+        for (const throttles of [0, 3, 6, 7, 8]) {
+            const f = fixture(); const seen = { calls: [] as string[] }; let reads = 0; const readBack: { inside?: number | undefined; outside?: number } = {}; let atFailure: number | undefined;
+            const store = new DynamoMailOperationStore({ tableName: 'MailTable', client: f.client, retry: { ...f.virtual.retry, sleep: async ms => { f.virtual.clock.ms += ms; advance(ms); } } });
+            const service = createMailService({ reader: {} as never, writer: recording([]), operations: observed(store, seen, {
+                reserve: async (value, token) => {
+                    f.client.failures.transact.push(...Array.from({ length: 8 }, () => throttleError())); f.client.fault = 'lost_persistent';
+                    try { return await store.reserve(value, token); } finally { f.client.fault = 'none'; }
+                },
+                getOperation: value => {
+                    if (++reads === 2) { readBack.inside = remainingRequestTimeMs(); readBack.outside = 30_000 - f.virtual.clock.ms; f.client.failures.get.push(...Array.from({ length: throttles }, () => throttleError())); }
+                    return store.getOperation(value);
+                },
+                failPreflight: async (value, receipt) => {
+                    atFailure = remainingRequestTimeMs(); f.client.failures.get.push(...Array.from({ length: 8 }, () => throttleError()));
+                    await store.failPreflight(value, receipt);
+                },
+            }) });
+            const args = { uid: 1, expectedVersion: digest, operationId: 'slow-read-back-0001' };
+            const outcome = await withRequestBudget(() => 30_000 - f.virtual.clock.ms, () => service.send_draft(context, args)).catch((error: unknown) => error);
+            // The read-back sees only what is left beyond a whole settlement.
+            expect(readBack.inside).toBe((readBack.outside ?? 0) - settlement);
+            if (seen.calls.includes('failPreflight')) {
+                expect(atFailure).toBeGreaterThanOrEqual(settlement);
+                expect({ throttles, outcome, states: states(f.client) }).toMatchObject({ throttles, outcome: { status: 'failed', reason: 'temporarily_unavailable' }, states: ['settled'] });
+                outcomes[throttles] = 'settled';
+            } else {
+                // The documented residual: nothing proved, nothing touched; the draft stays fenced and the retry is in_progress.
+                expect({ throttles, outcome, states: states(f.client) }).toMatchObject({ throttles, outcome: { code: 'temporarily_unavailable' }, states: ['reserved', 'reserved'] });
+                expect(await service.send_draft(context, args)).toMatchObject({ status: 'in_progress' });
+                outcomes[throttles] = 'reserved';
+            }
+        }
+        expect(outcomes).toEqual({ 0: 'settled', 3: 'settled', 6: 'settled', 7: 'reserved', 8: 'reserved' });
+    });
+    test('with no more than a settlement left after the reservation, the read-back is skipped; with a little more, it runs and the reservation is settled', async () => {
+        for (const [took, expected] of [[30_000 - DEFAULT_THROTTLE_TIMEOUT_MS - RESPONSE_RESERVE_MS, 'reserved'], [30_000 - DEFAULT_THROTTLE_TIMEOUT_MS - RESPONSE_RESERVE_MS - 4000, 'settled']] as const) {
+            const f = fixture(); const seen = { calls: [] as string[] }; clock.state.frozen = 1_000_000;
+            // A store with a longer throttle budget: its reservation commits, takes `took` ms and loses its answer.
+            const service = createMailService({ reader: {} as never, writer: recording([]), operations: observed(f.store, seen, {
+                reserve: async (value, token) => { await f.store.reserve(value, token); advance(took); throw new MailError('temporarily_unavailable'); },
+            }) });
+            const outcome = await withRequestBudget(() => 30_000 - (performance.now() - 1_000_000), () => service.send_draft(context, { uid: 1, expectedVersion: digest, operationId: 'late-read-back-0001' })).catch((error: unknown) => error);
+            if (expected === 'reserved') {
+                expect({ outcome, calls: seen.calls, states: states(f.client) }).toMatchObject({ outcome: { code: 'temporarily_unavailable' }, calls: ['getOperation', 'reserve'], states: ['reserved', 'reserved'] });
+            } else {
+                expect({ outcome, calls: seen.calls, states: states(f.client) }).toMatchObject({ outcome: { status: 'failed', reason: 'temporarily_unavailable' }, calls: ['getOperation', 'reserve', 'getOperation', 'failPreflight'], states: ['settled'] });
+            }
+        }
+    });
+    test('a reservation another request won is never touched by the read-back: the outcome stays unknown, as before', async () => {
+        const f = fixture(); const seen = { calls: [] as string[] }; const called: string[] = []; const rival = 'rival-owner-token-'.padEnd(43, 'r');
+        const service = createMailService({ reader: {} as never, writer: recording(called), operations: observed(f.store, seen, {
+            // An identical concurrent request reserves first; this call's own attempt then fails without an answer.
+            reserve: async value => { await f.store.reserve(value, rival); throw new MailError('temporarily_unavailable'); },
+        }) });
+        const args = { uid: 1, expectedVersion: digest, operationId: 'rival-reserve-00001' };
+        await expect(withRequestBudget(() => 60_000, () => service.send_draft(context, args))).rejects.toMatchObject({ code: 'temporarily_unavailable' });
+        expect(seen.calls).toEqual(['getOperation', 'reserve', 'getOperation']); expect(transacts(f.client)).toBe(1);
+        expect(await f.store.getOperation(key(args.operationId, clientHash))).toMatchObject({ state: 'reserved', ownerToken: rival, revision: 0 });
+        expect(states(f.client)).toEqual(['reserved', 'reserved']);
+        expect(await service.send_draft(context, args)).toMatchObject({ status: 'in_progress' }); expect(called).toEqual(['resolveDraftMailbox']);
+    });
+    test('a failed reservation with no record, or whose read-back fails, is temporarily_unavailable and writes nothing more', async () => {
+        for (const readBack of ['absent', 'fails'] as const) {
+            const f = fixture(); const seen = { calls: [] as string[] }; let reads = 0;
+            const service = createMailService({ reader: {} as never, writer: recording([]), operations: observed(f.store, seen, {
+                reserve: () => Promise.reject(new MailError('temporarily_unavailable')),
+                getOperation: value => ++reads === 2 && readBack === 'fails' ? Promise.reject(new MailError('temporarily_unavailable')) : f.store.getOperation(value),
+            }) });
+            await expect(withRequestBudget(() => 60_000, () => service.send_draft(context, { uid: 1, expectedVersion: digest, operationId: 'absent-reserve-00001' }))).rejects.toMatchObject({ code: 'temporarily_unavailable' });
+            expect({ readBack, calls: seen.calls, transacts: transacts(f.client), records: f.client.records.size }).toEqual({ readBack, calls: ['getOperation', 'reserve', 'getOperation'], transacts: 0, records: 0 });
+        }
+    });
+    test.each(['create_draft', 'update_draft', 'send_draft', 'move_message'] as const)('%s: neither a refused admission nor a settled unanswered reservation reaches the backend or dispatches', async tool => {
+        const args = (operationId: string) => tool === 'create_draft' ? draft(operationId) : tool === 'update_draft' ? { uid: 1, expectedVersion: digest, subject: 'y', operationId } : tool === 'send_draft' ? { uid: 1, expectedVersion: digest, operationId } : { mailboxId, uid: 1, expectedVersion: digest, destinationMailboxId: 'b'.repeat(24), operationId };
+        const run = (service: MailService, operationId: string) => (service[tool] as unknown as (context: MailContext, input: unknown) => Promise<unknown>)(context, args(operationId));
+        const lookups = tool === 'move_message' ? [] : ['resolveDraftMailbox']; clock.state.frozen = 1_000_000;
+        const refused = fixture(); const seen = { calls: [] as string[] }; const called: string[] = [];
+        await expect(withRequestBudget(() => PREFLIGHT_RESERVE_MS + RESERVE_ADMISSION_MS - 1, () => run(createMailService({ reader: {} as never, writer: recording(called), operations: observed(refused.store, seen) }), 'refused-00000001'))).rejects.toMatchObject({ code: 'temporarily_unavailable' });
+        expect({ calls: seen.calls, called, transacts: transacts(refused.client) }).toEqual({ calls: ['getOperation'], called: lookups, transacts: 0 });
+        const lost = fixture(); const lostSeen = { calls: [] as string[] }; const lostCalled: string[] = [];
+        expect(await withRequestBudget(() => 60_000, () => run(createMailService({ reader: {} as never, writer: recording(lostCalled), operations: observed(lost.store, lostSeen, unanswered(lost)) }), 'unanswered-000001'))).toMatchObject({ status: 'failed', reason: 'temporarily_unavailable' });
+        expect({ calls: lostSeen.calls, called: lostCalled, states: states(lost.client) }).toEqual({ calls: ['getOperation', 'reserve', 'getOperation', 'failPreflight'], called: lookups, states: ['settled'] });
+    });
+    test('without a request budget, or with most of the Lambda left, a slow preflight is not cut off', async () => {
+        for (const budget of [undefined, 60_000]) {
+            const f = fixture(); let inside: number | undefined = -1;
+            const slow = async (): Promise<never> => { inside = remainingRequestTimeMs(); await Bun.sleep(300); throw new MailError('invalid_input'); };
+            const service = createMailService({ reader: {} as never, writer: writer(slow), operations: f.store });
+            const run = () => service.create_draft(context, draft('slow-preflight-0001'));
+            expect(await (budget === undefined ? run() : withRequestBudget(() => budget, run))).toMatchObject({ status: 'failed', reason: 'invalid_input' });
+            if (budget === undefined) { expect(inside).toBeUndefined(); } else { expect(inside).toBeLessThanOrEqual(budget - PREFLIGHT_RESERVE_MS); expect(inside).toBeGreaterThan(budget - PREFLIGHT_RESERVE_MS - 200); }
+        }
     });
 });

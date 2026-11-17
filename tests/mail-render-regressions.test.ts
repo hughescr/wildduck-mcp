@@ -3,6 +3,7 @@ import { execFileSync } from 'node:child_process';
 import MarkdownIt from 'markdown-it';
 import { MailError } from '../src/mail/contracts';
 import { renderBody, type BodyInput, type RenderDiagnostic } from '../src/mail/render';
+import { memoryViolations, type ChildMemory } from './child-memory';
 
 const plain = (html: string): string => renderBody({ html }).text;
 
@@ -248,46 +249,6 @@ const pathological: Record<string, string> = {
 const depthBound = new Set(['unclosed <b> nesting', 'unclosed <div> nesting', 'unclosed list nesting']);
 
 const RSS_LIMIT_KIB = 300 * 1024;
-/** Memory figures, all in KiB, reported by the child process itself. */
-interface ChildMemory {
-    /** process.resourceUsage().maxRSS before rendering. */
-    before: number;
-    /** process.resourceUsage().maxRSS after rendering. */
-    after: number;
-    /** process.memoryUsage().rss (current, not peak) after rendering. */
-    rss: number;
-    /** Linux only: VmHWM from /proc/self/status, the child's own peak RSS. */
-    hwm?: number;
-}
-/**
- * Decide whether a child stayed under RSS_LIMIT_KIB; returns the violated rules (empty = pass).
- *
- * Why not just assert on maxRSS: on Linux ru_maxrss is inherited across fork/exec from the
- * parent's RSS at spawn time (verified: a child of a 377 MB bun parent reports maxRSS 377 MB
- * while its current RSS is 12 MB), so the number can reflect the test runner, not the child.
- * macOS does not inherit it. Units are KiB on both platforms in Bun.
- *
- * Rules, strictest first:
- *  1. Current RSS after rendering must be under the limit; the parent cannot inflate it.
- *  2. If /proc gave the child's own high-water mark (Linux), it must be under the limit. This is
- *     the real peak check and is immune to inheritance (it comes from the new process image).
- *  3. Without that, if maxRSS rose during the child's life (after > before) the rise is the
- *     child's own peak, so it must be under the limit. If it did not rise, the value is either
- *     below the limit (so passes) or an inherited value at or above it. The latter hides the
- *     child's own peak anywhere below the inherited value, so the peak cannot be proven here and
- *     only rule 1 applies; a child that peaked and shrank back inside that window is covered
- *     only by the parent-side ps poll. This gap does not exist where /proc is available.
- */
-const memoryViolations = ({ before, after, rss, hwm }: ChildMemory, limit = RSS_LIMIT_KIB): string[] => {
-    const violations: string[] = [];
-    if (!(rss < limit)) { violations.push(`current rss ${rss} KiB >= ${limit}`); }
-    if (hwm !== undefined) {
-        if (!(hwm < limit)) { violations.push(`own peak rss ${hwm} KiB >= ${limit}`); }
-    } else if (after > before) {
-        if (!(after < limit)) { violations.push(`maxRSS rose to ${after} KiB (from ${before}) >= ${limit}`); }
-    }
-    return violations;
-};
 
 describe('child memory decision', () => {
     test.each([
@@ -302,7 +263,7 @@ describe('child memory decision', () => {
         ['a rise from a small start to over the limit fails even with a small current rss', { before: 20000, after: 400000, rss: 20000 }, true],
         ['a rise that stays under the limit passes', { before: 20000, after: 290000, rss: 20000 }, false],
     ] as const)('%s', (_name, memory, fails) => {
-        expect(memoryViolations(memory).length > 0).toBe(fails);
+        expect(memoryViolations(memory, RSS_LIMIT_KIB).length > 0).toBe(fails);
     });
 });
 
@@ -347,7 +308,7 @@ describe('isolated pathological Markdown, 128 KiB', () => {
             expect(result.status).not.toBe('render_internal_error');
             expect(result.status).toBeOneOf(depthBound.has(name) ? ['invalid_input'] : ['ok', 'too_large']);
             expect(result.ms).toBeLessThan(1500);
-            expect(memoryViolations(result)).toEqual([]);
+            expect(memoryViolations(result, RSS_LIMIT_KIB)).toEqual([]);
         });
     }
 });
