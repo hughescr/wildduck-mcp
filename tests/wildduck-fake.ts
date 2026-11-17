@@ -130,7 +130,7 @@ export function memoryOperations(): MailOperationStore {
         getOperation: async key => { const record = records.get(keyOf(key)); return record && structuredClone(record); },
         reserve: async (intent, ownerToken) => {
             const existing = records.get(keyOf(intent)); if (existing) { return JSON.stringify(existing.intent) === JSON.stringify(intent) ? { kind: 'replay', record: structuredClone(existing) } : { kind: 'conflict', reason: 'operation_conflict' }; }
-            const key = { accountId: intent.accountId, clientIdHash: intent.clientIdHash, operationId: intent.operationId }; records.set(keyOf(key), { key, intent, ownerToken, revision: 0, state: 'reserved' });
+            const key = { accountId: intent.accountId, clientIdHash: intent.clientIdHash, operationId: intent.operationId }; records.set(keyOf(key), { key, intent, ownerToken, revision: 0, state: 'reserved', reservedAt: Math.floor(Date.now() / 1000) });
             return { kind: 'acquired', claim: { key, ownerToken, revision: 0, state: 'reserved' } };
         },
         markDispatched: async claim => settle('dispatched')(claim),
@@ -138,6 +138,9 @@ export function memoryOperations(): MailOperationStore {
         complete: async (claim, receipt) => { await settle('settled')(claim, receipt); },
         markOutcomeUnknown: async (claim, receipt) => { await settle('settled')(claim, receipt); },
         failDispatched: async (claim, receipt) => { await settle('settled')(claim, receipt); },
+        // This ledger keeps no guards.
+        getGuard: async () => undefined, releaseGuard: async () => false,
+        resolveUnknown: async (record, receipt) => { await settle('settled')({ key: record.key, ownerToken: record.ownerToken, revision: record.revision, state: 'dispatched' }, receipt); },
     };
 }
 /** Upload records bound to account and client, and their staged objects, as the DynamoDB store and

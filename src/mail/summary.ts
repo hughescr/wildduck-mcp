@@ -82,7 +82,9 @@ function successText(name: MailWriteTool, result: MailOutput<MailWriteTool>): st
     }
     return undefined;
 }
-const sendFailedText = (temporary: boolean): string => `The mail was not sent. ${temporary ? 'To try again, use a new operationId.' : 'Fix the cause above, then try again with a new operationId: this one now only returns this failure.'} If a new send of the same draft is refused, the draft must be created again.`;
+/** The stored receipt cannot tell a send refused before it marked the draft (still sendable) from one that marked it (never
+ * sendable again: the mark names this failed record), so one text says what is true of both. */
+const sendFailedText = (temporary: boolean): string => `The mail was not sent. ${temporary ? 'To try again, use a new operationId.' : 'Fix the cause above, then try again with a new operationId: this one now only returns this failure.'} If a new send of this same draft is refused with verification_failed, this draft can no longer be sent: to send the mail, create the draft again and send the new one (the old draft can be deleted).`;
 /** What a write result means, and what to do next: a one-sentence summary on success, an explanation otherwise. */
 export function receiptSummary(name: MailWriteTool, result: MailOutput<MailWriteTool>): string | undefined {
     switch (result.status) {
@@ -93,9 +95,11 @@ export function receiptSummary(name: MailWriteTool, result: MailOutput<MailWrite
         case 'failed': return `Not done: ${errorText(result.reason, name)} ${name === 'send_draft' ? sendFailedText(temporaryReasons.includes(result.reason)) : temporaryReasons.includes(result.reason) ? 'The requested change was not applied; to try again, use a new operationId.' : 'The requested change was not applied. Fix the cause above, then try again with a new operationId: this one now only returns this failure.'}`;
         case 'conflict': return result.reason === 'operation_conflict'
             ? 'Conflict: this operationId was already used for a request with other arguments. Nothing was changed. Use a new operationId for a new action.'
-            : 'Conflict: another change to this message is unfinished or uncertain, or the message was already moved, replaced, sent or deleted. Nothing was changed. List or read again to find the message and its current uid.';
-        case 'in_progress': return 'In progress: no final result is recorded for this operationId yet, and no change is recorded. Retry the identical request once or twice after a few seconds. If it is still in_progress, stop retrying, read the message\'s current state and tell the user. Never repeat the change under a new operationId.';
-        case 'outcome_unknown': return 'Outcome unknown: the change was started but its result is not known, so it may or may not have happened. Retrying the identical request only looks up the recorded result and never repeats the change; it may then show the real result, or stay unknown. Do not repeat the change under a new operationId. Check the current state yourself (for a send, look in the Sent mailbox) and tell the user. While it is unknown, the affected message cannot be changed through this server.';
+            : 'Conflict: another change to this message is not finished yet. Nothing was changed. Retry the identical request in a few minutes: an unfinished change is ended after about 5 minutes (15 for a send). The old copy left by a partly finished update_draft can only be deleted. If it is still refused, list or read again to find the message and its current uid.';
+        case 'in_progress': return 'In progress: no final result is recorded for this operationId yet, and no change is recorded. Retry the identical request after a few seconds; if it is still in progress, wait and retry it again: after about 5 minutes it reports a final result. Never repeat the change under a new operationId.';
+        case 'outcome_unknown': return name === 'send_draft'
+            ? 'Outcome unknown: the send was started but its result is not known, so the mail may or may not have gone. Do not send it again. Do not repeat the change under a new operationId: retrying the identical request never repeats the change, and after 15 minutes it checks the mail server and reports the settled answer: sent, or not sent. If it still cannot tell, look in the Sent mailbox and tell the user.'
+            : 'Outcome unknown: the change was started but its result is not known, so it may or may not have happened. Retrying the identical request only looks up the recorded result and never repeats the change. Do not repeat the change under a new operationId before you have checked: read the current state (for a new draft, list the Drafts mailbox) and tell the user. After about 5 minutes the message can be changed again with a new operationId; if editing or sending a draft is then refused, create the draft again.';
         case 'partial': return partialText[result.reason]?.(savedAs(result));
         default: return undefined;
     }
@@ -117,7 +121,7 @@ export function readSummary(name: MailToolName, result: MailOutput<MailToolName>
         if (cut.length) { notes.push(`Incomplete read: the ${cut.join(' and ')} is or may be cut short. Do not treat it as the complete message.`); }
         const verification = 'managedOperation' in result ? result.managedOperation?.verification : undefined;
         if (verification === 'verified') { notes.push('This message was created or last changed through this server and that change is confirmed (managedOperation.verification is verified). If it is a draft created here and no other mail client has changed it since, it can be edited or sent here.'); }
-        else if (verification !== undefined) { notes.push(`This server cannot change this message (managedOperation.verification is ${verification}): its last change made here is unfinished, uncertain or could not be confirmed.`); }
+        else if (verification !== undefined) { notes.push(`This message cannot be edited or sent here (managedOperation.verification is ${verification}): its last change made here is unfinished, uncertain or could not be confirmed. Moving, flagging or deleting it may be refused too, for a few minutes or for good; a draft can usually still be deleted, and created again if needed.`); }
     }
     if ((name === 'list_messages' || name === 'search_messages' || name === 'get_thread') && 'messages' in result) {
         const unchecked = result.messages.filter(message => message.managedOperation?.verification === 'not_checked').length;

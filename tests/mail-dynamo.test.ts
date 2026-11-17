@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { isDeepStrictEqual } from 'node:util';
 import { GetCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 import type { DynamoSender } from '../src/auth/dynamo-store';
+import { ModelSender } from './dynamo-model';
 import type { AuthInfo } from '@modelcontextprotocol/server';
 import { digest as hashOf } from '../src/auth/crypto';
 import { handleMcp } from '../src/mcp';
-import { DynamoMailOperationStore } from '../src/mail/dynamo-store';
+import { DynamoMailOperationStore, RECORD_TTL_SECONDS } from '../src/mail/dynamo-store';
 import { createMailService, PREFLIGHT_RESERVE_MS, RESERVE_ADMISSION_MS } from '../src/mail/service';
 import { MailError, type BoundMailService, type ConfirmedReceipt, type MailContext, type MailOperationStore, type MailService, type OperationClaim, type OperationKey, type SourceGrade, type WriteIntent } from '../src/mail/contracts';
 import { DEFAULT_THROTTLE_TIMEOUT_MS, RESPONSE_RESERVE_MS } from '../src/dynamo-retry';
@@ -21,52 +21,18 @@ const intent = (operationId = 'operation-00000001', tool: Exclude<WriteIntent['t
 const verifiedDraft = (uid: number, targetMailbox = mailboxId) => ({ draft: { mailboxId: targetMailbox, uid, version: digest }, verified: true as const, proof: { accountId: key().accountId, mailboxId: targetMailbox, uid, version: digest, contentDigest: 'a'.repeat(64), sourceGrade: 'mcp_authored' as const } });
 const verifiedMessage = (uid: number, targetMailbox = mailboxId, sourceGrade: SourceGrade = 'observed') => { const { draft, verified, proof } = verifiedDraft(uid, targetMailbox); return { message: draft, verified, proof: { ...proof, sourceGrade } }; };
 const claim = async (store: MailOperationStore, value: WriteIntent): Promise<OperationClaim<'reserved'>> => { const result = await store.reserve(value, owner); expect(result.kind).toBe('acquired'); if (result.kind !== 'acquired') { throw new Error('expected acquisition'); } return result.claim; };
-class ModelSender implements DynamoSender {
-    readonly records = new Map<string, Record<string, unknown>>();
-    readonly calls: (GetCommand | TransactWriteCommand)[] = [];
-    readonly committed = new Map<string, string>();
-    fault: 'none' | 'lost_once' | 'unknown_always' | 'lost_persistent' = 'none';
-    beforeTransaction: (() => void) | undefined;
-    /** Errors thrown by the next calls of each kind, before the command is applied (throttles, conflicts). */
-    readonly failures: { get: unknown[]; transact: unknown[] } = { get: [], transact: [] };
-    async send(command: GetCommand | TransactWriteCommand): Promise<unknown> {
-        this.calls.push(command);
-        const failure = (command instanceof GetCommand ? this.failures.get : this.failures.transact).shift();
-        if (failure !== undefined) { throw failure; }
-        if (command instanceof GetCommand) { return { Item: structuredClone(this.records.get(String(command.input.Key?.pk))) }; }
-        if (this.fault === 'unknown_always') { throw new Error('ambiguous socket outcome'); }
-        const token = String(command.input.ClientRequestToken); const payload = JSON.stringify(command.input.TransactItems);
-        const prior = this.committed.get(token);
-        if (prior !== undefined) { if (prior !== payload) { throw new Error('idempotency mismatch'); } if (this.fault === 'lost_persistent') { throw new Error('lost commit acknowledgement'); } return {}; }
-        this.beforeTransaction?.(); this.beforeTransaction = undefined;
-        const items = command.input.TransactItems ?? [];
-        const reasons = items.map(item => {
-            const action = item.Put ?? item.Delete;
-            const pk = String(item.Put?.Item?.pk ?? item.Delete?.Key?.pk);
-            const stored = this.records.get(pk);
-            const passed = action?.ConditionExpression === 'attribute_not_exists(#pk)' ? !stored : isDeepStrictEqual(stored?.record, action?.ExpressionAttributeValues?.[':before']);
-            return { Code: passed ? 'None' : 'ConditionalCheckFailed' };
-        });
-        if (reasons.some(reason => reason.Code !== 'None')) { throw { name: 'TransactionCanceledException', CancellationReasons: reasons }; }
-        for (const item of items) {
-            if (item.Put?.Item) { this.records.set(String(item.Put.Item.pk), structuredClone(item.Put.Item)); }
-            if (item.Delete?.Key) { this.records.delete(String(item.Delete.Key.pk)); }
-        }
-        this.committed.set(token, payload);
-        if (this.fault === 'lost_persistent') { throw new Error('committed but acknowledgement unavailable'); }
-        if (this.fault === 'lost_once') { this.fault = 'none'; throw new Error('response lost after commit'); }
-        return {};
-    }
-}
 // A virtual clock: backoff waits cost no real time, and the longest jitter makes the schedule deterministic.
-function fixture(timeoutMs = 5000) { const client = new ModelSender(); const virtual = virtualRetry(); return { client, virtual, store: new DynamoMailOperationStore({ tableName: 'MailTable', client, timeoutMs, retry: virtual.retry }) }; }
+// clock.ms is the store's own clock, so a test sets reservedAt and expiresAt by moving it.
+const NOW = 1_800_000_000;
+function fixture(timeoutMs = 5000) { const client = new ModelSender(); const virtual = virtualRetry(); const clock = { ms: NOW * 1000 }; return { client, virtual, clock, store: new DynamoMailOperationStore({ tableName: 'MailTable', client, timeoutMs, retry: virtual.retry, now: () => clock.ms }) }; }
 const throttled = (attempt: number, operation: string) => ({ event: 'dynamodb_throttled', store: 'mail', operation, attempt });
 async function lifecycleMatrix(store: MailOperationStore): Promise<void> {
     const send = intent();
     const reserved = await claim(store, send);
     expect((await store.reserve(send, 'other-owner'.padEnd(43, 'b'))).kind).toBe('replay');
     expect(await store.reserve({ ...send, payloadDigest: 'e'.repeat(43) }, owner)).toEqual({ kind: 'conflict', reason: 'operation_conflict' });
-    expect(await store.reserve({ ...send, ...key('operation-00000002', 'x'.repeat(43)) }, owner)).toEqual({ kind: 'conflict', reason: 'draft_fenced' });
+    const fenced = await store.reserve({ ...send, ...key('operation-00000002', 'x'.repeat(43)) }, owner);
+    expect(fenced).toEqual({ kind: 'conflict', reason: 'draft_fenced', blocker: { key: { accountId: send.accountId, ...send.target }, operation: key(), ownerToken: owner, revision: 0, state: 'reserved' } });
     const otherAccount = { ...send, ...key('operation-00000003', 'c'.repeat(43), '2'.repeat(24)) };
     const otherClaim = await claim(store, otherAccount);
     await store.failPreflight(otherClaim, { status: 'failed', operationId: otherAccount.operationId, reason: 'version_conflict' });
@@ -79,17 +45,18 @@ async function lifecycleMatrix(store: MailOperationStore): Promise<void> {
     const queued = await store.getOperation(key());
     expect(queued?.state).toBe('settled');
     if (queued?.state === 'settled') { expect(queued.receipt.status).toBe('queued'); }
-    expect(await store.reserve({ ...send, operationId: 'operation-00000005' }, owner)).toEqual({ kind: 'conflict', reason: 'draft_fenced' });
-    // A new mailbox/UID is independently writable; old targets never expire.
+    // The hold ended with the receipt, so the guard was deleted with it and the message can be written again.
+    expect((await store.reserve({ ...send, operationId: 'operation-00000005' }, owner)).kind).toBe('acquired');
+    // A new mailbox/UID is independently writable; an unknown outcome keeps its guard.
     const unknown = { ...intent('operation-00000006'), target: { mailboxId, uid: 2 } };
     const pending = await store.markDispatched(await claim(store, unknown));
     await store.markOutcomeUnknown(pending, { status: 'outcome_unknown', operationId: unknown.operationId, reason: 'dispatch_uncertain' });
     expect((await store.reserve(unknown, owner)).kind).toBe('replay');
-    expect(await store.reserve({ ...unknown, operationId: 'operation-00000007' }, owner)).toEqual({ kind: 'conflict', reason: 'draft_fenced' });
+    expect(await store.reserve({ ...unknown, operationId: 'operation-00000007' }, owner)).toMatchObject({ kind: 'conflict', reason: 'draft_fenced', blocker: { state: 'outcome_unknown', operation: key('operation-00000006') } });
     const update = { ...intent('operation-00000008', 'update_draft'), target: { mailboxId, uid: 3 } };
     const updating = await store.markDispatched(await claim(store, update));
     await store.complete(updating, { status: 'partial', operationId: update.operationId, candidate: { mailboxId, uid: 4, version: digest }, candidateVerified: true, proof: verifiedDraft(4).proof, reason: 'original_deletion_failed', originalDeletion: 'failed' });
-    expect(await store.reserve({ ...update, operationId: 'operation-00000009' }, owner)).toEqual({ kind: 'conflict', reason: 'draft_fenced' });
+    expect(await store.reserve({ ...update, operationId: 'operation-00000009' }, owner)).toMatchObject({ kind: 'conflict', reason: 'draft_fenced', blocker: { state: 'retired', operation: key('operation-00000008') } });
     await claim(store, { ...update, operationId: 'operation-00000010', target: { mailboxId, uid: 4 } });
     const create: WriteIntent = { ...key('operation-00000011'), tool: 'create_draft', payloadDigest: digest };
     const creating = await store.markDispatched(await claim(store, create));
@@ -104,20 +71,20 @@ async function expandedMatrix(store: MailOperationStore): Promise<void> {
     const move = { ...flags, operationId: 'operation-move0001', tool: 'move_message' as const };
     const destination = 'b'.repeat(24);
     await store.complete(await store.markDispatched(await claim(store, move)), { status: 'completed', operationId: move.operationId, ...verifiedMessage(201, destination) });
-    expect(await store.reserve({ ...flags, operationId: 'operation-flags002' }, owner)).toEqual({ kind: 'conflict', reason: 'draft_fenced' });
+    expect((await store.reserve({ ...flags, operationId: 'operation-flags002' }, owner)).kind).toBe('acquired');
     await claim(store, { ...flags, operationId: 'operation-flags003', target: { mailboxId: destination, uid: 201 } });
     const unknownFlags = { ...flags, operationId: 'operation-flags004', target: { mailboxId, uid: 202 } };
     await store.markOutcomeUnknown(await store.markDispatched(await claim(store, unknownFlags)), { status: 'outcome_unknown', operationId: unknownFlags.operationId, reason: 'dispatch_uncertain' });
-    expect(await store.reserve({ ...unknownFlags, operationId: 'operation-flags005' }, owner)).toEqual({ kind: 'conflict', reason: 'draft_fenced' });
+    expect(await store.reserve({ ...unknownFlags, operationId: 'operation-flags005' }, owner)).toMatchObject({ kind: 'conflict', reason: 'draft_fenced' });
     const unverified = { ...intent('operation-partial01', 'update_draft'), target: { mailboxId, uid: 203 } };
     await store.complete(await store.markDispatched(await claim(store, unverified)), { status: 'partial', operationId: unverified.operationId, candidate: { mailboxId, uid: 204 }, candidateVerified: false, reason: 'candidate_verification_failed', originalDeletion: 'not_attempted' });
-    expect(await store.reserve({ ...unverified, operationId: 'operation-partial02' }, owner)).toEqual({ kind: 'conflict', reason: 'draft_fenced' });
+    expect((await store.reserve({ ...unverified, operationId: 'operation-partial02' }, owner)).kind).toBe('acquired');
     const stale = { ...intent('operation-partial03', 'update_draft'), target: { mailboxId, uid: 205 } };
     const receipt = { status: 'partial' as const, operationId: stale.operationId, candidate: verifiedDraft(206).draft, candidateVerified: true as const, proof: verifiedDraft(206).proof, reason: 'original_version_changed' as const, originalDeletion: 'not_attempted' as const };
     await store.complete(await store.markDispatched(await claim(store, stale)), receipt);
     const staleReplay = await store.getOperation(key(stale.operationId));
     expect(staleReplay?.state).toBe('settled'); if (staleReplay?.state === 'settled') { expect(staleReplay.receipt).toEqual(receipt); }
-    expect(await store.reserve({ ...stale, operationId: 'operation-partial04' }, owner)).toEqual({ kind: 'conflict', reason: 'draft_fenced' });
+    expect((await store.reserve({ ...stale, operationId: 'operation-partial04' }, owner)).kind).toBe('acquired');
     const sending = { ...intent('operation-send-sent'), target: { mailboxId, uid: 207 } };
     const sent = { mailboxId: destination, uid: 208 };
     await store.complete(await store.markDispatched(await claim(store, sending)), { status: 'queued', operationId: sending.operationId, queueId: 'actual-queue', sent });
@@ -144,13 +111,18 @@ async function provenanceMatrix(store: MailOperationStore): Promise<void> {
     }
 }
 describe('Dynamo mail operation adapter', () => {
-    test('atomic lifecycle matrix preserves receipts, shared fences, preflight release and permanent retirement', async () => {
+    test('atomic lifecycle matrix preserves receipts, shared fences, preflight release and guard deletion at the end of a hold', async () => {
         const { client, store } = fixture(); await lifecycleMatrix(store); await expandedMatrix(store); await provenanceMatrix(store);
         expect(client.calls.filter(command => command instanceof GetCommand).every(command => command.input.ConsistentRead === true)).toBe(true);
         for (const [pk, record] of client.records) {
             expect(pk.startsWith('wildduck-mcp#mail-')).toBe(true); expect(record.sk).toBe('STATE');
-            expect(JSON.stringify(record)).not.toMatch(/expiresAt|subject|accessToken|recipients|clientId"/u);
+            expect(Object.keys(record).sort()).toEqual(['expiresAt', 'pk', 'record', 'sk']); expect(record.expiresAt).toBe(NOW + RECORD_TTL_SECONDS);
+            expect(JSON.stringify(record.record)).not.toMatch(/expiresAt|subject|accessToken|recipients|clientId"/u);
+            if (pk.includes('#mail-operation#')) { expect(record.record).toMatchObject({ reservedAt: NOW }); }
         }
+        // Only holds that outlive their write remain: unknown outcomes, both-copies-alive updates, and still-reserved reservations.
+        const guardStates = [...client.records.entries()].filter(([pk]) => pk.includes('#mail-guard#')).map(([, row]) => (row.record as { state: string }).state);
+        expect(new Set(guardStates)).toEqual(new Set(['reserved', 'outcome_unknown', 'retired']));
         expect([...client.records.values()].some(value => (value.record as { state: string }).state === 'outcome_unknown')).toBe(true);
     });
     test('concurrent same intent yields one acquisition and replay; independent clients share one UID fence', async () => {
@@ -158,7 +130,7 @@ describe('Dynamo mail operation adapter', () => {
         const same = await Promise.all([store.reserve(intent(), owner), store.reserve(intent(), owner)]);
         expect(same.map(result => result.kind).sort()).toEqual(['acquired', 'replay']);
         const different = { ...intent('operation-00000002'), ...key('operation-00000002', 'x'.repeat(43)) };
-        expect(await store.reserve(different, owner)).toEqual({ kind: 'conflict', reason: 'draft_fenced' });
+        expect(await store.reserve(different, owner)).toMatchObject({ kind: 'conflict', reason: 'draft_fenced', blocker: { state: 'reserved' } });
         const { store: separate } = fixture();
         const racing = await Promise.all([separate.reserve(intent(), owner), separate.reserve(different, owner)]);
         expect(racing.map(result => result.kind).sort()).toEqual(['acquired', 'conflict']);
@@ -212,28 +184,35 @@ describe('Dynamo mail operation adapter', () => {
         client.fault = 'none';
         const replay = await store.reserve(intent(), owner);
         expect(replay.kind).toBe('replay');
-        expect(await store.reserve({ ...intent(), operationId: 'operation-00000002' }, owner)).toEqual({ kind: 'conflict', reason: 'draft_fenced' });
+        expect(await store.reserve({ ...intent(), operationId: 'operation-00000002' }, owner)).toMatchObject({ kind: 'conflict', reason: 'draft_fenced' });
     });
-    test('delete receipts bind the exact target and successful deletion permanently retires its UID', async () => {
-        const { store } = fixture(); const deleting = await store.markDispatched(await claim(store, intent('operation-00000001', 'delete_draft')));
+    test('delete receipts bind the exact target; a successful deletion deletes the guard with the receipt', async () => {
+        const { client, store } = fixture(); const deleting = await store.markDispatched(await claim(store, intent('operation-00000001', 'delete_draft')));
         await expect(store.complete(deleting, { status: 'completed', operationId: key().operationId, deleted: { mailboxId, uid: 2 } })).rejects.toThrow('temporarily_unavailable');
         await store.complete(deleting, { status: 'completed', operationId: key().operationId, deleted: { mailboxId, uid: 1 } });
-        expect(await store.reserve(intent('operation-00000002'), owner)).toEqual({ kind: 'conflict', reason: 'draft_fenced' });
+        expect([...client.records.keys()].some(pk => pk.includes('#mail-guard#'))).toBe(false);
+        expect((await store.reserve(intent('operation-00000002'), owner)).kind).toBe('acquired');
     });
     const rowOf = (client: ModelSender, part: string) => { const row = [...client.records.values()].find(item => String(item.pk).includes(part)); if (!row) { throw new Error(`missing ${part}`); } return row; };
-    test('fields a later version writes are read: reservedAt survives every transition and the compare-and-set still matches; expiresAt is ignored', async () => {
-        const { client, store } = fixture(); const value = intent(); const reservedAt = 1_800_000_000;
+    test('reserve writes reservedAt and expiresAt; reservedAt survives every transition and the compare-and-set still matches; expiresAt is refreshed at each write', async () => {
+        const { client, store, clock } = fixture(); const value = intent(); const reservedAt = NOW - 100;
         const reserved = await claim(store, value);
+        expect(rowOf(client, '#mail-operation#')).toMatchObject({ record: { reservedAt: NOW }, expiresAt: NOW + RECORD_TTL_SECONDS });
+        expect(rowOf(client, '#mail-guard#')).toMatchObject({ expiresAt: NOW + RECORD_TTL_SECONDS });
+        expect(RECORD_TTL_SECONDS).toBe(7_776_000);
         (rowOf(client, '#mail-operation#').record as Record<string, unknown>).reservedAt = reservedAt;
-        rowOf(client, '#mail-operation#').expiresAt = reservedAt + 7_776_000; rowOf(client, '#mail-guard#').expiresAt = reservedAt + 7_776_000;
         expect(await store.getOperation(key())).toMatchObject({ state: 'reserved', reservedAt });
+        // Whole seconds, rounded up: 1 500 001 ms later is 1 501 s later.
+        clock.ms += 1_500_001;
         const dispatched = await store.markDispatched(reserved);
-        expect(rowOf(client, '#mail-operation#').record).toMatchObject({ state: 'dispatched', revision: 1, reservedAt });
+        expect(rowOf(client, '#mail-operation#')).toMatchObject({ record: { state: 'dispatched', revision: 1, reservedAt }, expiresAt: NOW + 1501 + RECORD_TTL_SECONDS });
+        expect(rowOf(client, '#mail-guard#')).toMatchObject({ record: { state: 'dispatched' }, expiresAt: NOW + 1501 + RECORD_TTL_SECONDS });
+        clock.ms += 999_999;
         await store.complete(dispatched, { status: 'queued', operationId: value.operationId, queueId: 'queue-r1' });
         const settled = await store.getOperation(key());
         expect(settled).toMatchObject({ state: 'settled', revision: 2, reservedAt, receipt: { status: 'queued', queueId: 'queue-r1' } });
-        // A Put writes pk, sk and record only, so the expiresAt read from the item is not written back.
-        expect(rowOf(client, '#mail-operation#')).not.toHaveProperty('expiresAt');
+        expect(rowOf(client, '#mail-operation#').expiresAt).toBe(NOW + 2500 + RECORD_TTL_SECONDS);
+        expect(rowOf(client, '#mail-operation#').record).toMatchObject({ reservedAt });
         const failing = { ...intent('operation-00000002'), target: { mailboxId, uid: 2 } };
         const failed = await store.markDispatched(await claim(store, failing));
         const other = [...client.records.values()].find(item => String(item.pk).includes('operation-00000002'));
@@ -242,6 +221,13 @@ describe('Dynamo mail operation adapter', () => {
         expect(again).toMatchObject({ kind: 'replay', record: { reservedAt } });
         await store.failDispatched(failed, { status: 'failed', operationId: failing.operationId, reason: 'not_found' });
         expect(await store.getOperation(key('operation-00000002'))).toMatchObject({ state: 'settled', reservedAt, receipt: { status: 'failed' } });
+    });
+    test('reservedAt is the clock rounded up to a whole second, so a hold never looks older than it is', async () => {
+        for (const [offset, expected] of [[0, NOW], [1, NOW + 1], [999, NOW + 1], [1000, NOW + 1]] as const) {
+            const { client, store, clock } = fixture(); clock.ms += offset;
+            await claim(store, intent());
+            expect({ offset, row: rowOf(client, '#mail-operation#') }).toMatchObject({ offset, row: { record: { reservedAt: expected }, expiresAt: expected + RECORD_TTL_SECONDS } });
+        }
     });
     test('reservedAt must be a positive safe integer; an unknown attribute, on the record or beside it, is still rejected', async () => {
         const { client, store } = fixture(); await claim(store, intent());
@@ -416,6 +402,258 @@ describe('Dynamo mail operation adapter', () => {
         let signal: AbortSignal | undefined;
         const store = new DynamoMailOperationStore({ tableName: 'MailTable', timeoutMs: 5, client: { send(_command, options) { signal = options?.abortSignal; return new Promise(() => {}); } } });
         await expect(store.reserve(intent(), owner)).rejects.toThrow('temporarily_unavailable'); expect(signal?.aborted).toBe(true);
+    });
+});
+
+describe('the guard lasts exactly as long as its hold', () => {
+    type Tool = Exclude<WriteIntent['tool'], 'create_draft' | 'create_reply_draft'>;
+    const guardRow = (client: ModelSender) => [...client.records.entries()].find(([pk]) => pk.includes('#mail-guard#'))?.[1];
+    const guardRecord = (client: ModelSender) => { const row = guardRow(client); if (!row) { throw new Error('missing guard row'); } return row.record as { state: string; revision: number }; };
+    const operationRow = (client: ModelSender) => { const row = [...client.records.entries()].find(([pk]) => pk.includes('#mail-operation#'))?.[1]; if (!row) { throw new Error('missing operation row'); } return row; };
+    const transacts = (client: ModelSender) => client.calls.filter(call => call instanceof TransactWriteCommand);
+    const read = async (store: MailOperationStore, value = key()) => { const record = await store.getOperation(value); if (!record) { throw new Error('missing record'); } return record; };
+    const guardOf = async (store: MailOperationStore, value: WriteIntent = intent('operation-blocker01')) => { const result = await store.reserve({ ...value, ...key('operation-blocker01', 'z'.repeat(43)) } as WriteIntent, owner); if (result.kind !== 'conflict' || result.reason !== 'draft_fenced') { throw new Error('expected a blocker'); } return result.blocker; };
+    const partial = (operationId: string, reason: 'original_deletion_failed' | 'original_deletion_unconfirmed' | 'original_version_changed' | 'original_verification_failed', originalDeletion: 'failed' | 'unconfirmed' | 'not_attempted'): ConfirmedReceipt => ({ status: 'partial', operationId, candidate: verifiedDraft(4).draft, candidateVerified: true, proof: verifiedDraft(4).proof, reason, originalDeletion });
+    const failed = (operationId = key().operationId) => ({ status: 'failed' as const, operationId, reason: 'not_found' as const });
+    const unknown = (operationId = key().operationId) => ({ status: 'outcome_unknown' as const, operationId, reason: 'dispatch_uncertain' as const });
+    const queuedReceipt = (operationId = key().operationId) => ({ status: 'queued' as const, operationId });
+
+    // Rule table, rows that are pure store matters: which receipt deletes the guard and which keeps it.
+    const completions: { name: string; tool: Tool; receipt: (operationId: string) => ConfirmedReceipt; kept?: 'retired' }[] = [
+        { name: 'update_draft completed', tool: 'update_draft', receipt: operationId => ({ status: 'completed', operationId, ...verifiedDraft(2), previousDeleted: true } as ConfirmedReceipt) },
+        { name: 'update_draft partial, original_version_changed', tool: 'update_draft', receipt: operationId => partial(operationId, 'original_version_changed', 'not_attempted') },
+        { name: 'update_draft partial, original_verification_failed', tool: 'update_draft', receipt: operationId => partial(operationId, 'original_verification_failed', 'not_attempted') },
+        { name: 'update_draft partial, candidate not verified', tool: 'update_draft', receipt: operationId => ({ status: 'partial', operationId, candidate: { mailboxId, uid: 204 }, candidateVerified: false, reason: 'candidate_verification_failed', originalDeletion: 'not_attempted' }) },
+        { name: 'update_draft partial, original_deletion_failed', tool: 'update_draft', receipt: operationId => partial(operationId, 'original_deletion_failed', 'failed'), kept: 'retired' },
+        { name: 'update_draft partial, original_deletion_unconfirmed', tool: 'update_draft', receipt: operationId => partial(operationId, 'original_deletion_unconfirmed', 'unconfirmed'), kept: 'retired' },
+        { name: 'delete_draft completed', tool: 'delete_draft', receipt: operationId => ({ status: 'completed', operationId, deleted: { mailboxId, uid: 1 } }) },
+        { name: 'move_message completed', tool: 'move_message', receipt: operationId => ({ status: 'completed', operationId, ...verifiedMessage(2, 'b'.repeat(24)) }) },
+        { name: 'update_message_flags completed', tool: 'update_message_flags', receipt: operationId => ({ status: 'completed', operationId, ...verifiedMessage(1) }) },
+        { name: 'send_draft queued with queue id and Sent copy', tool: 'send_draft', receipt: operationId => ({ status: 'queued', operationId, queueId: 'queue-1', sent: { mailboxId: 'b'.repeat(24), uid: 9 } }) },
+        { name: 'send_draft queued without queue id', tool: 'send_draft', receipt: operationId => ({ status: 'queued', operationId }) },
+    ];
+    for (const { name, tool, receipt, kept } of completions) {
+        test(`${name}: the guard is ${kept ? 'kept as retired with a fresh expiresAt' : 'deleted in the transaction that stores the receipt'}`, async () => {
+            const { client, store, clock } = fixture(); const value = intent('operation-00000001', tool);
+            const dispatched = await store.markDispatched(await claim(store, value)); clock.ms += 5_000_000;
+            const before = transacts(client).length;
+            await store.complete(dispatched, receipt(value.operationId));
+            expect(transacts(client)).toHaveLength(before + 1);
+            expect(transacts(client).at(-1)?.input.TransactItems?.map(item => Object.keys(item)[0])).toEqual(['Put', kept ? 'Put' : 'Delete']);
+            expect(operationRow(client)).toMatchObject({ record: { state: 'settled', revision: 2 }, expiresAt: NOW + 5000 + RECORD_TTL_SECONDS });
+            if (kept) { expect(guardRow(client)).toMatchObject({ record: { state: kept, revision: 2 }, expiresAt: NOW + 5000 + RECORD_TTL_SECONDS }); expect((await store.reserve({ ...value, operationId: 'operation-00000002' }, owner)).kind).toBe('conflict'); }
+            else { expect(guardRow(client)).toBeUndefined(); expect((await store.reserve({ ...value, operationId: 'operation-00000002' }, owner)).kind).toBe('acquired'); }
+        });
+    }
+    test('failPreflight and failDispatched delete the guard; an unknown outcome keeps it with a fresh expiresAt and never writes the queued state', async () => {
+        const preflight = fixture(); const value = intent();
+        await preflight.store.failPreflight(await claim(preflight.store, value), failed());
+        expect(guardRow(preflight.client)).toBeUndefined();
+        const dispatchedFail = fixture(); await dispatchedFail.store.failDispatched(await dispatchedFail.store.markDispatched(await claim(dispatchedFail.store, value)), failed());
+        expect(guardRow(dispatchedFail.client)).toBeUndefined();
+        const { client, store, clock } = fixture(); const dispatched = await store.markDispatched(await claim(store, value)); clock.ms += 7_000_000;
+        await store.markOutcomeUnknown(dispatched, unknown());
+        expect(guardRow(client)).toMatchObject({ record: { state: 'outcome_unknown', revision: 2 }, expiresAt: NOW + 7000 + RECORD_TTL_SECONDS });
+        expect(await store.reserve({ ...value, operationId: 'operation-00000002' }, owner)).toMatchObject({ kind: 'conflict', reason: 'draft_fenced', blocker: { state: 'outcome_unknown' } });
+    });
+    test('items written by older versions (no reservedAt, no expiresAt) still transition: they gain expiresAt but never a reservedAt', async () => {
+        const { client, store, clock } = fixture(); const value = intent();
+        const reserved = await claim(store, value);
+        for (const row of client.records.values()) { delete row.expiresAt; delete (row.record as Record<string, unknown>).reservedAt; }
+        expect(await store.getOperation(key())).not.toHaveProperty('reservedAt');
+        clock.ms += 1_000_000;
+        const dispatched = await store.markDispatched(reserved);
+        expect(operationRow(client)).toMatchObject({ expiresAt: NOW + 1000 + RECORD_TTL_SECONDS }); expect(operationRow(client).record).not.toHaveProperty('reservedAt');
+        await store.markOutcomeUnknown(dispatched, unknown());
+        expect(operationRow(client).record).not.toHaveProperty('reservedAt');
+        // Its guard has neither field either; releasing and resolving work on it.
+        delete guardRow(client)?.expiresAt;
+        const record = await read(store); const blocker = await guardOf(store);
+        await store.resolveUnknown(record, queuedReceipt(), blocker);
+        expect(guardRow(client)).toBeUndefined(); expect(operationRow(client)).toMatchObject({ record: { state: 'settled', revision: 3, receipt: { status: 'queued', operation_id: key().operationId } }, expiresAt: NOW + 1000 + RECORD_TTL_SECONDS });
+        expect(operationRow(client).record).not.toHaveProperty('reservedAt');
+    });
+
+    test('reserve returns the guard row it read as the blocker, whatever state that row has, and a legacy queued or retired row still reads', async () => {
+        const { client, store } = fixture(); const value = intent(); await claim(store, value);
+        const blocker = await guardOf(store);
+        expect(blocker).toEqual({ key: { accountId: key().accountId, ...value.target }, operation: key(), ownerToken: owner, revision: 0, state: 'reserved' });
+        for (const state of ['retired', 'queued'] as const) {
+            guardRecord(client).state = state;
+            expect(await store.reserve({ ...value, ...key('operation-blocker02', 'z'.repeat(43)) }, owner)).toMatchObject({ kind: 'conflict', reason: 'draft_fenced', blocker: { state } });
+        }
+    });
+
+    test('releaseGuard deletes exactly the given guard row while it still equals it, touches no operation record, and reports whether it did', async () => {
+        const { client, store } = fixture(); const value = intent(); await claim(store, value);
+        const blocker = await guardOf(store); const operationBefore = structuredClone(operationRow(client));
+        const stale = { ...blocker, revision: blocker.revision + 1 };
+        const before = transacts(client).length;
+        expect(await store.releaseGuard(stale)).toBe(false); expect(guardRow(client)).toBeDefined();
+        expect(await store.releaseGuard({ ...blocker, state: 'outcome_unknown' })).toBe(false); expect(guardRow(client)).toBeDefined();
+        expect(await store.releaseGuard(blocker)).toBe(true);
+        expect(transacts(client)).toHaveLength(before + 3); expect(transacts(client).at(-1)?.input.TransactItems).toHaveLength(1);
+        expect(guardRow(client)).toBeUndefined(); expect(operationRow(client)).toEqual(operationBefore);
+        // Gone already: nothing to delete; someone else's new hold is never released by an old value.
+        expect(await store.releaseGuard(blocker)).toBe(false);
+        const next = await claim(store, { ...value, ...key('operation-00000002', 'x'.repeat(43)) });
+        expect(await store.releaseGuard(blocker)).toBe(false); expect(guardRow(client)).toBeDefined(); expect(next.state).toBe('reserved');
+    });
+    test('releaseGuard: a change between read and delete, an invalid guard and an unreachable table are all handled without deleting', async () => {
+        const { client, store } = fixture(); await claim(store, intent()); const blocker = await guardOf(store);
+        client.beforeTransaction = () => { guardRecord(client).revision++; };
+        expect(await store.releaseGuard(blocker)).toBe(false); expect(guardRow(client)).toBeDefined();
+        await expect(store.releaseGuard({ ...blocker, state: 'bogus' } as never)).rejects.toThrow('temporarily_unavailable');
+        await expect(store.releaseGuard({ ...blocker, key: { ...blocker.key, accountId: 'namespace#injection' } })).rejects.toThrow('temporarily_unavailable');
+        client.fault = 'unknown_always'; await expect(store.releaseGuard(blocker)).rejects.toThrow('temporarily_unavailable'); client.fault = 'none';
+        expect(guardRow(client)).toBeDefined();
+    });
+
+    test('getGuard reads the guard row as reserve does: one strong read, the same parsing and checks, undefined when there is none', async () => {
+        const { client, store } = fixture(); const value = intent(); const at = { accountId: key().accountId, ...value.target };
+        expect(await store.getGuard(at)).toBeUndefined();
+        await claim(store, value); const blocker = await guardOf(store); const before = client.calls.length;
+        expect(await store.getGuard(at)).toEqual(blocker);
+        expect(client.calls).toHaveLength(before + 1); const read = client.calls.at(-1);
+        expect(read).toBeInstanceOf(GetCommand); expect((read as GetCommand).input).toMatchObject({ ConsistentRead: true, Key: { sk: 'STATE' } });
+        expect(String((read as GetCommand).input.Key?.pk)).toContain('#mail-guard#');
+        guardRecord(client).state = 'bogus'; await expect(store.getGuard(at)).rejects.toThrow('temporarily_unavailable');
+        await expect(store.getGuard({ ...at, accountId: 'namespace#injection' })).rejects.toThrow('temporarily_unavailable');
+        // A row stored under this key but naming another message is refused, never returned.
+        guardRecord(client).state = 'reserved'; (guardRecord(client) as unknown as { key: { uid: number } }).key.uid = 2;
+        await expect(store.getGuard(at)).rejects.toThrow('temporarily_unavailable');
+    });
+
+    // resolveUnknown: dispatched, or settled with an unknown receipt, to failed or queued.
+    const seedDispatched = async () => { const f = fixture(); const dispatched = await f.store.markDispatched(await claim(f.store, intent())); return { ...f, dispatched }; };
+    const seedUnknown = async () => { const f = await seedDispatched(); await f.store.markOutcomeUnknown(f.dispatched, unknown()); return f; };
+    const snapshot = (client: ModelSender) => structuredClone([...client.records.entries()]);
+    test('a dispatched record settles as queued or failed with its guard deleted in the same transaction', async () => {
+        for (const receipt of [queuedReceipt(), failed()]) {
+            const { client, store, clock } = await seedDispatched(); clock.ms += 3_000_000;
+            const before = transacts(client).length;
+            await store.resolveUnknown(await read(store), receipt, await guardOf(store));
+            expect(transacts(client)).toHaveLength(before + 1 + 1); // one for the blocker read's failed reserve, one for the resolution
+            expect(transacts(client).at(-1)?.input.TransactItems?.map(item => Object.keys(item)[0])).toEqual(['Put', 'Delete']);
+            expect(guardRow(client)).toBeUndefined();
+            expect(operationRow(client)).toMatchObject({ record: { state: 'settled', revision: 2, reservedAt: NOW, receipt: { status: receipt.status, operation_id: key().operationId } }, expiresAt: NOW + 3000 + RECORD_TTL_SECONDS });
+            expect(await store.getOperation(key())).toMatchObject({ state: 'settled', receipt });
+        }
+    });
+    test('a settled outcome_unknown record settles as queued or as failed against the model, storing the receipt in its stored spelling', async () => {
+        for (const receipt of [queuedReceipt(), failed()]) {
+            const { client, store } = await seedUnknown();
+            expect(operationRow(client).record).toMatchObject({ receipt: { status: 'outcome_unknown', operation_id: key().operationId } });
+            const record = await read(store); expect(record).toMatchObject({ state: 'settled', receipt: { status: 'outcome_unknown', operationId: key().operationId } });
+            await store.resolveUnknown(record, receipt, await guardOf(store));
+            expect(guardRow(client)).toBeUndefined();
+            expect(operationRow(client).record).toMatchObject({ state: 'settled', revision: 3, receipt: { status: receipt.status, operation_id: key().operationId } });
+            expect(operationRow(client).record).not.toHaveProperty('receipt.operationId');
+            expect(await store.getOperation(key())).toMatchObject({ state: 'settled', revision: 3, receipt });
+            // Settled now: a second resolution, from the same stale record, is refused.
+            await expect(store.resolveUnknown(record, receipt)).rejects.toThrow('temporarily_unavailable');
+        }
+    });
+    test('without a guard argument only the operation record is written; the unknown guard stays', async () => {
+        const { client, store } = await seedUnknown();
+        await store.resolveUnknown(await read(store), failed());
+        expect(guardRow(client)).toMatchObject({ record: { state: 'outcome_unknown' } });
+        expect(transacts(client).at(-1)?.input.TransactItems).toHaveLength(1);
+    });
+    test('the condition is the value as stored: a settled record with a stray stored summary still settles', async () => {
+        const { client, store } = await seedUnknown();
+        (operationRow(client).record as { receipt: Record<string, unknown> }).receipt.summary = { text: 'stale' };
+        await store.resolveUnknown(await read(store), queuedReceipt(), await guardOf(store));
+        expect(operationRow(client).record).toMatchObject({ receipt: { status: 'queued' } }); expect(operationRow(client).record).not.toHaveProperty('receipt.summary');
+    });
+    test('a concurrent change to the record or the guard makes resolveUnknown fail cleanly with nothing written', async () => {
+        for (const seed of [seedDispatched, seedUnknown]) {
+            for (const change of ['record', 'guard'] as const) {
+                const { client, store } = await seed(); const record = await read(store); const blocker = await guardOf(store);
+                const stored = snapshot(client);
+                client.beforeTransaction = () => { const row = change === 'record' ? operationRow(client).record : guardRecord(client); (row as { revision: number }).revision += 10; };
+                const expected = structuredClone(stored); const target = expected.find(([pk]) => pk.includes(change === 'record' ? '#mail-operation#' : '#mail-guard#'));
+                if (!target) { throw new Error('missing row'); } (target[1].record as { revision: number }).revision += 10;
+                await expect(store.resolveUnknown(record, queuedReceipt(), blocker)).rejects.toThrow('temporarily_unavailable');
+                expect(snapshot(client)).toEqual(expected);
+            }
+        }
+    });
+    test('resolveUnknown refuses every other source state, a stale record, a foreign guard and a wrong receipt, writing nothing', async () => {
+        const reservedF = fixture(); const reserved = await claim(reservedF.store, intent());
+        const states: { name: string; client: ModelSender; store: MailOperationStore }[] = [{ name: 'reserved', ...reservedF }];
+        const settle = async (name: string, tool: Tool, finish: (store: MailOperationStore, claimed: OperationClaim<'dispatched'>, operationId: string) => Promise<void>) => {
+            const f = fixture(); const value = intent('operation-00000001', tool); await finish(f.store, await f.store.markDispatched(await claim(f.store, value)), value.operationId); states.push({ name, ...f });
+        };
+        await settle('completed', 'update_message_flags', (store, claimed, operationId) => store.complete(claimed, { status: 'completed', operationId, ...verifiedMessage(1) }));
+        await settle('partial', 'update_draft', (store, claimed, operationId) => store.complete(claimed, partial(operationId, 'original_deletion_failed', 'failed')));
+        await settle('queued', 'send_draft', (store, claimed, operationId) => store.complete(claimed, queuedReceipt(operationId)));
+        await settle('failed', 'send_draft', (store, claimed, operationId) => store.failDispatched(claimed, failed(operationId)));
+        for (const { name, client, store } of states) {
+            const record = await read(store); const stored = snapshot(client); const calls = client.calls.length;
+            for (const receipt of [queuedReceipt(), failed()]) { await expect(store.resolveUnknown(record, receipt), name).rejects.toThrow('temporarily_unavailable'); }
+            expect(snapshot(client), name).toEqual(stored);
+            // Nothing is written; for a settled non-unknown record not even a transaction is attempted.
+            expect(client.calls.slice(calls).some(call => call instanceof TransactWriteCommand), name).toBe(false);
+        }
+        expect(reserved.state).toBe('reserved');
+        const { client, store } = await seedUnknown(); const record = await read(store); const blocker = await guardOf(store); const stored = snapshot(client);
+        await expect(store.resolveUnknown({ ...record, revision: record.revision - 1 }, failed(), blocker)).rejects.toThrow('temporarily_unavailable');
+        await expect(store.resolveUnknown({ ...record, ownerToken: 'other-owner'.padEnd(43, 'b') }, failed(), blocker)).rejects.toThrow('temporarily_unavailable');
+        await expect(store.resolveUnknown(record, failed(), { ...blocker, operation: key('operation-00000009') })).rejects.toThrow('temporarily_unavailable');
+        await expect(store.resolveUnknown(record, failed(), { ...blocker, key: { ...blocker.key, uid: 2 } })).rejects.toThrow('temporarily_unavailable');
+        await expect(store.resolveUnknown(record, failed('operation-other000'))).rejects.toThrow('temporarily_unavailable');
+        await expect(store.resolveUnknown(record, { status: 'completed', operationId: key().operationId, ...verifiedMessage(1) } as never)).rejects.toThrow('temporarily_unavailable');
+        await expect(store.resolveUnknown(record, unknown() as never)).rejects.toThrow('temporarily_unavailable');
+        expect(snapshot(client)).toEqual(stored);
+        // A queued receipt exists only for send_draft; a create has no guard to delete.
+        const move = fixture(); const moving = await move.store.markDispatched(await claim(move.store, intent('operation-00000001', 'move_message')));
+        await move.store.markOutcomeUnknown(moving, unknown());
+        await expect(move.store.resolveUnknown(await read(move.store), queuedReceipt() as never)).rejects.toThrow('temporarily_unavailable');
+        const create = fixture(); const created = await create.store.markDispatched(await claim(create.store, { ...key(), tool: 'create_draft', payloadDigest: digest }));
+        await create.store.markOutcomeUnknown(created, unknown());
+        await expect(create.store.resolveUnknown(await read(create.store), failed(), blocker)).rejects.toThrow('temporarily_unavailable');
+        await create.store.resolveUnknown(await read(create.store), failed());
+        expect(await create.store.getOperation(key())).toMatchObject({ state: 'settled', receipt: { status: 'failed' } });
+    });
+    test('a lost acknowledgement of resolveUnknown retries the same transaction and applies once', async () => {
+        const { client, store } = await seedUnknown(); const record = await read(store); const blocker = await guardOf(store); client.fault = 'lost_once';
+        await store.resolveUnknown(record, queuedReceipt(), blocker);
+        const writes = transacts(client); expect(writes.at(-1)).toBe(writes.at(-2));
+        expect(operationRow(client).record).toMatchObject({ state: 'settled', revision: 3 }); expect(guardRow(client)).toBeUndefined();
+    });
+
+    test('abandoning an aged reservation: failPreflight built from the stored record settles it failed, deletes the guard, and the slow first attempt can no longer dispatch', async () => {
+        for (const legacy of [false, true]) {
+            const { client, store } = fixture(); const value = intent(); const first = await claim(store, value);
+            if (legacy) { for (const row of client.records.values()) { delete row.expiresAt; delete (row.record as Record<string, unknown>).reservedAt; } }
+            const stored = await read(store); expect(stored.reservedAt).toBe(legacy ? undefined : NOW);
+            // What the service does: a claim from the stored record, not from the first attempt's own memory.
+            await store.failPreflight({ key: stored.key, ownerToken: stored.ownerToken, revision: stored.revision, state: 'reserved' }, failed());
+            expect(guardRow(client)).toBeUndefined();
+            expect(await store.getOperation(key())).toMatchObject({ state: 'settled', revision: 1, receipt: { status: 'failed' } });
+            if (legacy) { expect(operationRow(client).record).not.toHaveProperty('reservedAt'); } else { expect(operationRow(client).record).toMatchObject({ reservedAt: NOW }); }
+            const writes = transacts(client).length; const snapshotted = snapshot(client);
+            await expect(store.markDispatched(first)).rejects.toThrow('temporarily_unavailable');
+            await expect(store.failPreflight(first, failed())).rejects.toThrow('temporarily_unavailable');
+            expect(transacts(client)).toHaveLength(writes); expect(snapshot(client)).toEqual(snapshotted);
+            // The message is free again for the retry.
+            expect((await store.reserve({ ...value, operationId: 'operation-00000002' }, owner)).kind).toBe('acquired');
+        }
+    });
+    test('abandon and dispatch race for one reservation: whichever commits first wins and the other is refused', async () => {
+        const abandonFirst = fixture(); const claimA = await claim(abandonFirst.store, intent());
+        await abandonFirst.store.failPreflight(claimA, failed());
+        await expect(abandonFirst.store.markDispatched(claimA)).rejects.toThrow('temporarily_unavailable');
+        const dispatchFirst = fixture(); const claimB = await claim(dispatchFirst.store, intent());
+        await dispatchFirst.store.markDispatched(claimB);
+        await expect(dispatchFirst.store.failPreflight(claimB, failed())).rejects.toThrow('temporarily_unavailable');
+        expect(await dispatchFirst.store.getOperation(key())).toMatchObject({ state: 'dispatched' });
+        // Interleaved: the dispatch commits between the abandon's read and its write.
+        const interleaved = fixture(); const claimC = await claim(interleaved.store, intent());
+        interleaved.client.beforeTransaction = () => { const record = operationRow(interleaved.client).record as { state: string; revision: number }; record.state = 'dispatched'; record.revision = 1; const held = guardRecord(interleaved.client); held.state = 'dispatched'; held.revision = 1; };
+        await expect(interleaved.store.failPreflight(claimC, failed())).rejects.toThrow('temporarily_unavailable');
+        expect(operationRow(interleaved.client).record).toMatchObject({ state: 'dispatched' }); expect(guardRow(interleaved.client)).toBeDefined();
     });
 });
 
@@ -610,7 +848,8 @@ describe('the preflight window of a write', () => {
         const methods: MailOperationStore = {
             getOperation: value => store.getOperation(value), reserve: (value, token) => store.reserve(value, token), markDispatched: value => store.markDispatched(value),
             failPreflight: async (value, receipt) => { seen.atFailure = remainingRequestTimeMs(); await store.failPreflight(value, receipt); },
-            complete: (value, receipt) => store.complete(value, receipt), markOutcomeUnknown: (value, receipt) => store.markOutcomeUnknown(value, receipt), failDispatched: (value, receipt) => store.failDispatched(value, receipt), ...over,
+            complete: (value, receipt) => store.complete(value, receipt), markOutcomeUnknown: (value, receipt) => store.markOutcomeUnknown(value, receipt), failDispatched: (value, receipt) => store.failDispatched(value, receipt),
+            getGuard: value => store.getGuard(value), releaseGuard: value => store.releaseGuard(value), resolveUnknown: (value, receipt, guard) => store.resolveUnknown(value, receipt, guard), ...over,
         };
         return Object.fromEntries(Object.entries(methods).map(([name, method]: [string, (...args: unknown[]) => Promise<unknown>]) => [name, (...args: unknown[]) => { seen.calls.push(name); return method(...args); }])) as unknown as MailOperationStore;
     };
@@ -765,7 +1004,7 @@ describe('the preflight window of a write', () => {
                 expect({ throttles, outcome, states: states(f.client) }).toMatchObject({ throttles, outcome: { status: 'failed', reason: 'temporarily_unavailable' }, states: ['settled'] });
                 outcomes[throttles] = 'settled';
             } else {
-                // The documented residual: nothing proved, nothing touched; the draft stays fenced and the retry is in_progress.
+                // The documented residual: nothing proved, nothing touched; the draft stays fenced and the retry is in_progress until the hold is aged (HOLD_AGED_MS), when the next request settles it.
                 expect({ throttles, outcome, states: states(f.client) }).toMatchObject({ throttles, outcome: { code: 'temporarily_unavailable' }, states: ['reserved', 'reserved'] });
                 expect(await service.send_draft(context, args)).toMatchObject({ status: 'in_progress' });
                 outcomes[throttles] = 'reserved';

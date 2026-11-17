@@ -1487,3 +1487,83 @@ test('a verification GET is not retried more than once, nor for other failures, 
     const ample = model([], {}, 'sender@example.com', 'Sender', after(path => path === `${movedPath}/message.eml`, () => upstreamError(503))); const ampleSnapshot = await ample.backend.inspectMessage(session, target);
     await failure(withRequestBudget(() => 60_000, () => move(ample, ampleSnapshot))); expect(attempts(ample)).toBe(2);
 });
+const sentId = '5'.repeat(24); const threadId = '7'.repeat(24);
+const sentRow = (uid: number, over: Record<string, unknown> = {}, stamp: unknown = sendMarker) => ({ id: uid, mailbox: sentId, thread: threadId, draft: false, flags: ['\\Seen'], metaData: { [MAIL_OPERATION_METADATA_KEY]: stamp }, ...over });
+/** WildDuck's Sent listing and thread search as pages of rows (the cursor is the next page's index) and the single-message GET of a found copy. */
+function sentFake(pages: unknown[][], outbound?: unknown) {
+    const calls: Array<{ method: string; url: URL }> = [];
+    const fetcher = (async (input: string | URL | Request, init?: RequestInit) => {
+        const url = new URL(String(input)); calls.push({ method: init?.method ?? 'GET', url }); const path = url.pathname.slice(`/users/${accountId}`.length);
+        if (path === '/mailboxes') { return Response.json({ success: true, results: [{ id: mailboxId, path: 'Drafts', specialUse: '\\Drafts' }, { id: sentId, path: 'Sent', specialUse: '\\Sent' }] }); }
+        if (path === `/mailboxes/${sentId}/messages` || path === '/search') {
+            const index = Number(url.searchParams.get('next') ?? 0);
+            return Response.json({ success: true, results: pages[index] ?? [], ...(index + 1 < pages.length ? { nextCursor: String(index + 1) } : {}) });
+        }
+        const one = /^\/mailboxes\/([a-f0-9]{24})\/messages\/(\d+)$/u.exec(path);
+        if (one) { return Response.json({ success: true, user: accountId, mailbox: one[1], id: Number(one[2]), ...(outbound === undefined ? {} : { outbound }) }); }
+        throw new Error('Unexpected fake request');
+    }) as typeof fetch;
+    return { backend: createMailBackend({ fetch: fetcher, timeoutMs: 100 }), calls, paths: () => calls.map(call => call.url.pathname.slice(`/users/${accountId}`.length)) };
+}
+test('findSentCopy finds the copy through the thread search, with the queue id WildDuck still reports, using GETs only', async () => {
+    const f = sentFake([[sentRow(20, { draft: true }), sentRow(21), sentRow(22, { mailbox: mailboxId })]], [{ queueId: 'queue-1', entries: [{ seq: '001' }] }]);
+    expect(await f.backend.findSentCopy(session, sendMarker, { threadId })).toEqual({ message: { mailboxId: sentId, uid: 21 }, queueId: 'queue-1' });
+    expect(f.paths()).toEqual(['/mailboxes', '/search', `/mailboxes/${sentId}/messages/21`]);
+    expect(f.calls.every(call => call.method === 'GET')).toBe(true);
+    const search = f.calls[1]?.url.searchParams; expect(search?.get('thread')).toBe(threadId); expect(search?.get('metaData')).toBe('true'); expect(search?.get('order')).toBe('desc'); expect(search?.get('limit')).toBe('50');
+    expect(f.calls[2]?.url.searchParams.get('markAsSeen')).toBe('false');
+    // A thread search spans mailboxes: only a Sent row counts.
+    const elsewhere = sentFake([[sentRow(5, { mailbox: mailboxId })]]); expect(await elsewhere.backend.findSentCopy(session, sendMarker, { threadId })).toBeUndefined();
+});
+test('findSentCopy lists Sent newest first, page by page, and returns no queue id once WildDuck reports none', async () => {
+    const f = sentFake([[sentRow(30, {}, 'not a marker'), sentRow(29, { metaData: 'text' }), sentRow(28, { metaData: {} })], [sentRow(27, {}, { ...sendMarker, extra: 1 }), sentRow(26)]]);
+    const found = await f.backend.findSentCopy(session, sendMarker); expect(found).toEqual({ message: { mailboxId: sentId, uid: 26 } }); expect(found).not.toHaveProperty('queueId');
+    expect(f.paths()).toEqual(['/mailboxes', `/mailboxes/${sentId}/messages`, `/mailboxes/${sentId}/messages`, `/mailboxes/${sentId}/messages/26`]);
+    const first = f.calls[1]?.url.searchParams; expect(first?.get('order')).toBe('desc'); expect(first?.get('metaData')).toBe('true'); expect(first?.get('limit')).toBe('50'); expect(first?.has('next')).toBe(false); expect(f.calls[2]?.url.searchParams.get('next')).toBe('1');
+    // Several or empty outbound entries are not one queue id.
+    for (const outbound of [[], [{ queueId: 'a' }, { queueId: 'b' }], [{ queueId: 'has space' }], 'x']) { expect(await sentFake([[sentRow(9)]], outbound).backend.findSentCopy(session, sendMarker)).toEqual({ message: { mailboxId: sentId, uid: 9 } }); }
+});
+test('findSentCopy matches only the whole marker and only a copy that is no longer a draft', async () => {
+    const other = (patch: Partial<MailOperationMarker>) => sentRow(40, {}, { ...sendMarker, ...patch });
+    for (const patch of [{ payloadDigest: 'z'.repeat(43) }, { clientIdHash: 'q'.repeat(43) }, { operationId: 'operation-7654321' }, { tool: 'create_draft' as const }, { accountId: 'd'.repeat(24) }]) {
+        expect([Object.keys(patch)[0], await sentFake([[other(patch)]]).backend.findSentCopy(session, sendMarker)]).toEqual([Object.keys(patch)[0], undefined]);
+    }
+    // A draft moved to Sent by hand keeps its draft state (and the marker): the draft field or the \Draft flag keeps it from matching.
+    expect(await sentFake([[sentRow(41, { draft: true, flags: ['\\Draft'] })]]).backend.findSentCopy(session, sendMarker)).toBeUndefined();
+    expect(await sentFake([[sentRow(42, { draft: false, flags: ['\\Seen', '\\draft'] })]]).backend.findSentCopy(session, sendMarker)).toBeUndefined();
+    expect((await sentFake([[sentRow(41, { draft: true }), sentRow(43)]]).backend.findSentCopy(session, sendMarker))?.message.uid).toBe(43);
+    await errorCode(sentFake([[]]).backend.findSentCopy(session, { ...sendMarker, accountId: 'd'.repeat(24) }), 'invalid_input');
+    await errorCode(sentFake([[]]).backend.findSentCopy(session, sendMarker, { threadId: 'not a thread' }), 'invalid_input');
+});
+test('findSentCopy is bounded: a miss after the page limit is undefined after exactly the listing, three pages and no more', async () => {
+    const pages = Array.from({ length: 6 }, (_, index) => [sentRow(100 + index, {}, { ...sendMarker, operationId: 'operation-other-' + index })]);
+    const listed = sentFake(pages); expect(await listed.backend.findSentCopy(session, sendMarker)).toBeUndefined();
+    expect(listed.paths()).toEqual(['/mailboxes', ...Array.from({ length: 3 }, () => `/mailboxes/${sentId}/messages`)]); expect(listed.calls.every(call => call.method === 'GET')).toBe(true);
+    const threaded = sentFake(pages); expect(await threaded.backend.findSentCopy(session, sendMarker, { threadId })).toBeUndefined();
+    expect(threaded.paths()).toEqual(['/mailboxes', '/search', '/search', '/search']);
+    // Fewer pages than the limit end the search early.
+    const short = sentFake(pages.slice(0, 2)); expect(await short.backend.findSentCopy(session, sendMarker)).toBeUndefined(); expect(short.calls).toHaveLength(3);
+});
+test('findSentCopy fails closed: no single Sent mailbox, a bad page, or an upstream error is a throw, never a miss', async () => {
+    const boxes = (results: unknown[]) => fixture([{ success: true, results }]).backend;
+    await errorCode(boxes([{ id: mailboxId, path: 'Drafts', specialUse: '\\Drafts' }]).findSentCopy(session, sendMarker), 'not_found');
+    await errorCode(boxes([{ id: sentId, path: 'Sent', specialUse: '\\Sent' }, { id: 'e'.repeat(24), path: 'Sent2', specialUse: '\\Sent' }]).findSentCopy(session, sendMarker), 'temporarily_unavailable');
+    const sentBoxes = { success: true, results: [{ id: sentId, path: 'Sent', specialUse: '\\Sent' }] };
+    await errorCode(fixture([sentBoxes, { success: true, results: 'no' }]).backend.findSentCopy(session, sendMarker), 'temporarily_unavailable');
+    await errorCode(fixture([sentBoxes, upstreamError(503)]).backend.findSentCopy(session, sendMarker), 'temporarily_unavailable');
+    await errorCode(fixture([sentBoxes, { success: true, results: [sentRow(1, { draft: 'no' })] }]).backend.findSentCopy(session, sendMarker), 'temporarily_unavailable');
+    // The queue id read is optional: its failure leaves the established match without one.
+    const found = await fixture([sentBoxes, { success: true, results: [sentRow(7)] }, upstreamError(500)]).backend.findSentCopy(session, sendMarker); expect(found).toEqual({ message: { mailboxId: sentId, uid: 7 } });
+});
+test('draftPresent is true when the message exists, false only for 404 MessageNotFound, and throws for everything else', async () => {
+    const present = fixture([message()]); expect(await present.backend.draftPresent(session, target)).toBe(true);
+    expect(present.calls).toHaveLength(1); expect(present.calls[0]?.init.method).toBe('GET'); expect(present.calls[0]?.url).toBe(`${WILDDUCK_ORIGIN}/users/${accountId}/mailboxes/${mailboxId}/messages/12?markAsSeen=false&replaceCidLinks=false`);
+    const gone = fixture([upstreamError(404, 'MessageNotFound')]); expect(await gone.backend.draftPresent(session, target)).toBe(false); expect(gone.calls).toHaveLength(1);
+    for (const [name, response, code] of [['5xx', upstreamError(500, 'InternalDatabaseError'), 'temporarily_unavailable'], ['404 without code', upstreamError(404), 'not_found'], ['404 other code', upstreamError(404, 'NoSuchMailbox'), 'not_found'],
+        ['403 token', upstreamError(403, 'InvalidToken'), 'reconnect_required'], ['429', upstreamError(429, 'RateLimitedError'), 'temporarily_unavailable'], ['another message', Response.json(message({ id: 13 })), 'temporarily_unavailable']] as const) {
+        const f = fixture([response]); try { await f.backend.draftPresent(session, target); throw new Error('Expected failure'); } catch (error) { expect([name, error instanceof MailError && error.code]).toEqual([name, code]); }
+        expect(f.calls).toHaveLength(1);
+    }
+    const slow = createMailBackend({ timeoutMs: 5, fetch: (async (_url, _init) => await hang()) as typeof fetch }); expect((await failure(slow.draftPresent(session, target))).code).toBe('upstream_timeout');
+    await errorCode(fixture([]).backend.draftPresent(session, { mailboxId: 'bad', uid: 12 }), 'invalid_input');
+});

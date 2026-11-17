@@ -30,6 +30,37 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # The store's lifecycle test against DynamoDB Local (a local emulator). It needs the emulator, so it is not part of `bun run validate`.
+  dynamodb-local:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      dynamodb:
+        image: amazon/dynamodb-local:3.3.2
+        ports:
+          - 18765:8000
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - name: Wait for DynamoDB Local
+        run: |
+          for _ in $(seq 1 30); do
+            curl --silent --output /dev/null http://127.0.0.1:18765 && exit 0
+            sleep 1
+          done
+          echo 'DynamoDB Local did not answer on 127.0.0.1:18765' >&2
+          exit 1
+      - name: Run the DynamoDB Local mail store test
+        run: bun test tests/mail-dynamo.test.ts
+        env:
+          DYNAMO_LOCAL_MAIL_TEST: '1'
+
   deployment-status:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: verify
@@ -55,7 +86,7 @@ jobs:
 
   deploy:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.DEPLOY_ENABLED == 'true'
-    needs: [verify, deployment-status]
+    needs: [verify, dynamodb-local, deployment-status]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     concurrency:

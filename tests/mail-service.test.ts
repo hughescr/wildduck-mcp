@@ -1,11 +1,14 @@
+import { readFileSync } from 'node:fs';
 import { withRequestBudget } from '../src/request-budget';
 import { withRequestId } from '../src/request-id';
-import { captureWarnings } from './dynamo-virtual';
-import { expect, test } from 'bun:test';
+import { captureWarnings, steppedClock, virtualRetry } from './dynamo-virtual';
+import { ModelSender } from './dynamo-model';
+import { describe, expect, test } from 'bun:test';
 import { digest } from '../src/auth/crypto';
-import { createMailService } from '../src/mail/service';
+import { DynamoMailOperationStore, guardKey, opKey } from '../src/mail/dynamo-store';
+import { createMailService, holdAction, HOLD_AGED_MS, SEND_CHECK_AGED_MS } from '../src/mail/service';
 import { errorText } from '../src/mail/summary';
-import { MailError, type ConfirmedReceipt, type MailOperationMarker, type FailedReceipt, type MailBackendReader, type MailBackendWriter, type MailContext, type MailOperationRecord, type MailOperationStore, type OperationClaim, type OperationKey, type ReservationResult, type UnknownReceipt, type WriteIntent, type MessageSnapshot, type PreparedDraft } from '../src/mail/contracts';
+import { MailError, type ConfirmedReceipt, type DraftGuardKey, type MailFailureCode, type MailOutput, type MailOperationMarker, type FailedReceipt, type MailBackendReader, type MailBackendWriter, type MailContext, type DraftGuardRecord, type MailOperationRecord, type MailOperationStore, type OperationClaim, type OperationKey, type ReservationResult, type ResolvedReceipt, type UnknownReceipt, type WriteIntent, type MessageSnapshot, type PreparedDraft } from '../src/mail/contracts';
 
 const accountId = 'a'.repeat(24); const mailboxId = 'b'.repeat(24); const version = 'v'.repeat(43);
 const context: MailContext = { accountId, accessToken: 'c'.repeat(40), clientId: 'client-one', scopes: ['mail:read', 'mail:draft', 'mail:send', 'mail:modify'], connectionStatus: 'active' };
@@ -29,10 +32,20 @@ class Store implements MailOperationStore {
     async reserve(intent: WriteIntent, ownerToken: string): Promise<ReservationResult> {
         this.calls.push('reserve'); const key = keyOf(intent); const existing = this.records.get(key);
         if (existing) { return JSON.stringify(existing.intent) === JSON.stringify(intent) ? { kind: 'replay', record: structuredClone(existing) } : { kind: 'conflict', reason: 'operation_conflict' }; }
-        const guard = guardOf(intent); if (guard && this.guards.has(guard)) { return { kind: 'conflict', reason: 'draft_fenced' }; }
-        const operation: MailOperationRecord = { key: { accountId: intent.accountId, clientIdHash: intent.clientIdHash, operationId: intent.operationId }, intent, ownerToken, revision: 0, state: 'reserved' };
+        const guard = guardOf(intent);
+        if (guard && this.guards.has(guard) && 'target' in intent) {
+            const blocker = await this.getGuard({ accountId: intent.accountId, ...intent.target });
+            if (blocker) { return { kind: 'conflict', reason: 'draft_fenced', blocker }; }
+        }
+        const operation: MailOperationRecord = { key: { accountId: intent.accountId, clientIdHash: intent.clientIdHash, operationId: intent.operationId }, intent, ownerToken, revision: 0, state: 'reserved', reservedAt: Math.ceil(Date.now() / 1000) };
         this.records.set(key, structuredClone(operation)); if (guard) { this.guards.set(guard, key); }
         return { kind: 'acquired', claim: { key: operation.key, ownerToken, revision: 0, state: 'reserved' } };
+    }
+    /** The guard row as the real store keeps it: the holder's owner and revision, and its state. */
+    async getGuard(key: DraftGuardKey): Promise<DraftGuardRecord | undefined> {
+        const holder = this.records.get(String(this.guards.get(JSON.stringify([key.accountId, key.mailboxId, key.uid]))));
+        if (!holder) { return undefined; }
+        return { key, operation: holder.key, ownerToken: holder.ownerToken, revision: holder.revision, state: holder.state === 'settled' ? holder.receipt.status === 'outcome_unknown' ? 'outcome_unknown' : 'retired' : holder.state };
     }
     checked(claim: OperationClaim): MailOperationRecord {
         const record = this.records.get(keyOf(claim.key));
@@ -55,7 +68,9 @@ class Store implements MailOperationStore {
     async complete(claim: OperationClaim<'dispatched'>, receipt: ConfirmedReceipt): Promise<void> {
         this.calls.push('complete'); if (this.completeFault === 'before' || this.completeFailures > 0) { this.completeFailures = Math.max(0, this.completeFailures - 1); throw new Error('secret completion failure'); }
         const record = this.checked(claim); this.records.set(keyOf(claim.key), { ...record, revision: record.revision + 1, state: 'settled', receipt: stored(receipt, this.summariesOffered) });
-        if (record.intent.tool === 'update_message_flags') { const guard = guardOf(record.intent); if (guard) { this.guards.delete(guard); } }
+        // As the real store: the guard ends with the receipt, except on an update's original while both copies are alive.
+        const bothAlive = receipt.status === 'partial' && (receipt.reason === 'original_deletion_failed' || receipt.reason === 'original_deletion_unconfirmed');
+        const guard = guardOf(record.intent); if (guard && !bothAlive) { this.guards.delete(guard); }
         if (this.completeFault === 'after') { throw new Error('secret committed completion failure'); }
     }
     async markOutcomeUnknown(claim: OperationClaim<'dispatched'>, receipt: UnknownReceipt): Promise<void> {
@@ -68,8 +83,20 @@ class Store implements MailOperationStore {
         const guard = guardOf(record.intent); if (guard) { this.guards.delete(guard); }
         if (this.failDispatchedFault === 'after') { throw new Error('secret committed settlement failure'); }
     }
+    async releaseGuard(guard: DraftGuardRecord): Promise<boolean> {
+        this.calls.push('release'); const id = JSON.stringify([guard.key.accountId, guard.key.mailboxId, guard.key.uid]);
+        if (this.guards.get(id) !== keyOf(guard.operation)) { return false; }
+        this.guards.delete(id); return true;
+    }
+    async resolveUnknown(record: MailOperationRecord, receipt: ResolvedReceipt, guard?: DraftGuardRecord): Promise<void> {
+        this.calls.push('resolve'); const current = this.records.get(keyOf(record.key));
+        if (!current || current.revision !== record.revision || (current.state !== 'dispatched' && !(current.state === 'settled' && current.receipt.status === 'outcome_unknown'))) { throw new MailError('temporarily_unavailable'); }
+        this.records.set(keyOf(record.key), { ...current, revision: current.revision + 1, state: 'settled', receipt: stored(receipt, this.summariesOffered) });
+        if (guard) { await this.releaseGuard(guard); }
+    }
 }
-function fixture(authored = true) {
+/** The fake WildDuck and, unless `real` gives the store and clock to use instead, the in-memory ledger above. */
+function fixture(authored = true, real?: { store: MailOperationStore; now: () => number }) {
     const operations = new Store(); const calls: { method: string; args: unknown[] }[] = [];
     const mailbox = { mailboxId, path: 'Drafts', specialUse: '\\Drafts' };
     const message = { mailboxId, uid: 7, subject: 'subject', snippet: null, threadId: null, from: [], to: [], date: null, receivedAt: null, flags: { seen: false, flagged: false, draft: true, answered: false, deleted: false, forwarded: false }, imapFlags: [], labels: [], hasAttachments: false };
@@ -80,9 +107,13 @@ function fixture(authored = true) {
     if (authored) {
         operations.records.set(keyOf(seedKey), structuredClone({ key: seedKey, intent: seedMarker, ownerToken: 'seed-owner', revision: 1, state: 'settled', receipt: { status: 'completed', operationId: seedKey.operationId, draft: snapshot.message, verified: true, proof: { accountId, ...snapshot.message, contentDigest: 'd'.repeat(64), sourceGrade: 'mcp_authored' } } }));
     }
-    const behavior = { snapshot, sourceMismatch: false, unexpectedGrade: false, mutationDigestMismatch: false, nextUid: 8, queueId: 'queue-1', postError: false, wrongMailbox: false, verificationError: false, preparationError: false, originalChanged: false, originalReadError: false, deletionError: undefined as Error | undefined, marker: (authored ? seedMarker : undefined) as MailOperationMarker | undefined, beforeInspect: async () => {} };
+    const behavior = { snapshot, sourceMismatch: false, unexpectedGrade: false, mutationDigestMismatch: false, nextUid: 8, queueId: 'queue-1', postError: false, wrongMailbox: false, verificationError: false, preparationError: false, originalChanged: false, originalReadError: false, deletionError: undefined as Error | undefined, marker: (authored ? seedMarker : undefined) as MailOperationMarker | undefined, beforeInspect: async () => {},
+        /** What the send check sees: the draft still in Drafts, and the copy in Sent; an Error is thrown instead. */
+        present: true as boolean | Error, sentCopy: undefined as { message: { mailboxId: string; uid: number }; queueId?: string } | undefined | Error };
+    /** Messages deleted or moved away: inspecting them is not_found, as WildDuck answers. */
+    const gone = new Set<string>();
     const record = (method: string, ...args: unknown[]) => { calls.push({ method, args }); };
-    const find = (key: { mailboxId: string; uid: number }): MessageSnapshot => messages.get(JSON.stringify(key)) ?? { ...behavior.snapshot, ...(behavior.marker ? { marker: behavior.marker } : {}) };
+    const find = (key: { mailboxId: string; uid: number }): MessageSnapshot => { if (gone.has(JSON.stringify(key))) { throw new MailError('not_found'); } return messages.get(JSON.stringify(key)) ?? { ...behavior.snapshot, ...(behavior.marker ? { marker: behavior.marker } : {}) }; };
     const reader: MailBackendReader = {
         getAttachmentDownload: async (_bound, input) => ({ metadata: { ...input, filename: null, contentType: 'text/plain', size: 5, expiresAt: '2026-10-26T10:00:00.000Z' }, url: 'https://example.s3.amazonaws.com/file' }),
         getMessageSourceDownload: async (...args) => { record('getMessageSourceDownload', ...args); const [, input] = args; return { metadata: { ...input, size: 9, sha256: 'd'.repeat(64), expiresAt: '2026-10-26T10:05:00.000Z' }, url: 'https://example.s3.amazonaws.com/source' }; },
@@ -114,13 +145,16 @@ function fixture(authored = true) {
             if (behavior.originalChanged) { behavior.snapshot.message.version = 'z'.repeat(43); }
             return { ...args[1], version };
         },
-        deleteDraft: async (...args) => { record('delete', ...args); if (behavior.deletionError) { throw behavior.deletionError; } if (behavior.postError) { throw new Error('secret token or backend body'); } },
+        deleteDraft: async (...args) => { record('delete', ...args); if (behavior.deletionError) { throw behavior.deletionError; } if (behavior.postError) { throw new Error('secret token or backend body'); } gone.add(JSON.stringify({ mailboxId: args[1].mailboxId, uid: args[1].uid })); },
         stampSendMarker: async (...args) => { record('stamp', ...args); behavior.marker = args[2]; return args[1].message; },
         submitDraft: async (...args) => { record('submit', ...args); if (behavior.postError) { throw new Error('secret token or backend body'); } return { queueId: behavior.queueId }; },
-        moveMessage: async (...args) => { record('move', ...args); const moved = { mailboxId: args[2], uid: 9, version }; messages.set(JSON.stringify({ mailboxId: moved.mailboxId, uid: moved.uid }), { ...snapshot, message: moved, marker: args[3] }); return { message: moved, contentDigest: (behavior.mutationDigestMismatch ? 'e' : 'd').repeat(64), sourceGrade: args[4] || behavior.unexpectedGrade ? 'mcp_authored' : 'observed' }; },
+        draftPresent: async (...args) => { record('draftPresent', ...args); if (behavior.present instanceof Error) { throw behavior.present; } return behavior.present; },
+        findSentCopy: async (...args) => { record('findSentCopy', ...args); if (behavior.sentCopy instanceof Error) { throw behavior.sentCopy; } return behavior.sentCopy; },
+        moveMessage: async (...args) => { record('move', ...args); gone.add(JSON.stringify({ mailboxId: args[1].message.mailboxId, uid: args[1].message.uid })); const moved = { mailboxId: args[2], uid: 9, version }; messages.set(JSON.stringify({ mailboxId: moved.mailboxId, uid: moved.uid }), { ...snapshot, message: moved, marker: args[3] }); return { message: moved, contentDigest: (behavior.mutationDigestMismatch ? 'e' : 'd').repeat(64), sourceGrade: args[4] || behavior.unexpectedGrade ? 'mcp_authored' : 'observed' }; },
         updateMessageFlags: async (...args) => { record('flags', ...args); const changed = { ...args[1].message, version: 'f'.repeat(43) }; messages.set(JSON.stringify({ mailboxId: changed.mailboxId, uid: changed.uid }), { ...snapshot, message: changed, marker: args[3] }); return { message: changed, contentDigest: (behavior.mutationDigestMismatch ? 'e' : 'd').repeat(64), sourceGrade: args[4] || behavior.unexpectedGrade ? 'mcp_authored' : 'observed' }; },
     };
-    return { service: createMailService({ reader, writer, operations }), operations, calls, behavior, reader, writer, mailbox, messages };
+    const service = createMailService({ reader, writer, operations: real?.store ?? operations, ...(real ? { now: real.now } : {}) });
+    return { service, operations, calls, behavior, reader, writer, mailbox, messages, gone, seedKey, seedMarker };
 }
 const posts = (f: ReturnType<typeof fixture>) => f.calls.filter(call => ['upload', 'delete', 'submit', 'move', 'flags'].includes(call.method));
 
@@ -148,7 +182,7 @@ test('concurrent identical send has one backend dispatch; receipt replay never r
     expect(replay).toEqual({ status: 'queued', operationId, queueId: 'queue-1' }); expect(f.calls).toHaveLength(calls);
     expect(JSON.stringify(replay)).not.toContain(context.accessToken);
 });
-test('send versus update/delete across clients uses one shared permanent draft fence', async () => {
+test('send versus update/delete across clients uses one shared message guard', async () => {
     const f = fixture(); const other = { ...context, clientId: 'other-client' };
     const results = await Promise.all([f.service.send_draft(context, target), f.service.update_draft(other, { ...content, ...target, operationId: 'operation_test_002' }), f.service.delete_draft(other, { ...target, operationId: 'operation_test_003' })]);
     expect(f.calls.filter(call => ['upload', 'delete', 'submit', 'move', 'flags'].includes(call.method))).toHaveLength(1); expect(results.filter(result => result.status === 'conflict')).toHaveLength(2);
@@ -179,7 +213,7 @@ test('failure to durably release preflight is temporary and never dispatches', a
     expect(posts(f)).toHaveLength(0); expect(f.operations.guards.size).toBe(1);
     expect((await f.service.send_draft(context, target)).status).toBe('in_progress');
 });
-test('lost submit response is permanently unknown and never resent under old or new operation IDs', async () => {
+test('lost submit response stays unknown and is never resent under old or new operation IDs', async () => {
     const f = fixture(); f.behavior.postError = true;
     const result = await f.service.send_draft(context, target);
     expect(result).toEqual({ status: 'outcome_unknown', operationId, reason: 'dispatch_uncertain' });
@@ -304,7 +338,7 @@ test('failDispatched failing falls back to the uncertain path, which returns the
 test('complete is repeated once: one failure completes, two fail into the uncertain path, and no repeat starts without room in the request', async () => {
     const once = fixture(); once.operations.completeFailures = 1; const warnings = captureWarnings();
     try {
-        expect((await send(once)).status).toBe('queued'); expect(once.operations.calls.filter(call => call === 'complete')).toHaveLength(2); expect(posts(once)).toHaveLength(1); expect(once.operations.guards.size).toBe(1);
+        expect((await send(once)).status).toBe('queued'); expect(once.operations.calls.filter(call => call === 'complete')).toHaveLength(2); expect(posts(once)).toHaveLength(1); expect(once.operations.guards.size).toBe(0);
         expect(warnings.lines).toEqual([]);
         const twice = fixture(); twice.operations.completeFailures = 2;
         expect(await send(twice)).toEqual({ status: 'outcome_unknown', operationId, reason: 'dispatch_uncertain' }); expect(twice.operations.calls.filter(call => call === 'complete')).toHaveLength(2); expect(posts(twice)).toHaveLength(1);
@@ -346,8 +380,10 @@ test('replacement verifies candidate before fresh original inspection and deleti
     expect(result.status).toBe('completed');
     expect(f.calls.map(call => call.method)).toEqual(['resolve', 'inspect', 'prepareUpdate', 'upload', 'verify', 'inspect', 'delete']);
     expect(f.calls.find(call => call.method === 'prepareUpdate')?.args[2]).toEqual({ subject: 'changed' });
-    expect(f.operations.guards.size).toBe(1);
-    expect((await f.service.delete_draft(context, { ...target, operationId: 'operation_test_002' })).status).toBe('conflict');
+    // The hold ended with the receipt; the old uid is gone, so a later change of it reaches WildDuck's own not_found.
+    expect(f.operations.guards.size).toBe(0);
+    expect(await f.service.delete_draft(context, { ...target, operationId: 'operation_test_002' })).toEqual({ status: 'failed', operationId: 'operation_test_002', reason: 'not_found' });
+    expect(f.calls.filter(call => call.method === 'delete')).toHaveLength(1);
 });
 test('write preflight uses its write scope without granting public read access', async () => {
     const f = fixture(); const sendOnly = { ...context, scopes: ['mail:send'] };
@@ -411,8 +447,11 @@ test('verified candidate with failed or uncertain original deletion has explicit
         expect(result.status).toBe('partial');
         if (result.status === 'partial') { expect(result.reason).toBe(error instanceof MailError ? 'original_deletion_failed' : 'original_deletion_unconfirmed'); }
         f.behavior.deletionError = undefined;
+        // The old copy stays held for its deletion only: flags are refused, delete_draft of it takes the hold over.
+        expect((await f.service.update_message_flags(context, { ...target, mailboxId, operationId: 'old_flags_op_001', seen: true })).status).toBe('conflict');
+        expect((await f.service.delete_draft(context, { ...target, operationId: 'old_delete_op_001' })).status).toBe('completed');
         expect((await f.service.send_draft(context, { ...target, uid: 8, operationId: 'candidate_send_001' })).status).toBe('queued');
-        expect((await f.service.delete_draft(context, { ...target, operationId: 'old_delete_op_001' })).status).toBe('conflict');
+        expect(f.calls.filter(call => call.method === 'delete')).toHaveLength(2); expect(f.operations.guards.size).toBe(0);
     }
 });
 test('historical activation proof survives later version changes but fresh expected version alone cannot activate', async () => {
@@ -445,13 +484,13 @@ test('send stamps after durable dispatch before queue submission and returns act
     const g = fixture(); g.behavior.queueId = '';
     expect((await g.service.send_draft(context, target)).status).toBe('outcome_unknown');
 });
-test('move retires source, flags release same UID and both require modify scope', async () => {
+test('move and flags end their hold with the receipt, and both require modify scope', async () => {
     const f = fixture(); const flags = { ...target, mailboxId, seen: true };
     expect((await f.service.update_message_flags(context, flags)).status).toBe('completed'); expect(f.operations.guards.size).toBe(0);
     expect((await f.service.update_message_flags(context, { ...flags, operationId: 'flags_operation_02', expectedVersion: 'f'.repeat(43), flagged: true })).status).toBe('completed');
     const next = { ...target, mailboxId, destinationMailboxId: 'e'.repeat(24), expectedVersion: 'f'.repeat(43), operationId: 'move_operation_01' };
-    expect((await f.service.move_message(context, next)).status).toBe('completed'); expect(f.operations.guards.size).toBe(1);
-    expect((await f.service.update_message_flags(context, { ...flags, operationId: 'flags_operation_03', expectedVersion: 'f'.repeat(43) })).status).toBe('conflict');
+    expect((await f.service.move_message(context, next)).status).toBe('completed'); expect(f.operations.guards.size).toBe(0);
+    expect(await f.service.update_message_flags(context, { ...flags, operationId: 'flags_operation_03', expectedVersion: 'f'.repeat(43) })).toEqual({ status: 'failed', operationId: 'flags_operation_03', reason: 'not_found' });
     const g = fixture(); await expect(g.service.move_message({ ...context, scopes: ['mail:draft'] }, next)).rejects.toThrow('forbidden'); expect(g.calls).toHaveLength(0); expect(g.operations.calls).toHaveLength(0);
 });
 test('verified partial replay is durable and performs no upload, verification or deletion again', async () => {
@@ -818,4 +857,396 @@ test('the payload digest of a request with only base64 attachments is the one ea
     // The digest of the 0.7 payload shape, worked out here independently of the service.
     const stable = (value: unknown): string => Array.isArray(value) ? `[${value.map(stable).join(',')}]` : value !== null && typeof value === 'object' ? `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stable((value as Record<string, unknown>)[key])}`).join(',')}}` : JSON.stringify(value);
     expect(record?.intent.payloadDigest).toBe(digest(stable({ accountId, tool: 'create_draft', input: payload })));
+});
+
+test('a hold ends only well after the Lambda timeout, and an uncertain send waits longer still', () => {
+    const timeouts = [...readFileSync(new URL('../serverless.yml', import.meta.url), 'utf8').matchAll(/^\s*timeout:\s*(\d+)\s*$/gmu)].map(match => Number(match[1]));
+    expect(timeouts).toEqual([60]);
+    expect(HOLD_AGED_MS).toBeGreaterThanOrEqual(2 * Math.max(...timeouts) * 1000); expect(SEND_CHECK_AGED_MS).toBeGreaterThan(HOLD_AGED_MS);
+});
+test('holdAction: a record without reservedAt counts as aged, except an uncertain send, which is never checked', () => {
+    const key = { accountId, clientIdHash: digest(context.clientId), operationId };
+    const record = (tool: 'send_draft' | 'update_message_flags', state: 'reserved' | 'dispatched' | 'unknown', reservedAt?: number): MailOperationRecord => {
+        const base = { key, intent: { ...key, payloadDigest: 'p'.repeat(43), tool, target: { mailboxId, uid: 7 }, expectedVersion: version }, ownerToken: 'owner-token-00000001', revision: 1, ...(reservedAt === undefined ? {} : { reservedAt }) };
+        return state === 'unknown' ? { ...base, state: 'settled', receipt: { status: 'outcome_unknown', operationId, reason: 'dispatch_uncertain' } } : { ...base, state };
+    };
+    const now = 1_800_000_000_000; const at = now / 1000;
+    for (const state of ['dispatched', 'unknown'] as const) {
+        const from = state === 'unknown' ? 'unknown' : 'dispatched';
+        expect(holdAction(record('send_draft', state), now)).toEqual({ act: 'none' });
+        expect(holdAction(record('send_draft', state, at - SEND_CHECK_AGED_MS / 1000), now)).toEqual({ act: 'check_send', from });
+        expect(holdAction(record('send_draft', state, at - SEND_CHECK_AGED_MS / 1000 + 1), now)).toEqual({ act: 'none' });
+        expect(holdAction(record('update_message_flags', state), now)).toEqual({ act: 'release', from });
+    }
+    expect(holdAction(record('send_draft', 'reserved'), now)).toEqual({ act: 'fail', from: 'reserved' });
+    expect(holdAction(record('update_message_flags', 'reserved'), now)).toEqual({ act: 'fail', from: 'reserved' });
+});
+
+describe('a hold ends at the next request that meets it (the real store over the DynamoDB model, an injected clock)', () => {
+    const T0 = 1_800_000_000_000; const MINUTE = 60_000;
+    /** The fake WildDuck over the real store; authored seeds the create record of draft uid 7, as fixture() does. */
+    async function ledger(authored = true) {
+        const client = new ModelSender(); const clock = { ms: T0 };
+        const store = new DynamoMailOperationStore({ tableName: 'MailTable', client, retry: virtualRetry().retry, now: () => clock.ms });
+        const f = fixture(false, { store, now: () => clock.ms });
+        if (authored) {
+            const claimed = await store.reserve(f.seedMarker, 'seed-owner-token-0001'); if (claimed.kind !== 'acquired') { throw new Error('seed'); }
+            const draft = { ...f.behavior.snapshot.message };
+            await store.complete(await store.markDispatched(claimed.claim), { status: 'completed', operationId: f.seedKey.operationId, draft, verified: true, proof: { accountId, ...draft, contentDigest: 'd'.repeat(64), sourceGrade: 'mcp_authored' } });
+            f.behavior.marker = f.seedMarker;
+        }
+        return { ...f, client, store, advance: (ms: number) => { clock.ms += ms; } };
+    }
+    type Ledger = Awaited<ReturnType<typeof ledger>>;
+    const own = (operation = operationId) => ({ accountId, clientIdHash: digest(context.clientId), operationId: operation });
+    const recordOf = async (f: Ledger, operation = operationId) => { const record = await f.store.getOperation(own(operation)); if (!record) { throw new Error('missing record'); } return record; };
+    const guardOn = (f: Ledger, uid = 7) => f.store.getGuard({ accountId, mailboxId, uid });
+    const rows = (f: Ledger) => structuredClone([...f.client.records.entries()]);
+    const mutations = (f: Ledger) => f.calls.filter(call => ['upload', 'delete', 'stamp', 'submit', 'move', 'flags'].includes(call.method)).map(call => call.method);
+    const checks = (f: Ledger) => f.calls.filter(call => call.method === 'draftPresent' || call.method === 'findSentCopy').map(call => call.method);
+    const line = (tool: string | undefined, trigger: 'retry' | 'lock_hit', from: string, action: string) => ({ event: 'mail_write_recovered', ...(tool === undefined ? {} : { tool }), trigger, from, action });
+    /** The next call of this store method fails before it reaches DynamoDB. */
+    const failOnce = (f: Ledger, name: 'markDispatched' | 'failPreflight' | 'markOutcomeUnknown') => { Object.defineProperty(f.store, name, { configurable: true, value: async () => { Reflect.deleteProperty(f.store, name); throw new MailError('temporarily_unavailable'); } }); };
+    /** Replaces one store method for its next call; `inner` gets the store's own method. */
+    const wrapOnce = <Name extends 'markDispatched' | 'failPreflight' | 'releaseGuard' | 'reserve' | 'getGuard'>(f: Ledger, name: Name, inner: (original: MailOperationStore[Name], ...args: Parameters<MailOperationStore[Name]>) => ReturnType<MailOperationStore[Name]>) => {
+        const original = (f.store[name] as (...args: unknown[]) => unknown).bind(f.store) as MailOperationStore[Name];
+        Object.defineProperty(f.store, name, { configurable: true, value: (...args: Parameters<MailOperationStore[Name]>) => { Reflect.deleteProperty(f.store, name); return inner(original, ...args); } });
+    };
+    const flagsOf = (operation = operationId, expectedVersion = version, uid = 7, box = mailboxId) => ({ uid, mailboxId: box, expectedVersion, operationId: operation, seen: true });
+    const deleteOf = (operation: string, uid = 7, expectedVersion = version) => ({ uid, expectedVersion, operationId: operation });
+    const unknownOf = (operation = operationId) => ({ status: 'outcome_unknown', operationId: operation, reason: 'dispatch_uncertain' } as const);
+    const fenced = (operation: string) => ({ status: 'conflict', operationId: operation, reason: 'draft_fenced' } as const);
+    const failedOf = (operation: string, reason: MailFailureCode): FailedReceipt => ({ status: 'failed', operationId: operation, reason });
+    const changed = 'f'.repeat(43);
+    /** A flags change of uid 7 left reserved: its dispatch mark and then its settlement failed (in_progress). */
+    async function leftReserved(f: Ledger) { failOnce(f, 'markDispatched'); failOnce(f, 'failPreflight'); expect(await f.service.update_message_flags(context, flagsOf())).toEqual({ status: 'in_progress', operationId }); }
+    /** A flags change of uid 7 that landed and then timed out: settled outcome_unknown, or still dispatched when that mark failed too. */
+    async function leftUnknown(f: Ledger, dispatched = false, operation = operationId, expectedVersion = version) {
+        const flags = f.writer.updateMessageFlags;
+        f.writer.updateMessageFlags = async (...args) => { f.writer.updateMessageFlags = flags; await flags(...args); throw new MailError('upstream_timeout'); };
+        if (dispatched) { failOnce(f, 'markOutcomeUnknown'); }
+        expect(await f.service.update_message_flags(context, flagsOf(operation, expectedVersion))).toEqual(unknownOf(operation));
+    }
+    /** A send of uid 7 whose submit got no answer, after the draft was stamped with the send's marker. */
+    async function leftUnsent(f: Ledger, dispatched = false) {
+        f.behavior.postError = true; if (dispatched) { failOnce(f, 'markOutcomeUnknown'); }
+        expect(await f.service.send_draft(context, target)).toEqual(unknownOf()); f.behavior.postError = false;
+    }
+    const logged = (run: (lines: Record<string, unknown>[]) => Promise<void>) => async () => { const warnings = captureWarnings(); try { await run(warnings.lines); } finally { warnings.restore(); } };
+    const recovered = (lines: Record<string, unknown>[]) => lines.filter(item => item.event === 'mail_write_recovered');
+
+    test('reserved: young, a retry is in_progress and a lock hit draft_fenced with nothing written; aged, either settles it failed', logged(async lines => {
+        for (const trigger of ['retry', 'lock_hit'] as const) {
+            const f = await ledger(); await leftReserved(f);
+            f.advance(HOLD_AGED_MS - 1000); const before = rows(f); lines.length = 0;
+            expect(await f.service.update_message_flags(context, flagsOf())).toEqual({ status: 'in_progress', operationId });
+            expect(await f.service.update_message_flags(context, flagsOf('operation_test_002'))).toEqual(fenced('operation_test_002'));
+            expect(rows(f)).toEqual(before); expect(recovered(lines)).toEqual([]);
+            f.advance(1000);
+            if (trigger === 'retry') { expect(await f.service.update_message_flags(context, flagsOf())).toEqual(failedOf(operationId, 'temporarily_unavailable')); expect(mutations(f)).toEqual([]); }
+            else { expect((await f.service.update_message_flags(context, flagsOf('operation_test_003'))).status).toBe('completed'); expect(mutations(f)).toEqual(['flags']); }
+            expect(await recordOf(f)).toMatchObject({ state: 'settled', receipt: failedOf(operationId, 'temporarily_unavailable') }); expect(await guardOn(f)).toBeUndefined();
+            expect(recovered(lines)).toEqual([line('update_message_flags', trigger, 'reserved', 'failed')]);
+            // Settled now: the same request only replays its failure.
+            expect(await f.service.update_message_flags(context, flagsOf())).toEqual(failedOf(operationId, 'temporarily_unavailable'));
+        }
+    }));
+    test('unknown or dispatched, not a send: young, it holds; aged, the guard is deleted, the outcome stays unknown, and the message is written as mail of no record', logged(async lines => {
+        for (const dispatched of [false, true]) {
+            for (const trigger of ['retry', 'lock_hit'] as const) {
+                const f = await ledger(); await leftUnknown(f, dispatched); const state = dispatched ? 'dispatched' : 'settled';
+                f.advance(HOLD_AGED_MS - 1000); const before = rows(f); lines.length = 0;
+                expect(await f.service.update_message_flags(context, flagsOf())).toEqual(unknownOf());
+                expect(await f.service.update_message_flags(context, flagsOf('operation_test_002', changed))).toEqual(fenced('operation_test_002'));
+                expect(rows(f)).toEqual(before); expect(recovered(lines)).toEqual([]);
+                f.advance(1000);
+                if (trigger === 'retry') { expect(await f.service.update_message_flags(context, flagsOf())).toEqual(unknownOf()); expect(await guardOn(f)).toBeUndefined(); }
+                const next = await f.service.update_message_flags(context, flagsOf('operation_test_003', changed));
+                // The landed change left this operation's marker on the message: it now proves nothing, so the grade is observed.
+                expect(next).toMatchObject({ status: 'completed', proof: { sourceGrade: 'observed' } });
+                expect(await recordOf(f)).toMatchObject({ state, ...(dispatched ? {} : { receipt: unknownOf() }) }); expect(await guardOn(f)).toBeUndefined();
+                expect(recovered(lines)).toEqual([line('update_message_flags', trigger, dispatched ? 'dispatched' : 'unknown', 'released')]);
+                expect(mutations(f)).toEqual(['flags', 'flags']);
+                // The retry still reports the unknown outcome; the guard is gone, so nothing more is done.
+                lines.length = 0; expect(await f.service.update_message_flags(context, flagsOf())).toEqual(unknownOf()); expect(recovered(lines)).toEqual([]);
+            }
+        }
+    }));
+    test('an uncertain send younger than 15 minutes is never cleared or checked, even with its draft already gone', logged(async lines => {
+        const f = await ledger(); await leftUnsent(f); f.behavior.present = false; f.gone.add(JSON.stringify({ mailboxId, uid: 7 }));
+        f.advance(SEND_CHECK_AGED_MS - 1000); const before = rows(f); lines.length = 0;
+        expect(await f.service.send_draft(context, target)).toEqual(unknownOf());
+        expect(await f.service.delete_draft({ ...context, clientId: 'another-client' }, deleteOf('operation_test_002'))).toEqual(fenced('operation_test_002'));
+        expect(checks(f)).toEqual([]); expect(rows(f)).toEqual(before); expect(recovered(lines)).toEqual([]); expect(mutations(f)).toEqual(['stamp', 'submit']);
+        expect(await guardOn(f)).toMatchObject({ operation: own(), state: 'outcome_unknown' });
+    }));
+    const sentKey = { mailboxId: 'c'.repeat(24), uid: 501 };
+    const deletedOf = (operation: string) => ({ status: 'completed' as const, operationId: operation, deleted: { mailboxId, uid: 7 } });
+    // Sent is looked at first: WildDuck stores the Sent copy before it deletes the draft, so both can be there, and then the mail was sent.
+    // deleted: what a delete_draft of the old draft gets once the send is settled (completed while it is still in Drafts, sent or not; WildDuck's not_found once gone).
+    const sendCases: { name: string; present: boolean; sentCopy?: { message: typeof sentKey; queueId?: string }; result: MailOutput<'send_draft'>; action: string; looked: string[]; deleted: MailOutput<'delete_draft'> }[] = [
+        { name: 'no Sent copy, draft still in Drafts', present: true, result: failedOf(operationId, 'upstream_timeout'), action: 'not_sent', looked: ['findSentCopy', 'draftPresent'], deleted: deletedOf('operation_test_002') },
+        { name: 'Sent copy with a queue id', present: false, sentCopy: { message: sentKey, queueId: 'queue-501' }, result: { status: 'queued', operationId, sent: sentKey, queueId: 'queue-501' }, action: 'sent_found', looked: ['findSentCopy'], deleted: failedOf('operation_test_002', 'not_found') },
+        { name: 'Sent copy without a queue id', present: false, sentCopy: { message: sentKey }, result: { status: 'queued', operationId, sent: sentKey }, action: 'sent_found', looked: ['findSentCopy'], deleted: failedOf('operation_test_002', 'not_found') },
+        { name: 'Sent copy and the draft still in Drafts (its deletion after the Sent copy failed)', present: true, sentCopy: { message: sentKey, queueId: 'queue-501' }, result: { status: 'queued', operationId, sent: sentKey, queueId: 'queue-501' }, action: 'sent_found', looked: ['findSentCopy'], deleted: deletedOf('operation_test_002') },
+        { name: 'neither', present: false, result: unknownOf(), action: 'released', looked: ['findSentCopy', 'draftPresent'], deleted: failedOf('operation_test_002', 'not_found') },
+    ];
+    for (const { name, present, sentCopy, result, action, looked, deleted } of sendCases) {
+        test(`an uncertain send 15 minutes old, ${name}: settled from what WildDuck shows, on a retry or a lock hit, and its guard is deleted`, logged(async lines => {
+            for (const [trigger, dispatched] of [['retry', false], ['lock_hit', false], ['retry', true]] as const) {
+                const f = await ledger(); await leftUnsent(f, dispatched); f.behavior.present = present; f.behavior.sentCopy = sentCopy;
+                if (!present) { f.gone.add(JSON.stringify({ mailboxId, uid: 7 })); }
+                f.advance(SEND_CHECK_AGED_MS); lines.length = 0;
+                if (trigger === 'retry') { expect(await f.service.send_draft(context, target)).toEqual(result); }
+                else {
+                    expect(await f.service.delete_draft(context, deleteOf('operation_test_002'))).toEqual(deleted);
+                    expect(await f.service.send_draft(context, target)).toEqual(result);
+                }
+                expect(checks(f)).toEqual([...looked]); expect(await guardOn(f)).toBeUndefined();
+                expect(await recordOf(f)).toMatchObject(action === 'released' ? { state: dispatched ? 'dispatched' : 'settled' } : { state: 'settled', receipt: result });
+                expect(recovered(lines)).toEqual([line('send_draft', trigger, dispatched ? 'dispatched' : 'unknown', action)]);
+                expect(f.calls.find(call => call.method === 'findSentCopy')?.args[1]).toEqual({ ...own(), payloadDigest: (await recordOf(f)).intent.payloadDigest, tool: 'send_draft' });
+                expect(mutations(f)).toEqual(['stamp', 'submit', ...trigger === 'lock_hit' && deleted.status === 'completed' ? ['delete'] : []]);
+                // Asked again, the same request makes no more lookups.
+                expect(await f.service.send_draft(context, target)).toEqual(result); expect(checks(f)).toEqual([...looked]);
+            }
+        }));
+    }
+    test('an uncertain send whose WildDuck lookup fails is left exactly as it was, and the failure is logged once', logged(async lines => {
+        for (const [present, sentCopy] of [[new MailError('upstream_timeout'), undefined], [false, new MailError('temporarily_unavailable')]] as const) {
+            for (const trigger of ['retry', 'lock_hit'] as const) {
+                const f = await ledger(); await leftUnsent(f); f.behavior.present = present; f.behavior.sentCopy = sentCopy;
+                f.advance(SEND_CHECK_AGED_MS); const before = rows(f); lines.length = 0;
+                expect(trigger === 'retry' ? await f.service.send_draft(context, target) : await f.service.delete_draft(context, deleteOf('operation_test_002'))).toEqual(trigger === 'retry' ? unknownOf() : fenced('operation_test_002'));
+                expect(rows(f)).toEqual(before); expect(recovered(lines)).toEqual([]);
+                expect(lines).toEqual([{ event: 'mail_write_unsettled', tool: 'send_draft', step: 'send_check', code: present instanceof Error ? 'upstream_timeout' : 'temporarily_unavailable' }]);
+                expect(mutations(f)).toEqual(['stamp', 'submit']);
+            }
+        }
+    }));
+    test('the draft a sent mail left in Drafts can be deleted and nothing else; its Sent copy and any other message carrying the marker keep their treatment', logged(async () => {
+        for (const withSent of [true, false]) {
+            const f = await ledger();
+            if (withSent) {
+                // Settled by the send check: a Sent copy was found while the draft was still in Drafts.
+                await leftUnsent(f); f.behavior.sentCopy = { message: sentKey, queueId: 'queue-501' }; f.advance(SEND_CHECK_AGED_MS);
+                expect(await f.service.send_draft(context, target)).toEqual({ status: 'queued', operationId, sent: sentKey, queueId: 'queue-501' });
+            } else {
+                // A queued receipt without a sent key: the fake WildDuck reports no Sent copy and keeps the draft.
+                expect(await f.service.send_draft(context, target)).toEqual({ status: 'queued', operationId, queueId: 'queue-1' });
+            }
+            const marker = f.behavior.marker; if (!marker) { throw new Error('missing send marker'); }
+            const other = { mailboxId, uid: 50 }; f.messages.set(JSON.stringify(other), { ...f.behavior.snapshot, message: { ...other, version }, marker });
+            if (withSent) { f.messages.set(JSON.stringify(sentKey), { ...f.behavior.snapshot, isDraft: false, message: { ...sentKey, version }, marker }); }
+            const refused = (operation: string) => failedOf(operation, 'verification_failed');
+            expect(await f.service.send_draft(context, { ...target, operationId: 'resend_operation_01' })).toEqual(refused('resend_operation_01'));
+            expect(await f.service.update_draft(context, { ...target, operationId: 'reedit_operation_01', subject: 'x' })).toEqual(refused('reedit_operation_01'));
+            expect(await f.service.update_message_flags(context, flagsOf('reflag_operation_01'))).toEqual(refused('reflag_operation_01'));
+            expect(await f.service.move_message(context, { ...target, operationId: 'remove_operation_01', mailboxId, destinationMailboxId: 'e'.repeat(24) })).toEqual(refused('remove_operation_01'));
+            // Another message carrying the send's marker is not the send's own target: still refused, delete included.
+            expect(await f.service.delete_draft(context, deleteOf('other_delete_op_0001', 50))).toEqual(refused('other_delete_op_0001'));
+            if (withSent) {
+                // The Sent copy keeps its verified marker (delete_draft only reaches Drafts): flagging it works as before, with no source.
+                expect(await f.service.update_message_flags(context, flagsOf('sent_flags_op_000001', version, sentKey.uid, sentKey.mailboxId))).toMatchObject({ status: 'completed', proof: { sourceGrade: 'observed' } });
+            }
+            expect(await f.service.delete_draft(context, deleteOf('leftover_delete_op01'))).toEqual(deletedOf('leftover_delete_op01'));
+            expect(mutations(f)).toEqual(['stamp', 'submit', ...withSent ? ['flags'] : [], 'delete']);
+        }
+    }));
+    test('a send settled not sent leaves its stamped draft deletable and nothing else: it can no longer be sent, edited, moved or flagged here', logged(async () => {
+        const f = await ledger(); await leftUnsent(f); f.advance(SEND_CHECK_AGED_MS);
+        expect(await f.service.send_draft(context, target)).toEqual(failedOf(operationId, 'upstream_timeout'));
+        expect(await f.service.send_draft(context, { ...target, operationId: 'resend_operation_01' })).toEqual(failedOf('resend_operation_01', 'verification_failed'));
+        expect(await f.service.update_draft(context, { ...target, operationId: 'reedit_operation_01', subject: 'x' })).toEqual(failedOf('reedit_operation_01', 'verification_failed'));
+        expect(await f.service.update_message_flags(context, flagsOf('reflag_operation_01'))).toEqual(failedOf('reflag_operation_01', 'verification_failed'));
+        expect(await f.service.move_message(context, { ...target, operationId: 'remove_operation_01', mailboxId, destinationMailboxId: 'e'.repeat(24) })).toEqual(failedOf('remove_operation_01', 'verification_failed'));
+        expect((await f.service.delete_draft(context, deleteOf('redelete_operation_1'))).status).toBe('completed');
+        expect(mutations(f)).toEqual(['stamp', 'submit', 'delete']);
+    }));
+    test('an update that left both copies keeps the old one held for its deletion only, whatever its age', logged(async lines => {
+        const f = await ledger(); f.behavior.deletionError = new MailError('forbidden');
+        const request = { ...target, subject: 'change' }; const partial = await f.service.update_draft(context, request);
+        expect(partial).toMatchObject({ status: 'partial', reason: 'original_deletion_failed' }); f.behavior.deletionError = undefined;
+        f.advance(SEND_CHECK_AGED_MS * 4); const before = rows(f); lines.length = 0;
+        expect(await f.service.update_draft(context, request)).toEqual(partial);
+        expect(await f.service.update_message_flags(context, flagsOf('operation_test_002'))).toEqual(fenced('operation_test_002'));
+        expect(await f.service.move_message(context, { ...target, operationId: 'operation_test_003', mailboxId, destinationMailboxId: 'e'.repeat(24) })).toEqual(fenced('operation_test_003'));
+        expect(await f.service.update_draft(context, { ...request, operationId: 'operation_test_004' })).toEqual(fenced('operation_test_004'));
+        expect(rows(f)).toEqual(before); expect(recovered(lines)).toEqual([]);
+        expect(await f.service.delete_draft(context, deleteOf('operation_test_005'))).toEqual({ status: 'completed', operationId: 'operation_test_005', deleted: { mailboxId, uid: 7 } });
+        expect(recovered(lines)).toEqual([line('update_draft', 'lock_hit', 'partial', 'released')]); expect(await guardOn(f)).toBeUndefined();
+        expect(await f.service.update_draft(context, request)).toEqual(partial); expect(mutations(f)).toEqual(['upload', 'delete', 'delete']);
+    }));
+    /** An update_draft of uid 7 that saved its new copy (uid 8) and could not delete the original: both copies alive, the original held. */
+    async function leftBothAlive(f: Ledger) {
+        f.behavior.deletionError = new MailError('forbidden');
+        expect(await f.service.update_draft(context, { ...target, subject: 'change' })).toMatchObject({ status: 'partial', reason: 'original_deletion_failed' }); f.behavior.deletionError = undefined;
+    }
+    test('a delete of the held original that would fail its own inspection never frees it: the error is answered, the guard stays and the original stays unsendable', logged(async lines => {
+        const f = await ledger(); await leftBothAlive(f); f.advance(MINUTE); const before = rows(f); lines.length = 0;
+        // A stale expectedVersion: version_conflict, as the delete's own preflight would answer; nothing is stored, so the same request may be retried.
+        await expect(f.service.delete_draft(context, deleteOf('operation_test_005', 7, changed))).rejects.toThrow('version_conflict');
+        expect(rows(f)).toEqual(before); expect(recovered(lines)).toEqual([]);
+        expect(await guardOn(f)).toMatchObject({ operation: own(), state: 'retired' });
+        expect(await f.service.send_draft(context, { ...target, operationId: 'operation_test_006' })).toEqual(fenced('operation_test_006'));
+        // Not a draft any more: unsupported_draft, and the guard still holds.
+        f.behavior.snapshot.isDraft = false;
+        await expect(f.service.delete_draft(context, deleteOf('operation_test_007'))).rejects.toThrow('unsupported_draft');
+        f.behavior.snapshot.isDraft = true;
+        expect(rows(f)).toEqual(before); expect(mutations(f)).toEqual(['upload', 'delete']);
+        // With the right version the hand-over goes through.
+        expect(await f.service.delete_draft(context, deleteOf('operation_test_008'))).toEqual(deletedOf('operation_test_008'));
+        expect(recovered(lines)).toEqual([line('update_draft', 'lock_hit', 'partial', 'released')]); expect(await guardOn(f)).toBeUndefined();
+        expect(mutations(f)).toEqual(['upload', 'delete', 'delete']);
+    }));
+    test('a delete of a held original that is already gone ends the hold and gets the normal not-found answer', logged(async lines => {
+        const f = await ledger(); await leftBothAlive(f); f.gone.add(JSON.stringify({ mailboxId, uid: 7 })); lines.length = 0;
+        expect(await f.service.delete_draft(context, deleteOf('operation_test_005'))).toEqual(failedOf('operation_test_005', 'not_found'));
+        expect(recovered(lines)).toEqual([line('update_draft', 'lock_hit', 'partial', 'released')]); expect(await guardOn(f)).toBeUndefined();
+        expect(mutations(f)).toEqual(['upload', 'delete']);
+    }));
+    test('a guard row left by an older version over a finished operation is deleted at the first lock hit', logged(async lines => {
+        for (const state of ['retired', 'queued'] as const) {
+            const f = await ledger(); expect((await f.service.update_message_flags(context, flagsOf())).status).toBe('completed');
+            const finished = await recordOf(f); const at = { accountId, mailboxId, uid: 7 };
+            f.client.records.set(guardKey(at).pk, { ...guardKey(at), record: { key: at, operation: own(), ownerToken: finished.ownerToken, revision: finished.revision, state } });
+            lines.length = 0;
+            // Its own retry replays the settled result and leaves the row alone.
+            expect((await f.service.update_message_flags(context, flagsOf())).status).toBe('completed'); expect(await guardOn(f)).toMatchObject({ state });
+            expect((await f.service.update_message_flags(context, flagsOf('operation_test_002', changed))).status).toBe('completed');
+            expect(recovered(lines)).toEqual([line('update_message_flags', 'lock_hit', 'leftover', 'released')]); expect(await guardOn(f)).toBeUndefined();
+            expect(mutations(f)).toEqual(['flags', 'flags']);
+        }
+    }));
+    test('a guard whose record has expired is deleted, and its message is written as mail of no record: movable and flaggable, never editable or sendable', logged(async lines => {
+        const f = await ledger(); await leftUnknown(f); f.client.records.delete(opKey(own()).pk); lines.length = 0;
+        expect(await f.service.send_draft(context, { ...target, expectedVersion: changed, operationId: 'operation_test_002' })).toEqual(failedOf('operation_test_002', 'unsupported_content'));
+        expect(recovered(lines)).toEqual([line(undefined, 'lock_hit', 'expired', 'released')]); expect(await guardOn(f)).toBeUndefined();
+        expect(await f.service.update_draft(context, { ...target, expectedVersion: changed, operationId: 'operation_test_003', subject: 'x' })).toEqual(failedOf('operation_test_003', 'unsupported_content'));
+        expect(await f.service.update_message_flags(context, flagsOf('operation_test_004', changed))).toMatchObject({ status: 'completed', proof: { sourceGrade: 'observed' } });
+        expect(await f.service.move_message(context, { ...target, expectedVersion: changed, operationId: 'operation_test_005', mailboxId, destinationMailboxId: 'e'.repeat(24) })).toMatchObject({ status: 'completed', proof: { sourceGrade: 'observed' } });
+        expect(mutations(f)).toEqual(['flags', 'flags', 'move']); expect(f.calls.some(call => call.method === 'sourcecheck' && f.calls.indexOf(call) > 3)).toBe(false);
+    }));
+    const strip = (f: Ledger) => { const row = f.client.records.get(opKey(own()).pk); Reflect.deleteProperty(row?.record as object, 'reservedAt'); };
+    test('records written without reservedAt count as aged: their hold ends at once', logged(async lines => {
+        const reserved = await ledger(); await leftReserved(reserved); strip(reserved); lines.length = 0;
+        expect(await reserved.service.update_message_flags(context, flagsOf())).toEqual(failedOf(operationId, 'temporarily_unavailable'));
+        expect(recovered(lines)).toEqual([line('update_message_flags', 'retry', 'reserved', 'failed')]);
+        const unknown = await ledger(); await leftUnknown(unknown); strip(unknown); lines.length = 0;
+        expect((await unknown.service.update_message_flags(context, flagsOf('operation_test_002', changed))).status).toBe('completed');
+        expect(recovered(lines)).toEqual([line('update_message_flags', 'lock_hit', 'unknown', 'released')]);
+    }));
+    test('an uncertain send written without reservedAt is never checked or released, however long it waits', logged(async lines => {
+        for (const dispatched of [false, true]) {
+            // An older version may still have been submitting it at the deploy: it holds until its items expire.
+            const f = await ledger(); await leftUnsent(f, dispatched); strip(f); f.behavior.present = true; f.advance(SEND_CHECK_AGED_MS * 4); const before = rows(f); lines.length = 0;
+            expect(await f.service.send_draft(context, target)).toEqual(unknownOf());
+            expect(await f.service.delete_draft({ ...context, clientId: 'another-client' }, deleteOf('operation_test_002'))).toEqual(fenced('operation_test_002'));
+            expect(await f.service.update_message_flags(context, flagsOf('operation_test_003'))).toEqual(fenced('operation_test_003'));
+            expect(checks(f)).toEqual([]); expect(rows(f)).toEqual(before); expect(recovered(lines)).toEqual([]); expect(mutations(f)).toEqual(['stamp', 'submit']);
+            expect(await guardOn(f)).toMatchObject({ operation: own(), state: dispatched ? 'dispatched' : 'outcome_unknown' });
+        }
+    }));
+    test('race: the abandon wins, so the resumed first attempt fails at its dispatch mark and makes no WildDuck call', logged(async lines => {
+        const f = await ledger(); let entered!: () => void; let resume!: () => void;
+        const inside = new Promise<void>(resolve => { entered = resolve; }); const paused = new Promise<void>(resolve => { resume = resolve; });
+        wrapOnce(f, 'markDispatched', async (original, claim) => { entered(); await paused; return original(claim); });
+        const first = f.service.delete_draft(context, deleteOf(operationId)); await inside;
+        f.advance(HOLD_AGED_MS);
+        expect((await f.service.update_message_flags(context, flagsOf('operation_test_002'))).status).toBe('completed');
+        resume(); expect(await first).toEqual(failedOf(operationId, 'temporarily_unavailable'));
+        expect(mutations(f)).toEqual(['flags']); expect(recovered(lines)).toEqual([line('delete_draft', 'lock_hit', 'reserved', 'failed')]);
+    }));
+    test('race: the dispatch mark wins, so the abandon is refused and the new operation is answered draft_fenced', logged(async lines => {
+        const f = await ledger(); let entered!: () => void; let resume!: () => void; let dispatching: Promise<unknown> = Promise.resolve();
+        const inside = new Promise<void>(resolve => { entered = resolve; }); const paused = new Promise<void>(resolve => { resume = resolve; });
+        wrapOnce(f, 'markDispatched', (original, claim) => { entered(); const marked = paused.then(() => original(claim)); dispatching = marked.catch(() => undefined); return marked; });
+        const first = f.service.delete_draft(context, deleteOf(operationId)); await inside;
+        f.advance(HOLD_AGED_MS);
+        wrapOnce(f, 'failPreflight', async (original, claim, receipt) => { resume(); await dispatching; return original(claim, receipt); });
+        expect(await f.service.update_message_flags(context, flagsOf('operation_test_002'))).toEqual(fenced('operation_test_002'));
+        expect(await first).toEqual({ status: 'completed', operationId, deleted: { mailboxId, uid: 7 } });
+        expect(mutations(f)).toEqual(['delete']); expect(recovered(lines)).toEqual([]);
+    }));
+    test('race: a retry of an old operation never deletes the guard a newer operation now holds on the same message', logged(async lines => {
+        const f = await ledger(); await leftUnknown(f); f.advance(HOLD_AGED_MS);
+        await leftUnknown(f, false, 'operation_test_002', changed);
+        expect(await guardOn(f)).toMatchObject({ operation: own('operation_test_002'), state: 'outcome_unknown' });
+        const before = rows(f); lines.length = 0;
+        expect(await f.service.update_message_flags(context, flagsOf())).toEqual(unknownOf());
+        expect(rows(f)).toEqual(before); expect(recovered(lines)).toEqual([]); expect(mutations(f)).toEqual(['flags', 'flags']);
+    }));
+    test('race: a stale retry never deletes the guard of a later incarnation of its own operationId on the same message', logged(async lines => {
+        const f = await ledger(); await leftUnknown(f); f.advance(HOLD_AGED_MS); const stale = await recordOf(f); const at = { accountId, mailboxId, uid: 7 };
+        // After the retry has read its record and before it reads the guard, both rows expire and the same request is reserved again.
+        wrapOnce(f, 'getGuard', async (original, guard) => {
+            f.client.records.delete(opKey(own()).pk); f.client.records.delete(guardKey(at).pk);
+            expect((await f.store.reserve(stale.intent, 'fresh-owner-token-0001')).kind).toBe('acquired');
+            return original(guard);
+        });
+        lines.length = 0;
+        expect(await f.service.update_message_flags(context, flagsOf())).toEqual(unknownOf());
+        expect(await guardOn(f)).toMatchObject({ operation: own(), ownerToken: 'fresh-owner-token-0001', revision: 0, state: 'reserved' });
+        expect(await recordOf(f)).toMatchObject({ state: 'reserved', ownerToken: 'fresh-owner-token-0001', revision: 0 });
+        expect(recovered(lines)).toEqual([]); expect(mutations(f)).toEqual(['flags']);
+    }));
+    test('a lock hit ends a hold only with time for a whole reservation after it, and reserves again only after the same admission check', logged(async lines => {
+        const late = await ledger(); await leftUnknown(late); late.advance(HOLD_AGED_MS); const clock = steppedClock();
+        try {
+            const budget = () => { const deadline = performance.now() + 60_000; return () => Math.max(0, deadline - performance.now()); };
+            // The hold is ended, then too little of the window is left to reserve: temporarily_unavailable, and the retry goes through.
+            wrapOnce(late, 'releaseGuard', async (original, guard) => { const released = await original(guard); clock.state.skew += 31_000; return released; });
+            await expect(withRequestBudget(budget(), () => late.service.update_message_flags(context, flagsOf('operation_test_002', changed)))).rejects.toThrow('temporarily_unavailable');
+        } finally { clock.restore(); }
+        expect(await guardOn(late)).toBeUndefined(); expect(recovered(lines)).toEqual([line('update_message_flags', 'lock_hit', 'unknown', 'released')]);
+        expect((await late.service.update_message_flags(context, flagsOf('operation_test_002', changed))).status).toBe('completed');
+        // A first reservation that leaves less than a whole reservation's time in the window: no recovery starts.
+        const tight = await ledger(); await leftUnknown(tight); tight.advance(HOLD_AGED_MS); const before = rows(tight); lines.length = 0; const stepped = steppedClock();
+        try {
+            const deadline = performance.now() + 60_000;
+            wrapOnce(tight, 'reserve', async (original, intent, owner) => { const result = await original(intent, owner); stepped.state.skew += 31_000; return result; });
+            expect(await withRequestBudget(() => Math.max(0, deadline - performance.now()), () => tight.service.update_message_flags(context, flagsOf('operation_test_002', changed)))).toEqual(fenced('operation_test_002'));
+        } finally { stepped.restore(); }
+        expect(rows(tight)).toEqual(before); expect(recovered(lines)).toEqual([]); expect(mutations(tight)).toEqual(['flags']);
+    }));
+    test('a moved message whose move stayed unknown can, once that is aged, be flagged, moved and deleted in its new mailbox', logged(async () => {
+        const f = await ledger(); const archive = 'e'.repeat(24); const move = f.writer.moveMessage;
+        f.writer.moveMessage = async (...args) => { f.writer.moveMessage = move; await move(...args); throw new MailError('upstream_timeout'); };
+        expect(await f.service.move_message(context, { ...target, mailboxId, destinationMailboxId: archive })).toEqual(unknownOf());
+        f.advance(MINUTE);
+        expect(await f.service.update_message_flags(context, flagsOf('copy_flags_early_01', version, 9, archive))).toEqual(failedOf('copy_flags_early_01', 'verification_failed'));
+        f.advance(HOLD_AGED_MS);
+        expect(await f.service.update_message_flags(context, flagsOf('copy_flags_operation1', version, 9, archive))).toMatchObject({ status: 'completed', proof: { sourceGrade: 'observed' } });
+        expect(await f.service.move_message(context, { uid: 9, mailboxId: archive, expectedVersion: changed, operationId: 'copy_move_operation_1', destinationMailboxId: mailboxId })).toMatchObject({ status: 'completed', message: { mailboxId, uid: 9 } });
+        expect((await f.service.delete_draft(context, deleteOf('copy_delete_operation', 9))).status).toBe('completed');
+        expect(mutations(f)).toEqual(['move', 'flags', 'move', 'delete']);
+    }));
+    test('a message carrying the marker of an unsettled send refuses every change, young or aged', logged(async () => {
+        const f = await ledger(); await leftUnsent(f); const copy = { mailboxId, uid: 50 };
+        const marker = f.behavior.marker; if (!marker) { throw new Error('missing send marker'); }
+        f.messages.set(JSON.stringify(copy), { ...f.behavior.snapshot, message: { ...copy, version }, marker });
+        for (const [step, age] of [['young', 10 * MINUTE], ['aged', 20 * MINUTE]] as const) {
+            f.advance(age);
+            expect(await f.service.update_message_flags(context, flagsOf(`${step}_flags_operation`, version, 50))).toEqual(failedOf(`${step}_flags_operation`, 'verification_failed'));
+            expect(await f.service.move_message(context, { uid: 50, mailboxId, expectedVersion: version, operationId: `${step}_move_operation_`, destinationMailboxId: 'e'.repeat(24) })).toEqual(failedOf(`${step}_move_operation_`, 'verification_failed'));
+            expect(await f.service.delete_draft(context, deleteOf(`${step}_delete_operation`, 50))).toEqual(failedOf(`${step}_delete_operation`, 'verification_failed'));
+        }
+        expect(mutations(f)).toEqual(['stamp', 'submit']);
+    }));
+    test('a copy that never became active can be deleted, and nothing else', logged(async () => {
+        const f = await ledger(); f.behavior.originalChanged = true;
+        expect(await f.service.update_draft(context, { ...target, subject: 'change' })).toMatchObject({ status: 'partial', reason: 'original_version_changed' });
+        f.advance(SEND_CHECK_AGED_MS);
+        for (const [tool, request] of [['update_message_flags', flagsOf('candidate_flags_op_1', version, 8)], ['move_message', { uid: 8, mailboxId, expectedVersion: version, operationId: 'candidate_move_op_01', destinationMailboxId: 'e'.repeat(24) }], ['send_draft', deleteOf('candidate_send_op_01', 8)], ['update_draft', { ...deleteOf('candidate_edit_op_01', 8), subject: 'x' }]] as const) {
+            expect(await f.service[tool](context, request as never)).toEqual(failedOf(request.operationId, 'verification_failed'));
+        }
+        expect((await f.service.delete_draft(context, deleteOf('candidate_delete_op1', 8))).status).toBe('completed');
+        expect(mutations(f)).toEqual(['upload', 'delete']);
+    }));
+    test('a recovery line carries fixed fields and the request ID, never an id or account data', logged(async lines => {
+        const f = await ledger(); await leftUnknown(f); f.advance(HOLD_AGED_MS); lines.length = 0;
+        await withRequestId('request-id-7', () => f.service.update_message_flags(context, flagsOf('operation_test_002', changed)));
+        expect(recovered(lines)).toEqual([{ ...line('update_message_flags', 'lock_hit', 'unknown', 'released'), requestId: 'request-id-7' }]);
+        expect(JSON.stringify(lines)).not.toMatch(/operation_test|aaaaaaaa|bbbbbbbb|client-one/u);
+    }));
 });
