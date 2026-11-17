@@ -86,7 +86,7 @@ function edgeCases(): RawItem[] {
         ...pair({ n: 3, tool: 'send_draft', uid: 3, state: 'settled', receipt: receipts.unknown(3), guard: 'outcome_unknown', opExpires: EXPIRES, guardExpires: EXPIRES }),
         // 4: orphan guard.
         { ...guardKey({ accountId: ACCOUNT, mailboxId: MAILBOX, uid: 4 }), record: { key: { accountId: ACCOUNT, mailboxId: MAILBOX, uid: 4 }, operation: keyOf(4), ownerToken: OWNER_TOKEN, revision: 2, state: 'retired' } },
-        // 5: fresh reserved pair written by 0.11.0.
+        // 5: fresh reserved pair written by 1.0.0.
         ...pair({ n: 5, tool: 'move_message', uid: 5, state: 'reserved', guard: 'reserved', reservedAt: NOW - 30, opExpires: EXPIRES, guardExpires: EXPIRES }),
         // 6: dispatched with reservedAt: left to the server's timeout.
         ...pair({ n: 6, tool: 'move_message', uid: 6, state: 'dispatched', guard: 'dispatched', reservedAt: NOW - 4000, opExpires: EXPIRES, guardExpires: EXPIRES }),

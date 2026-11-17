@@ -154,7 +154,7 @@ export function planCleanup(items: readonly RawItem[], nowSeconds: number): Plan
     for (const guard of guards.values()) {
         const ownerKey = ownerPk(guard.record);
         const owner = operations.get(ownerKey);
-        // Only a legacy guard (no expiresAt) is this script's business: every Put since 0.11.0 writes expiresAt, so a guard that has it belongs to the running server.
+        // Only a legacy guard (no expiresAt) is this script's business: every Put since 1.0.0 writes expiresAt, so a guard that has it belongs to the running server.
         const decision: GuardDecision = guard.expiresAt !== undefined ? 'leave_current_version' : unreadablePks.has(ownerKey) ? 'leave_owner_unreadable' : decideGuard(guard.record, owner?.record);
         guardDecisions[decision] += 1;
         const tool = owner?.record.intent.tool ?? ORPHAN_TOOL;
@@ -362,8 +362,8 @@ export const USAGE = `Usage: bun scripts/mail-ledger.ts <command> [options]
 Commands:
   show <accountId> <mailboxId> <uid>      Print the lock on a message, its owning operation and what the server will do about it.
                                           Reads two items; writes nothing.
-  cleanup [--apply]                       One-time migration after 0.11.0: one paced Scan, then delete finished locks and set
-                                          expiresAt on items written before 0.11.0 (items that already have expiresAt are left alone).
+  cleanup [--apply]                       One-time migration after 1.0.0: one paced Scan, then delete finished locks and set
+                                          expiresAt on items written before 1.0.0 (items that already have expiresAt are left alone).
                                           Dry run (writes nothing) unless --apply is given.
 
 Options:
@@ -430,14 +430,14 @@ async function readTarget(client: LedgerClient, target: { accountId: string; mai
 function describe(found: Found, nowMs: number, out: string[]): void {
     const { guard, owner } = found;
     const ownerRecord = owner === 'unreadable' ? undefined : owner?.record;
-    out.push(`lock: mailbox ${guard.record.key.mailboxId} uid ${guard.record.key.uid}, state ${guard.record.state}, revision ${guard.record.revision}, expiresAt ${when(guard.expiresAt, 'none (written before 0.11.0)')}`);
+    out.push(`lock: mailbox ${guard.record.key.mailboxId} uid ${guard.record.key.uid}, state ${guard.record.state}, revision ${guard.record.revision}, expiresAt ${when(guard.expiresAt, 'none (written before 1.0.0)')}`);
     out.push(`operation: ${guard.record.operation.operationId}`);
     if (owner === undefined) { out.push('  record missing (expired, or never written)'); }
     else if (owner === 'unreadable') { out.push('  record present but not in a readable format'); }
     else {
         const receipt = receiptOf(owner.record);
         out.push(`  tool ${owner.record.intent.tool}, state ${owner.record.state}, receipt ${receipt ? `${receipt.status}${receipt.reason ? ` (${receipt.reason})` : ''}` : 'none'}`);
-        out.push(`  reservedAt ${when(owner.record.reservedAt, 'none (written before 0.11.0; counts as aged)')}, expiresAt ${when(owner.expiresAt, 'none (written before 0.11.0)')}`);
+        out.push(`  reservedAt ${when(owner.record.reservedAt, 'none (written before 1.0.0; counts as aged)')}, expiresAt ${when(owner.expiresAt, 'none (written before 1.0.0)')}`);
     }
     out.push(owner === 'unreadable' ? 'meaning: the owning record cannot be read, so the server cannot judge this lock; inspect it by hand.' : `meaning: ${explainHold(ownerRecord, nowMs)}`);
 }

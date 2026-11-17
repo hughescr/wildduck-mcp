@@ -15,7 +15,7 @@ This is the one place that explains the whole life of a write made through `wild
 - [Capacity](#capacity)
 - [Log events](#log-events)
 - [Runbook: a message is locked](#runbook-a-message-is-locked)
-- [One-time migration after deploying 0.11.0](#one-time-migration-after-deploying-0110)
+- [One-time migration after deploying 1.0.0](#one-time-migration-after-deploying-100)
 - [Where to change things](#where-to-change-things)
 
 ## The problem this solves
@@ -46,7 +46,7 @@ The **marker** is a small entry, `wildduckMcpOperationV1`, that the server write
 
 ## State diagram
 
-The diagram shows the states of an operation record. `completed`, `queued`, `failed`, `partial` and `outcome_unknown` are the `status` of the receipt of a settled record. The lock, written together with the record, is deleted on every transition that ends in `completed`, `queued` or `failed`. It stays for `dispatched`, `outcome_unknown` and for the `partial` result of `update_draft` described below. A self-arrow means the record is left as it is: on `dispatched` and `outcome_unknown` the lock is deleted once aged (5 minutes, or for a send 15 minutes and a send check that finds neither a Sent copy nor the draft), on `partial` the lock is kept until a `delete_draft` of the original takes it over. The send check (from `dispatched` or `outcome_unknown`, at 15 minutes) looks in Sent first, then in Drafts. An uncertain send with no `reservedAt` (written before 0.11.0) never ages and is never checked. The next section has the exact rules.
+The diagram shows the states of an operation record. `completed`, `queued`, `failed`, `partial` and `outcome_unknown` are the `status` of the receipt of a settled record. The lock, written together with the record, is deleted on every transition that ends in `completed`, `queued` or `failed`. It stays for `dispatched`, `outcome_unknown` and for the `partial` result of `update_draft` described below. A self-arrow means the record is left as it is: on `dispatched` and `outcome_unknown` the lock is deleted once aged (5 minutes, or for a send 15 minutes and a send check that finds neither a Sent copy nor the draft), on `partial` the lock is kept until a `delete_draft` of the original takes it over. The send check (from `dispatched` or `outcome_unknown`, at 15 minutes) looks in Sent first, then in Drafts. An uncertain send with no `reservedAt` (written before 1.0.0) never ages and is never checked. The next section has the exact rules.
 
 ![State diagram of an operation record and its lock](mail-write-lifecycle.svg)
 
@@ -108,7 +108,7 @@ Every write above also sets the item's `expiresAt` to now plus `RECORD_TTL_SECON
 | `dispatched`, or `settled` with receipt `outcome_unknown`, tool other than `send_draft` | under 5 minutes | nothing | kept |
 | the same, tool other than `send_draft` | 5 minutes or more | left as it is: still `dispatched` or `outcome_unknown` | deleted (`releaseGuard`) |
 | the same, tool `send_draft` | under 15 minutes | nothing | kept |
-| the same, tool `send_draft` | no `reservedAt` (written before 0.11.0) | nothing, ever: it is never checked | kept until it expires (`expiresAt`) |
+| the same, tool `send_draft` | no `reservedAt` (written before 1.0.0) | nothing, ever: it is never checked | kept until it expires (`expiresAt`) |
 | the same, tool `send_draft` | 15 minutes or more, a copy carrying this operation's whole marker is in Sent and not flagged as a draft (looked for first, whether or not the draft is still in Drafts) | settled as `queued`, with `sent` set; `queueId` is set only if WildDuck still reports one | deleted in the same transaction |
 | the same, tool `send_draft` | 15 minutes or more, no such copy, and WildDuck still has the draft in Drafts | settled as `failed` with reason `upstream_timeout` (`resolveUnknown`) | deleted in the same transaction |
 | the same, tool `send_draft` | 15 minutes or more, no such copy and the draft is gone | left as `outcome_unknown` | deleted |
@@ -132,7 +132,7 @@ A lock hit ends the old hold and then reserves once more. If that second reserva
 
 This settles the one dangerous race. Suppose a request reserved a write and then stalled, and a later request judged the reservation aged and abandoned it (settled it `failed`, which deletes the lock). When the first request wakes up, its `markDispatched` is a compare-and-set against a record that has changed, so it fails. The service calls WildDuck only after `markDispatched` has returned, so the resumed request makes no WildDuck call. The reverse order is safe too: if `markDispatched` lands first, the abandon fails and the hold stays. The clock decides only when clean-up is attempted. It does not decide who is right.
 
-**Where time is trusted.** One rule rests on an assumption about time and not only on the compare-and-set: a `dispatched` or `outcome_unknown` hold older than 5 minutes is released on the belief that the request that made it has stopped. The Lambda is killed at 60 seconds, so 5 minutes is five times its limit; a test pins `HOLD_AGED_MS` at no less than twice the longest timeout (`tests/mail-service.test.ts`). If that belief were ever wrong, the late request would find its lock gone and could not store its result, and another change could run on the message while the first WildDuck call was still in flight. Ages are never overstated: the store writes `reservedAt` as the clock rounded up to a whole second, so a hold can look up to one second younger than it is, never older, and no age check fires early. A record with no `reservedAt` was written by a release before 0.11.0; it counts as aged, except an uncertain `send_draft`, which is never checked or released, because a request of the older release may still have been submitting it when 0.11.0 was deployed. Its lock lasts until its items expire.
+**Where time is trusted.** One rule rests on an assumption about time and not only on the compare-and-set: a `dispatched` or `outcome_unknown` hold older than 5 minutes is released on the belief that the request that made it has stopped. The Lambda is killed at 60 seconds, so 5 minutes is five times its limit; a test pins `HOLD_AGED_MS` at no less than twice the longest timeout (`tests/mail-service.test.ts`). If that belief were ever wrong, the late request would find its lock gone and could not store its result, and another change could run on the message while the first WildDuck call was still in flight. Ages are never overstated: the store writes `reservedAt` as the clock rounded up to a whole second, so a hold can look up to one second younger than it is, never older, and no age check fires early. A record with no `reservedAt` was written by a release before 1.0.0; it counts as aged, except an uncertain `send_draft`, which is never checked or released, because a request of the older release may still have been submitting it when 1.0.0 was deployed. Its lock lasts until its items expire.
 
 **The send check, and the one risk accepted.** An uncertain `send_draft` is not settled from a guess. After 15 minutes the server looks at WildDuck (`findSentCopy` and `draftPresent` in `src/mail/backend.ts`), Sent first:
 
@@ -218,8 +218,8 @@ All records are items in the one DynamoDB table, in the key namespace `wildduck-
 | `record.key`, `record.intent` | the operation key; the intent (`tool`, `payloadDigest`, and for a targeted tool `target` and `expectedVersion`) | the same |
 | `record.ownerToken`, `record.revision`, `record.state` | owner token; counter; `reserved`, `dispatched` or `settled` | the same |
 | `record.receipt` | present once settled; the stored receipt | the same |
-| `record.reservedAt` | epoch seconds, the clock rounded up, set at reserve, never changed afterwards | 0.11.0 |
-| `expiresAt` | epoch seconds, top level, the table's TTL attribute: now plus `RECORD_TTL_SECONDS` at reserve, set again at every write of the item | 0.11.0 |
+| `record.reservedAt` | epoch seconds, the clock rounded up, set at reserve, never changed afterwards | 1.0.0 |
+| `expiresAt` | epoch seconds, top level, the table's TTL attribute: now plus `RECORD_TTL_SECONDS` at reserve, set again at every write of the item | 1.0.0 |
 
 **Guard item** (`guardKey()`, `guardSchema`)
 
@@ -227,14 +227,14 @@ All records are items in the one DynamoDB table, in the key namespace `wildduck-
 |---|---|---|
 | `pk` | `wildduck-mcp#mail-guard#<accountId>#<mailboxId>#<uid>` | 0.6.x to 0.9.x wrote the same layout; still written |
 | `record.key`, `record.operation`, `record.ownerToken`, `record.revision` | the message; the owning operation's key; owner token; counter | the same |
-| `record.state` | `reserved`, `dispatched`, `outcome_unknown`, `retired` (only for an `update_draft` with both copies alive). `queued` is read but no longer written. | `queued` was written by releases before 0.11.0; the others still are |
-| `expiresAt` | as above | 0.11.0 |
+| `record.state` | `reserved`, `dispatched`, `outcome_unknown`, `retired` (only for an `update_draft` with both copies alive). `queued` is read but no longer written. | `queued` was written by releases before 1.0.0; the others still are |
+| `expiresAt` | as above | 1.0.0 |
 
-**What readers tolerate.** Since 0.10.0 a reader accepts an optional `record.reservedAt` (a positive integer) and an optional numeric top-level `expiresAt`, and ignores both when reading. Reads never filter on `expiresAt`: an item that is past its time but not yet deleted is read normally. A stored `queued` receipt may have no `queueId`. A guard may be in state `retired` or `queued`. A `summary` found inside a receipt is dropped on read; summaries are worked out again whenever a result is returned and are never stored. A record from before 0.11.0 has no `reservedAt` and no `expiresAt`; a missing `reservedAt` counts as aged, except on an uncertain `send_draft`, which is then never checked.
+**What readers tolerate.** Since 0.10.0 a reader accepts an optional `record.reservedAt` (a positive integer) and an optional numeric top-level `expiresAt`, and ignores both when reading. Reads never filter on `expiresAt`: an item that is past its time but not yet deleted is read normally. A stored `queued` receipt may have no `queueId`. A guard may be in state `retired` or `queued`. A `summary` found inside a receipt is dropped on read; summaries are worked out again whenever a result is returned and are never stored. A record from before 1.0.0 has no `reservedAt` and no `expiresAt`; a missing `reservedAt` counts as aged, except on an uncertain `send_draft`, which is then never checked.
 
 **The two old spellings.** A stored receipt keeps the field name `operation_id` (`STORED_OPERATION_ID` in `src/mail/dynamo-store.ts`); tool results call it `operationId` (renamed in 0.7.0). The reader accepts both and the writer always writes the old one, so a receipt written by 0.6.x replays unchanged. The same applies to the payload digest: it is computed over the arguments with `expectedVersion` named `expected_version` (`digestedPayload()` in `src/mail/service.ts`), so an identical retry of a request recorded by 0.6.x still matches its stored digest. The condition used to settle a record that already holds an `outcome_unknown` receipt must use the stored spelling; `resolveUnknown` does.
 
-**Rollback floor.** 0.10.0 is the oldest release that can read what 0.11.0 writes. Releases before 0.10.0 reject items that carry `reservedAt` or `expiresAt`. After 0.11.0 is deployed, do not roll back past 0.10.0.
+**Rollback floor.** 0.10.0 is the oldest release that can read what 1.0.0 writes. Releases before 0.10.0 reject items that carry `reservedAt` or `expiresAt`. After 1.0.0 is deployed, do not roll back past 0.10.0.
 
 ## Retention
 
@@ -307,10 +307,10 @@ Optional `--table <name>` (default `wildduck-mcp-prod-state`) and `--region <nam
 Output, for a lock that exists:
 
 ```
-lock: mailbox <id> uid <n>, state <state>, revision <n>, expiresAt <ISO time or "none (written before 0.11.0)">
+lock: mailbox <id> uid <n>, state <state>, revision <n>, expiresAt <ISO time or "none (written before 1.0.0)">
 operation: <operationId>
   tool <tool>, state <state>, receipt <status (reason) or none>
-  reservedAt <ISO time or "none (written before 0.11.0; counts as aged)">, expiresAt <...>
+  reservedAt <ISO time or "none (written before 1.0.0; counts as aged)">, expiresAt <...>
 meaning: <one sentence>
 ```
 
@@ -325,7 +325,7 @@ If there is no lock it prints `No lock on this message: nothing holds it.` and t
 | Reserved, aged: the request that took it died. | Nothing. The next request settles it `failed` and deletes the lock. |
 | Uncertain `send_draft`, young: held until 15 minutes old. | Wait; the agent retries the same request later. |
 | Uncertain `send_draft`, aged: the next request looks in WildDuck. | Nothing, or have the agent retry the same request now. |
-| Uncertain `send_draft` with no `reservedAt` (written before 0.11.0): its age is unknown, so the server never checks it. | Look in WildDuck (Sent and Drafts) and tell the user. The row expires 90 days after it was last written. |
+| Uncertain `send_draft` with no `reservedAt` (written before 1.0.0): its age is unknown, so the server never checks it. | Look in WildDuck (Sent and Drafts) and tell the user. The row expires 90 days after it was last written. |
 | Unknown outcome of another tool, young: may still be running. | Wait until it is 5 minutes old. |
 | Unknown outcome of another tool, aged: the record stays `outcome_unknown`; the next write deletes the lock. | Nothing. The agent re-reads the message and retries under a new `operationId`. |
 | The owning record cannot be read (unreadable format). | Inspect the two items by hand. |
@@ -353,11 +353,11 @@ aws logs filter-log-events --region us-west-2 \
 
 Replace the quoted term with `"mail_write_recovered"`, `"dynamodb_failed"`, `"dynamodb_throttled"` or `"mail_tool_error"`. Read `step` and `code` in the line against the [Log events](#log-events) table. To follow one request, search for its `requestId` (an agent's error text shows it as "Request ID"). A write receipt such as `in_progress` has no request ID, so use the time of the agent's attempt. Logs older than 14 days are gone.
 
-## One-time migration after deploying 0.11.0
+## One-time migration after deploying 1.0.0
 
-Releases before 0.11.0 left lock rows that nothing deletes and operation records that never expire. This script, run once, deletes the locks whose hold has already ended and gives every old record an `expiresAt`. It uses your own AWS credentials and is the only code that scans the table.
+Releases before 1.0.0 left lock rows that nothing deletes and operation records that never expire. This script, run once, deletes the locks whose hold has already ended and gives every old record an `expiresAt`. It uses your own AWS credentials and is the only code that scans the table.
 
-**It acts only on legacy rows**, those with no top-level `expiresAt` (every write from 0.11.0 on sets it). A lock that has `expiresAt` was written by the running server and is left to it, however it looks (a `retired` lock of an `update_draft` with both copies alive is a real hold); an operation item that has `expiresAt` needs nothing. Before **every** lock delete the script reads the lock's owner again with a consistent read and decides again from that fresh copy; it deletes only when the lock and the fresh owner carry the same `ownerToken` and `revision` (the store writes the two with the same revision in one transaction) and the fresh copy gives the same decision. Otherwise the lock is skipped and counted as changed since the scan. The delete itself is conditional on the lock still equalling what was scanned.
+**It acts only on legacy rows**, those with no top-level `expiresAt` (every write from 1.0.0 on sets it). A lock that has `expiresAt` was written by the running server and is left to it, however it looks (a `retired` lock of an `update_draft` with both copies alive is a real hold); an operation item that has `expiresAt` needs nothing. Before **every** lock delete the script reads the lock's owner again with a consistent read and decides again from that fresh copy; it deletes only when the lock and the fresh owner carry the same `ownerToken` and `revision` (the store writes the two with the same revision in one transaction) and the fresh copy gives the same decision. Otherwise the lock is skipped and counted as changed since the scan. The delete itself is conditional on the lock still equalling what was scanned.
 
 1. **Dry run** (the default; writes nothing):
 
