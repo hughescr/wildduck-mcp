@@ -11,6 +11,7 @@ const original: ReplyOriginal = {
 };
 const input: ReplyInput = { original, ownedAddresses: ['me@example.test', 'alias@example.test'], mode: 'reply', body: { text: 'My response', html: '<p>My response</p>' } };
 const list = (values: readonly { address: string }[]) => values.map(value => value.address);
+const quoteOpen = '<blockquote style="margin:0 0 0 .8ex;border-left:2px solid #c0c0c0;padding-left:1ex">';
 
 describe('reply derivation', () => {
     test('reply prefers Reply-To, copies no body or Bcc, and derives bounded threading', () => {
@@ -67,18 +68,49 @@ describe('reply derivation', () => {
         expect(result.subject).toBe('rE: Thread');
         expect(result.threading.references).toEqual(['<first@example.test>', '<original@example.test>']);
     });
-    test('quotes only when requested and escapes source text into paired HTML without including normalized source HTML', () => {
+    test('quotes only when requested and escapes source text into an email-style HTML quote without including normalized source HTML', () => {
         const result = deriveReply({ ...input, quoteOriginal: true });
         expect(result.body.text).toBe('My response\n\n> Original <script>alert("x")</script> & text\n> Second line');
-        expect(result.body.html).toBe('<p>My response</p><blockquote><pre>Original &lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt; &amp; text\nSecond line</pre></blockquote>');
+        expect(result.body.html).toBe(`<p>My response</p>${quoteOpen}Original &lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt; &amp; text<br>Second line</blockquote>`);
+        expect(result.body.html).not.toContain('<pre>');
+        const blank = deriveReply({ ...input, quoteOriginal: true, original: { ...original, text: 'one\n\n\ntwo\n' } });
+        expect(blank.body.text).toBe('My response\n\n> one\n> \n> \n> two\n> ');
+        expect(blank.body.html).toBe(`<p>My response</p>${quoteOpen}one<br><br><br>two<br></blockquote>`);
         const plain = deriveReply({ ...input, quoteOriginal: true, body: { text: '', html: null } });
         expect(plain.body.html).toBe(null);
         expect(() => deriveReply({ ...input, quoteOriginal: true, original: { ...original, textTruncated: true } })).toThrow(MimeError);
         expect(deriveReply({ ...input, original: { ...original, textTruncated: true } }).body).toEqual(input.body);
     });
+    test('quote indentation, aligned columns, tabs and blank lines survive HTML and MIME without doubled breaks', async () => {
+        const source = '  name    count\r\n  alpha   12\n\n\tindented & <literal>\r';
+        const reply = deriveReply({ ...input, quoteOriginal: true, original: { ...original, text: source } });
+        const expected = `<p>My response</p>${quoteOpen}  name    count<br>  alpha   12<br><br>    indented &amp; &lt;literal&gt;<br></blockquote>`;
+        expect(reply.body.html).toBe(expected);
+        expect(reply.body.html).not.toMatch(/white-space|<pre|font-family/);
+        expect(reply.body.text).toBe('My response\n\n>   name    count\n>   alpha   12\n> \n> \tindented & <literal>\n> ');
+        const created = await createMime({ from: { address: 'me@example.test' }, ...reply });
+        const encoded = /Content-Type: text\/html; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n([A-Za-z0-9+/=\r\n]*)/u.exec(created.raw.toString('latin1'))?.[1];
+        expect(encoded).toBeDefined();
+        const storedHtml = Buffer.from(encoded ?? '', 'base64').toString('utf8');
+        expect(storedHtml).toBe(expected.replaceAll('\n', '\r\n'));
+        // Explicit breaks do not depend on client white-space CSS support.
+        expect(storedHtml.match(/<br>/g)).toHaveLength(4);
+    });
     test('rejects quote expansion beyond paired body bounds instead of silently cutting original', () => {
         expect(() => deriveReply({ ...input, quoteOriginal: true, original: { ...original, text: 'x'.repeat(128 * 1024) } })).toThrow(MimeError);
         expect(() => deriveReply({ ...input, quoteOriginal: true, original: { ...original, text: '<'.repeat(70 * 1024) } })).toThrow(MimeError);
+        expect(deriveReply({ ...input, quoteOriginal: true, original: { ...original, text: ' '.repeat(50000) } }).body.html).toContain(' '.repeat(50000));
+        for (const source of ['\t'.repeat(40000), '<'.repeat(70 * 1024), 'x'.repeat(128 * 1024)]) {
+            try { deriveReply({ ...input, quoteOriginal: true, original: { ...original, text: source } }); throw new Error('Expected limit'); }
+            catch (error) { expect(error).toBeInstanceOf(MimeError); expect((error as MimeError).code).toBe('mime_limit'); }
+        }
+        const indented = '\t' + 'x'.repeat(95) + '\n';
+        const large = deriveReply({ ...input, quoteOriginal: true, original: { ...original, text: indented.repeat(1000) } });
+        expect(large.body.html).not.toContain('&nbsp;');
+        expect(large.body.html).toContain(' '.repeat(4));
+        expect(Buffer.byteLength(large.body.html ?? '')).toBeLessThan(256 * 1024);
+        const literal = deriveReply({ ...input, quoteOriginal: true, original: { ...original, text: `&nbsp; <br> "double" 'single'` } });
+        expect(literal.body.html).toEndWith(`${quoteOpen}&amp;nbsp; &lt;br&gt; &quot;double&quot; &#39;single&#39;</blockquote>`);
     });
     test('rejects malformed and injected inspected headers or derived recipients', () => {
         for (const messageId of [null, '', '<a@example.test>\r\nBcc: evil@example.test', '<a@example.test> <b@example.test>', '<a..b@example.test>', 'bare@example.test', '<a@exa mple.test>', '<a@example.test>\0']) {
@@ -125,7 +157,7 @@ describe('reply derivation', () => {
             const reply = deriveReply({ ...input, original: mixedOriginal, body, quoteOriginal: true });
             const created = await createMime({ from: { address: 'me@example.test' }, ...reply });
             expect(decode(created.raw, 'text/plain')).toEqual(['My\r\nresponse\r\n\r\n> first\r\n> second\r\n> third\r\n> fourth']);
-            expect(decode(created.raw, 'text/html')).toEqual([`<p>My\r\nresponse</p><blockquote><pre>first\r\nsecond\r\nthird\r\nfourth</pre></blockquote>`]);
+            expect(decode(created.raw, 'text/html')).toEqual([`<p>My\r\nresponse</p>${quoteOpen}first<br>second<br>third<br>fourth</blockquote>`]);
         }
         const unquoted = await createMime({ from: { address: 'me@example.test' }, ...deriveReply({ ...input, body: { text: 'a\nb', html: '<p>a\nb</p>' } }) });
         expect(decode(unquoted.raw, 'text/plain')).toEqual(['a\r\nb']); expect(decode(unquoted.raw, 'text/html')).toEqual(['<p>a\r\nb</p>']);

@@ -8,7 +8,7 @@ const accountId = 'a'.repeat(24); const mailboxId = 'b'.repeat(24); const versio
 const context: MailContext = { accountId, accessToken: 'c'.repeat(40), clientId: 'client-one', scopes: ['mail:read', 'mail:draft', 'mail:send', 'mail:modify'], connectionStatus: 'active' };
 const operation_id = 'operation_test_001';
 const target = { uid: 7, expected_version: version, operation_id };
-const content = { to: [{ address: 'to@example.com' }], cc: [], bcc: [], subject: 'private subject', body: { text: 'private body', html: '<p>private body</p>' }, attachments: [] };
+const content = { to: [{ address: 'to@example.com' }], cc: [], bcc: [], subject: 'private subject', body: { markdown: 'private **body**' }, attachments: [] };
 const keyOf = (key: OperationKey) => JSON.stringify([key.accountId, key.clientIdHash, key.operationId]);
 const guardOf = (intent: WriteIntent) => intent.tool === 'create_draft' || intent.tool === 'create_reply_draft' ? undefined : JSON.stringify([intent.accountId, intent.target.mailboxId, intent.target.uid]);
 class Store implements MailOperationStore {
@@ -136,9 +136,11 @@ test('send versus update/delete across clients uses one shared permanent draft f
 });
 test('changed payload with same operation ID conflicts before reading drafts', async () => {
     const f = fixture(); await f.service.create_draft(context, { ...content, operation_id }); const before = f.calls.length;
-    expect(await f.service.create_draft(context, { ...content, body: { text: 'changed', html: null }, operation_id })).toEqual({ status: 'conflict', operation_id, reason: 'operation_conflict' });
+    for (const body of [{ text: 'changed' }, { markdown: 'private **body** changed' }, { html: 'private **body**' }, { text: 'private **body**' }]) {
+        expect(await f.service.create_draft(context, { ...content, body, operation_id })).toEqual({ status: 'conflict', operation_id, reason: 'operation_conflict' });
+    }
     expect(f.calls).toHaveLength(before); expect(posts(f)).toHaveLength(1);
-    const stored = JSON.stringify([...f.operations.records.values()]); expect(stored).not.toContain(content.body.text); expect(stored).not.toContain(content.subject); expect(stored).not.toContain(context.accessToken);
+    const stored = JSON.stringify([...f.operations.records.values()]); expect(stored).not.toContain(content.body.markdown); expect(stored).not.toContain('private'); expect(stored).not.toContain(content.subject); expect(stored).not.toContain(context.accessToken);
 });
 test('preflight version, recipient, draft state and target mismatch failures release only before dispatch', async () => {
     for (const [field, value, reason] of [['hasRecipients', false, 'no_recipients'], ['isDraft', false, 'unsupported_draft'], ] as const) {
@@ -478,14 +480,14 @@ test('batch serialized budget includes metadata, envelope and reserved failure s
 });
 
 test('reply draft uses distinct durable create intent, skips preparation on replay, and requires both read and draft', async () => {
-    const f = fixture(false); const reply = { original: { mailboxId, uid: 7 }, mode: 'reply_all' as const, body: { text: 'Reply', html: null }, quoteOriginal: false, attachments: [], operation_id };
+    const f = fixture(false); const reply = { original: { mailboxId, uid: 7 }, mode: 'reply_all' as const, body: { text: 'Reply' }, quoteOriginal: false, attachments: [], operation_id };
     const created = await f.service.create_reply_draft(context, reply); expect(created.status).toBe('completed'); expect(f.calls.filter(call => call.method === 'prepareReply')).toHaveLength(1); expect(f.calls.some(call => call.method === 'inspect')).toBe(false);
-    const calls = f.calls.length; expect(await f.service.create_reply_draft(context, reply)).toEqual(created); expect(f.calls).toHaveLength(calls); expect(await f.service.create_reply_draft(context, { ...reply, body: { text: 'Changed', html: null } })).toMatchObject({ status: 'conflict', reason: 'operation_conflict' });
+    const calls = f.calls.length; expect(await f.service.create_reply_draft(context, reply)).toEqual(created); expect(f.calls).toHaveLength(calls); expect(await f.service.create_reply_draft(context, { ...reply, body: { text: 'Changed' } })).toMatchObject({ status: 'conflict', reason: 'operation_conflict' });
     expect([...f.operations.records.values()][0]?.intent.tool).toBe('create_reply_draft');
     const denied = fixture(false); await expect(denied.service.create_reply_draft({ ...context, scopes: ['mail:draft'] }, reply)).rejects.toMatchObject({ code: 'forbidden' }); expect(denied.calls).toHaveLength(0); expect(denied.operations.calls).toHaveLength(0);
 });
 test('reply preparation failure settles preflight without upload and authored reply can later send', async () => {
-    const f = fixture(false); const reply = { original: { mailboxId, uid: 7 }, mode: 'reply' as const, body: { text: 'Reply', html: null }, quoteOriginal: false, attachments: [], operation_id };
+    const f = fixture(false); const reply = { original: { mailboxId, uid: 7 }, mode: 'reply' as const, body: { text: 'Reply' }, quoteOriginal: false, attachments: [], operation_id };
     f.behavior.preparationError = true; expect(await f.service.create_reply_draft(context, reply)).toMatchObject({ status: 'failed', reason: 'unsupported_content' }); expect(f.calls.some(call => call.method === 'upload')).toBe(false); expect(f.operations.calls).not.toContain('dispatch');
     const good = fixture(false); const created = await good.service.create_reply_draft(context, reply); if (created.status !== 'completed') { throw new Error('expected created draft'); }
     const send = { uid: created.draft.uid, expected_version: created.draft.version, operation_id: 'reply-send-operation' };
@@ -494,7 +496,7 @@ test('reply preparation failure settles preflight without upload and authored re
     expect(good.calls.filter(call => call.method === 'submit')).toHaveLength(1); expect(good.calls.some(call => call.method === 'flags')).toBe(false);
 });
 test('reply verification failure stays partial on replay and uncertain reply sends never redispatch', async () => {
-    const reply = { original: { mailboxId, uid: 7 }, mode: 'reply' as const, body: { text: 'Reply', html: null }, quoteOriginal: false, attachments: [], operation_id };
+    const reply = { original: { mailboxId, uid: 7 }, mode: 'reply' as const, body: { text: 'Reply' }, quoteOriginal: false, attachments: [], operation_id };
     const partial = fixture(false); partial.behavior.verificationError = true;
     const result = await partial.service.create_reply_draft(context, reply); expect(result).toMatchObject({ status: 'partial', candidateVerified: false, reason: 'candidate_verification_failed' });
     const count = partial.calls.length; expect(await partial.service.create_reply_draft(context, reply)).toEqual(result); expect(partial.calls).toHaveLength(count);

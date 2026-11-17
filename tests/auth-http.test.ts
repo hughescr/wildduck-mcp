@@ -199,7 +199,7 @@ test('authenticated HTTP binds attachment identity and permits supported multi-m
     const invoke = (name: string, args: object) => env.app.request('/mcp', { method: 'POST', headers: { authorization: `Bearer ${tokens.access_token}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'mcp-protocol-version': '2025-11-25' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }) });
     const downloaded = await invoke('read_attachment', { mailboxId: 'b'.repeat(24), uid: 1, attachmentId: 'ATT1' });
     expect(downloaded.status).toBe(200); const output = await downloaded.json(); expect(output.result.content[1].resource.blob).toBe('aGVsbG8='); expect(JSON.stringify(output)).not.toContain(credentials.accessToken); expect(JSON.stringify(output)).not.toContain(tokens.access_token);
-    const larger = await invoke('create_draft', { operation_id: 'synthetic-attachment-operation', subject: '', body: { text: '', html: null }, attachments: [{ filename: 'large.bin', contentType: 'application/octet-stream', contentBase64: Buffer.alloc(2 * 1024 * 1024).toString('base64') }] });
+    const larger = await invoke('create_draft', { operation_id: 'synthetic-attachment-operation', subject: '', body: { text: '' }, attachments: [{ filename: 'large.bin', contentType: 'application/octet-stream', contentBase64: Buffer.alloc(2 * 1024 * 1024).toString('base64') }] });
     expect(larger.status).toBe(200); const denied = await larger.json(); expect(denied.result.isError).toBe(true); expect(denied.result.content[0].text).toContain('mail:draft');
 });
 test('send permission needs its own explicit consent checkbox without granting extra scopes', async () => {

@@ -39,7 +39,14 @@ export const inputAddressSchema = z.strictObject({ address: z.string().max(320).
 // Malformed incoming MIME addresses remain untrusted data, not outbound validators.
 export const outputAddressSchema = z.strictObject({ address: z.string(), name: z.string().optional() });
 const recipientsSchema = z.array(inputAddressSchema).max(50);
-export const draftBodySchema = z.strictObject({ text: boundedText(MAX_DRAFT_TEXT_BYTES), html: boundedText(MAX_HTML_BYTES).nullable() });
+export const MAX_MARKDOWN_BYTES = MAX_DRAFT_TEXT_BYTES;
+// Each branch is strict with one required key, so the advertised JSON Schema
+// (anyOf) itself says "exactly one". The server renders it before MIME composition.
+export const draftBodySchema = z.union([
+    z.strictObject({ markdown: boundedText(MAX_MARKDOWN_BYTES).describe('Preferred. Markdown rendered to HTML plus generated plain text (multipart/alternative).') }),
+    z.strictObject({ html: boundedText(MAX_HTML_BYTES).describe('HTML sent with generated plain text (multipart/alternative).') }),
+    z.strictObject({ text: boundedText(MAX_DRAFT_TEXT_BYTES).describe('Plain text only (single text/plain part). Some clients drop its line breaks when editing the draft; prefer markdown.') }),
+], { error: 'Provide exactly one of body.markdown, body.html or body.text.' }).describe('Exactly one of markdown (preferred), html or text.');
 const base64Schema = z.string().max(Math.ceil(MAX_ATTACHMENT_BYTES / 3) * 4).refine(value => value.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/u.test(value) && Buffer.from(value, 'base64').toString('base64') === value && Buffer.byteLength(value, 'base64') <= MAX_ATTACHMENT_BYTES, 'Canonical base64 of at most 2 MiB decoded bytes is required.');
 const contentTypeSchema = z.string().max(255).regex(/^[A-Za-z0-9!#$%&'*+.^_`|~-]+\/[A-Za-z0-9!#$%&'*+.^_`|~-]+$/u);
 const cidSchema = headerText(255).min(1).regex(/^[^\s<>]+$/u);

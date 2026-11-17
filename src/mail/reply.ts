@@ -1,4 +1,5 @@
 import { MimeError, validateMessageId, validateThreading, validateMimeAddresses, validateMimeBody, type MimeAddress, type MimeBody, type MimeThreading } from './mime';
+import { BLOCKQUOTE_STYLE } from './render';
 
 /** Request-local projection of a freshly inspected message. Backend identity,
  * ownership, version and operation replay checks belong to the existing pipeline. */
@@ -96,9 +97,22 @@ export function deriveReply(input: ReplyInput): DerivedReply {
         // Line endings are canonicalised to CRLF later, where each text entity is
         // authored (mime.ts textEntity). Work in LF here, including the caller's
         // text, so a trailing bare CR cannot fuse with the separator's LF.
-        const normalized = original.text.replace(/\r\n|\r/gu, '\n');
-        const quote = normalized.split('\n').map(line => '> ' + line).join('\n');
-        body = { text: body.text.replace(/\r\n|\r/gu, '\n') + '\n\n' + quote, html: body.html === null ? null : body.html + '<blockquote><pre>' + escapeHtml(normalized) + '</pre></blockquote>' };
+        // The body is already rendered: the quote is appended to each final part
+        // and is never interpreted as Markdown or as caller HTML.
+        const lines = original.text.replace(/\r\n|\r/gu, '\n').split('\n');
+        const quote = lines.map(line => '> ' + line).join('\n');
+        // Outlook's Word renderer ignores pre-wrap. Escape first, then preserve
+        // indentation and alignment with non-collapsing spaces and explicit breaks.
+        // Each source run is replaced once; no repeated scans of a growing string.
+        const htmlQuote = `<blockquote style="${BLOCKQUOTE_STYLE}">` + lines.map(line => escapeHtml(line)
+            .replace(/\t/g, '    ')
+            .replace(/^ +| {2,}/g, (spaces, offset: number) => offset === 0
+                ? ' '.repeat(spaces.length)
+                : ' '.repeat(spaces.length - 1) + ' ')).join('<br>') + '</blockquote>';
+        body = { text: body.text.replace(/\r\n|\r/gu, '\n') + '\n\n' + quote, html: body.html === null ? null : body.html + htmlQuote };
+        // The backend already maps mime_limit to the normal too_large tool error;
+        // do not let valid but expanded quotes become invalid_mime_patch instead.
+        if (Buffer.byteLength(body.text) > 128 * 1024 || body.html !== null && Buffer.byteLength(body.html) > 256 * 1024) { throw new MimeError('mime_limit'); }
         validateMimeBody(body);
     }
     return { ...recipients, bcc: [], subject, body, threading };

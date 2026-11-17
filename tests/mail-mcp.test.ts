@@ -6,6 +6,7 @@ import { createMailBackend, type SearchDiagnostic } from '../src/mail/backend';
 import { createMailService } from '../src/mail/service';
 import type { MailOperationStore } from '../src/mail/contracts';
 import { mailOutputSchemas } from '../src/mail/schemas';
+import { MARKDOWN_FLAVOR } from '../src/mail/render';
 import { withRequestBudget } from '../src/request-budget';
 import { currentRequestId } from '../src/request-id';
 const mailboxId = 'b'.repeat(24);
@@ -61,8 +62,8 @@ test('native schemas apply pagination defaults and reject caller identity, token
 });
 test('read output preserves untrusted mail as structured data and writes return actual typed references/queue acceptance', async () => {
     const f = fixture(); const read = await f.call('read_message', { mailboxId, uid: 1 }); expect(read.result.structuredContent.subject).toBe('<untrusted mail subject>'); expect(read.result._meta).toBeUndefined();
-    const created = await f.call('create_draft', { operation_id, to: [], cc: [], bcc: [], subject: 'Draft', body: { text: 'Body', html: null } }); expect(created.result.structuredContent.draft).toEqual({ mailboxId, uid: 2, version });
-    const updated = await f.call('update_draft', { operation_id, uid: 2, expected_version: version, to: [], cc: [], bcc: [], subject: 'Draft', body: { text: 'Body', html: null } }); expect(updated.result.isError).toBe(true); expect(updated.result.content[1].text).toContain('not complete success'); expect(updated.result.structuredContent.status).toBe('partial'); expect(updated.result.structuredContent.originalDeletion).toBe('unconfirmed');
+    const created = await f.call('create_draft', { operation_id, to: [], cc: [], bcc: [], subject: 'Draft', body: { text: 'Body' } }); expect(created.result.structuredContent.draft).toEqual({ mailboxId, uid: 2, version });
+    const updated = await f.call('update_draft', { operation_id, uid: 2, expected_version: version, to: [], cc: [], bcc: [], subject: 'Draft', body: { text: 'Body' } }); expect(updated.result.isError).toBe(true); expect(updated.result.content[1].text).toContain('not complete success'); expect(updated.result.structuredContent.status).toBe('partial'); expect(updated.result.structuredContent.originalDeletion).toBe('unconfirmed');
     const sent = await f.call('send_draft', { uid: 3, operation_id, expected_version: version }); expect(sent.result.structuredContent).toEqual({ status: 'queued', operation_id, queueId: 'synthetic-queue-id' }); expect(JSON.stringify(sent)).not.toContain('delivered');
 });
 test('mail exceptions redact backend messages and uncertain sends never trigger a transport resend', async () => {
@@ -108,6 +109,25 @@ test('published descriptions distinguish existing API snapshots and authored sou
     expect(description('update_draft')).toContain('legacy/observed drafts are rejected before upload'); expect(description('send_draft')).toContain('verified before dispatch'); expect(description('read_message')).toContain('potential upstream truncation');
     const read = tools.find((tool: { name: string }) => tool.name === 'read_message'); expect((read.outputSchema.anyOf ?? read.outputSchema.oneOf).find((item: { properties: { htmlOmitted: { const: boolean } } }) => item.properties.htmlOmitted.const === false).properties.textTruncated.description).toContain('potentially truncated upstream');
 });
+test('draft tools publish the three body forms, the Markdown dialect and a clear exactly-one validation error', async () => {
+    const f = fixture(); const tools = (await f.rpc('tools/list')).result.tools;
+    for (const name of ['create_draft', 'create_reply_draft', 'update_draft']) {
+        const tool = tools.find((item: { name: string }) => item.name === name);
+        expect(tool.description).toContain('exactly ONE of markdown (preferred), html or text'); expect(tool.description).toContain(MARKDOWN_FLAVOR); expect(tool.description).toContain('Spark');
+        expect(tool.description).not.toMatch(/paired|html null|HTML null/i);
+        expect(tool.inputSchema.properties.body.anyOf.map((item: { required: string[]; additionalProperties: boolean }) => [item.required, item.additionalProperties])).toEqual([[['markdown'], false], [['html'], false], [['text'], false]]);
+    }
+    expect(MARKDOWN_FLAVOR).toMatch(/CommonMark.*GFM.*markdown-it/);
+    for (const [body, expected] of [[{ markdown: 'a', text: 'a' }, 'Provide exactly one of body.markdown, body.html or body.text.'], [{}, 'Provide exactly one of body.markdown, body.html or body.text.'], [{ text: 'legacy', html: null }, 'Unrecognized key']] as const) {
+        const reply = await f.call('create_draft', { operation_id, subject: '', body });
+        expect(Boolean(reply.error || reply.result?.isError)).toBe(true); expect(JSON.stringify(reply)).toContain(expected);
+    }
+    expect(f.calls).toHaveLength(0);
+    for (const body of [{ markdown: '**Body**' }, { html: '<p>Body</p>' }, { text: 'Body' }]) {
+        const created = await f.call('create_draft', { operation_id, subject: '', body }); expect(created.result.structuredContent.status).toBe('completed');
+    }
+    expect(f.calls.map(call => (call.input as { body: unknown }).body)).toEqual([{ markdown: '**Body**' }, { html: '<p>Body</p>' }, { text: 'Body' }]);
+});
 test('read errors never prescribe operation IDs or write ambiguity handling', async () => {
     const inputs = { list_mailboxes: {}, list_messages: { mailboxId }, search_messages: { subject: 'Requested search' }, read_message: { mailboxId, uid: 1 }, read_attachment: { mailboxId, uid: 1, attachmentId: 'ATT1' } };
     for (const name of Object.keys(inputs) as (keyof typeof inputs)[]) {
@@ -122,7 +142,7 @@ test('read errors never prescribe operation IDs or write ambiguity handling', as
     expect(unavailable).toContain('search is temporarily unavailable'); expect(unavailable).not.toMatch(/timeout|timed out/i); expect(searches).toEqual([{ subject: 'Requested search', limit: 20, searchMode: 'fast' }]);
 });
 test('write temporary and verification failures retain conservative same-operation retry guidance', async () => {
-    const inputs = { create_draft: { operation_id, subject: '', body: { text: '', html: null } }, update_draft: { uid: 1, expected_version: version, operation_id, subject: 'Change' }, delete_draft: { uid: 1, expected_version: version, operation_id }, send_draft: { uid: 1, expected_version: version, operation_id }, move_message: { mailboxId, uid: 1, destinationMailboxId: 'c'.repeat(24), expected_version: version, operation_id }, update_message_flags: { mailboxId, uid: 1, expected_version: version, operation_id, seen: false } };
+    const inputs = { create_draft: { operation_id, subject: '', body: { text: '' } }, update_draft: { uid: 1, expected_version: version, operation_id, subject: 'Change' }, delete_draft: { uid: 1, expected_version: version, operation_id }, send_draft: { uid: 1, expected_version: version, operation_id }, move_message: { mailboxId, uid: 1, destinationMailboxId: 'c'.repeat(24), expected_version: version, operation_id }, update_message_flags: { mailboxId, uid: 1, expected_version: version, operation_id, seen: false } };
     for (const name of Object.keys(inputs) as (keyof typeof inputs)[]) {
         for (const code of ['temporarily_unavailable', 'upstream_timeout', 'verification_failed'] as const) {
             const f = fixture(); f.mail[name] = async () => { throw new MailError(code); };
@@ -139,7 +159,7 @@ test('actual upstream timeout reports read budget exhaustion without guessing ge
 
 test('durable preflight timeout receipts retain explicit same-operation guidance', async () => {
     const f = fixture(); f.mail.create_draft = async input => ({ status: 'failed', operation_id: input.operation_id, reason: 'upstream_timeout' });
-    const result = (await f.call('create_draft', { operation_id, subject: '', body: { text: '', html: null } })).result;
+    const result = (await f.call('create_draft', { operation_id, subject: '', body: { text: '' } })).result;
     expect(result.isError).toBe(true); expect(result.structuredContent.reason).toBe('upstream_timeout'); expect(result.content[1].text).toContain('same operation_id');
 });
 

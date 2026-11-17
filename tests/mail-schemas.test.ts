@@ -6,7 +6,7 @@ import { mailInputSchemas, mailOutputSchemas, draftContentSchema, inputAddressSc
 const mailboxId = 'a'.repeat(24), otherMailbox = 'b'.repeat(24);
 const operation_id = '061a78f9-14bd-4bb9-849d-5f6a3f304612', expected_version = 'v'.repeat(43);
 const target = { uid: 1, expected_version, operation_id };
-const body = { text: 'First line\nSecond line\r\nThird line', html: null };
+const body = { text: 'First line\nSecond line\r\nThird line' };
 const draft = { to: [{ address: 'recipient@example.invalid', name: 'Recipient' }], subject: 'Hello', body };
 const attachment = { filename: 'hello.txt', contentType: 'text/plain', contentBase64: Buffer.from('hello').toString('base64') };
 const ref = { mailboxId, uid: 2, version: expected_version };
@@ -65,23 +65,57 @@ test('search requires a meaningful filter, preserves false, and rejects rather t
     expect(mailInputSchemas.search_messages.safeParse({ receivedSince: '2026-10-26T01:00:00+02:00', receivedUntil: '2026-10-25T23:30:00Z' }).success).toBe(true);
     for (const value of [{ receivedSince: '2026-02-30T12:00:00Z' }, { receivedSince: '2026-10-26' }, { receivedSince: '2026-10-26T12:00:00' }, { receivedSince: '2026-10-26T00:00:01Z', receivedUntil: '2026-10-26T00:00:00Z' }]) { expect(mailInputSchemas.search_messages.safeParse(value).success).toBe(false); }
 });
-test('create uses paired rich body; patches preserve omitted fields and explicitly allow recipient clearing', () => {
+test('create takes one body form; patches preserve omitted fields and explicitly allow recipient clearing', () => {
     expect(mailInputSchemas.create_draft.parse({ ...draft, operation_id })).toEqual({ ...draft, cc: [], bcc: [], attachments: [], operation_id });
     expect(mailInputSchemas.create_draft.safeParse({ ...draft, operation_id, from: { address: 'owner@example.invalid' }, replyTo: [] }).success).toBe(true);
     expect(mailInputSchemas.update_draft.parse({ ...target, subject: 'Changed' })).toEqual({ ...target, subject: 'Changed' });
     expect(mailInputSchemas.update_draft.parse({ ...target, to: [] })).toEqual({ ...target, to: [] });
-    for (const patch of [{}, { attachments: [] }, { deleteAttachmentIds: [] }, { body: { text: '' } }, { body: { html: '' } }, { text: 'legacy replacement' }, { deleteAttachmentIds: ['ATT1', 'ATT1'] }]) { expect(mailInputSchemas.update_draft.safeParse({ ...target, ...patch }).success).toBe(false); }
-    expect(mailInputSchemas.update_draft.safeParse({ ...target, body: { text: '', html: '<b>new</b>' }, deleteAttachmentIds: ['ATT1'] }).success).toBe(true);
-    for (const fields of [{ raw: 'MIME' }, { mailboxId }, { storageId: 'file' }, { html: '<b>legacy</b>' }]) { expect(mailInputSchemas.create_draft.safeParse({ ...draft, operation_id, ...fields }).success).toBe(false); }
+    for (const patch of [{}, { attachments: [] }, { deleteAttachmentIds: [] }, { body: {} }, { body: { text: '', html: null } }, { body: { text: '', html: '<b>new</b>' } }, { text: 'legacy replacement' }, { deleteAttachmentIds: ['ATT1', 'ATT1'] }]) { expect(mailInputSchemas.update_draft.safeParse({ ...target, ...patch }).success).toBe(false); }
+    for (const value of [{ markdown: '**new**' }, { html: '<b>new</b>' }, { text: '' }]) { expect(mailInputSchemas.update_draft.parse({ ...target, body: value, deleteAttachmentIds: ['ATT1'] }).body).toEqual(value); }
+    for (const fields of [{ raw: 'MIME' }, { mailboxId }, { storageId: 'file' }, { html: '<b>legacy</b>' }, { markdown: 'top-level legacy' }]) { expect(mailInputSchemas.create_draft.safeParse({ ...draft, operation_id, ...fields }).success).toBe(false); }
 });
-test('outbound headers reject injections and UTF-8 overflow while paired bodies preserve newlines', () => {
+test('body accepts exactly one of markdown, html or text with per-form UTF-8 bounds and a clear error', () => {
+    const reply = { original: { mailboxId, uid: 1 }, operation_id };
+    const parsers = [(value: unknown) => mailInputSchemas.create_draft.safeParse({ ...draft, operation_id, body: value }), (value: unknown) => mailInputSchemas.create_reply_draft.safeParse({ ...reply, body: value }), (value: unknown) => mailInputSchemas.update_draft.safeParse({ ...target, body: value })];
+    for (const parse of parsers) {
+        for (const value of [{ markdown: '# Hi\n*there*' }, { html: '<p>Hi</p>' }, { text: 'Hi\nthere' }, { markdown: '' }]) { const result = parse(value); expect(result.success).toBe(true); expect(result.data?.body).toEqual(value); }
+        for (const value of [{ markdown: 'a', html: '<p>a</p>' }, { markdown: 'a', text: 'a' }, { html: '<p>a</p>', text: 'a' }, { markdown: 'a', html: 'b', text: 'c' }, {}, { body: 'a' }, { markdown: 'a', extra: 1 }, { text: 'legacy', html: null }, { text: 'legacy', html: '<p>legacy</p>' }, { markdown: null }, { text: 5 }, 'plain string', null]) {
+            expect(parse(value).success).toBe(false);
+        }
+    }
+    const message = (value: unknown) => mailInputSchemas.create_draft.safeParse({ ...draft, operation_id, body: value }).error?.issues.map(issue => issue.message).join(' | ');
+    for (const value of [{ markdown: 'a', html: 'b' }, {}, { unknown: 'x' }]) { expect(message(value)).toBe('Provide exactly one of body.markdown, body.html or body.text.'); }
+    expect(message({ text: 'legacy', html: null })).toContain('"html"');
+    for (const [key, maximum] of [['markdown', MAX_DRAFT_TEXT_BYTES], ['text', MAX_DRAFT_TEXT_BYTES], ['html', MAX_HTML_BYTES]] as const) {
+        expect(draftContentSchema.safeParse({ ...draft, body: { [key]: 'é'.repeat(maximum / 2) } }).success).toBe(true);
+        expect(message({ [key]: 'é'.repeat(maximum / 2 + 1) })).toContain(`At most ${maximum} UTF-8 bytes.`);
+    }
+    expect(MAX_DRAFT_TEXT_BYTES).toBe(128 * 1024); expect(MAX_HTML_BYTES).toBe(256 * 1024);
+});
+test('body JSON Schema is an anyOf of three strict single-key objects, each described', () => {
+    for (const name of ['create_draft', 'create_reply_draft', 'update_draft'] as const) {
+        const json = mailInputSchemas[name]['~standard'].jsonSchema.input({ target: 'draft-2020-12' }) as { properties: { body: { description: string; anyOf: Array<{ type: string; properties: Record<string, { type: string; maxLength: number; description: string }>; required: string[]; additionalProperties: boolean }> } } };
+        const schema = json.properties.body;
+        expect(schema.description).toContain('Exactly one of markdown (preferred), html or text');
+        expect(schema.anyOf.map(item => Object.keys(item.properties))).toEqual([['markdown'], ['html'], ['text']]);
+        for (const item of schema.anyOf) {
+            const [key] = Object.keys(item.properties) as [string];
+            expect(item).toMatchObject({ type: 'object', required: [key], additionalProperties: false });
+            expect(item.properties[key]).toMatchObject({ type: 'string', maxLength: key === 'html' ? MAX_HTML_BYTES : MAX_DRAFT_TEXT_BYTES });
+            expect(item.properties[key]?.description.length).toBeGreaterThan(10);
+        }
+        expect(schema.anyOf[0]?.properties.markdown?.description).toContain('Preferred');
+    }
+});
+test('outbound headers reject injections and UTF-8 overflow while bodies preserve newlines', () => {
     for (const injection of ['hello\rX-Forged: yes', 'hello\nX-Forged: yes', 'hello\0suffix']) {
         expect(draftContentSchema.safeParse({ ...draft, subject: injection }).success).toBe(false);
         expect(inputAddressSchema.safeParse({ address: 'recipient@example.invalid', name: injection }).success).toBe(false);
     }
     for (const address of ['not an email', 'a@example.invalid\r\nBcc: other@example.invalid', '', 'name <address@example.invalid>']) { expect(inputAddressSchema.safeParse({ address }).success).toBe(false); }
-    expect(draftContentSchema.safeParse({ ...draft, subject: 'é'.repeat(MAX_SUBJECT_BYTES / 2), body: { text: 'é'.repeat(MAX_DRAFT_TEXT_BYTES / 2), html: 'x'.repeat(MAX_HTML_BYTES) } }).success).toBe(true);
-    for (const fields of [{ subject: 'é'.repeat(MAX_SUBJECT_BYTES / 2 + 1) }, { body: { text: 'é'.repeat(MAX_DRAFT_TEXT_BYTES / 2 + 1), html: null } }, { body: { text: '', html: 'é'.repeat(MAX_HTML_BYTES / 2 + 1) } }]) { expect(draftContentSchema.safeParse({ ...draft, ...fields }).success).toBe(false); }
+    expect(draftContentSchema.parse(draft).body).toEqual(body);
+    for (const value of [{ text: 'é'.repeat(MAX_DRAFT_TEXT_BYTES / 2) }, { markdown: 'é'.repeat(MAX_DRAFT_TEXT_BYTES / 2) }, { html: 'x'.repeat(MAX_HTML_BYTES) }]) { expect(draftContentSchema.safeParse({ ...draft, subject: 'é'.repeat(MAX_SUBJECT_BYTES / 2), body: value }).success).toBe(true); }
+    for (const fields of [{ subject: 'é'.repeat(MAX_SUBJECT_BYTES / 2 + 1) }, { body: { text: 'é'.repeat(MAX_DRAFT_TEXT_BYTES / 2 + 1) } }, { body: { markdown: 'é'.repeat(MAX_DRAFT_TEXT_BYTES / 2 + 1) } }, { body: { html: 'é'.repeat(MAX_HTML_BYTES / 2 + 1) } }]) { expect(draftContentSchema.safeParse({ ...draft, ...fields }).success).toBe(false); }
     const many = Array.from({ length: 50 }, () => ({ address: 'recipient@example.invalid' }));
     expect(draftContentSchema.safeParse({ ...draft, to: many, cc: many }).success).toBe(true);
     expect(draftContentSchema.safeParse({ ...draft, to: many, cc: many, bcc: [many[0]] }).success).toBe(false);

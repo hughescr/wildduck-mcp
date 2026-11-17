@@ -25,8 +25,11 @@
     "@hono/aws-lambda": "^1.0.1",
     "@modelcontextprotocol/server": "^2.4.0",
     "@zone-eu/mailsplit": "5.4.20",
+    "entities": "4.5.0",
     "hono": "^4.13.14",
+    "htmlparser2": "10.1.0",
     "libmime": "5.6.3",
+    "markdown-it": "15.0.3",
     "nodemailer": "10.1.4",
     "zod": "^4.6.7"
   },

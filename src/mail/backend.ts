@@ -10,6 +10,7 @@ import { MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS, type AttachmentDownloadStager 
 import { deriveReply } from './reply';
 import { ownedIdentityMatcher } from './identities';
 import { createMime, inspectSource, preparePatch, verifyCandidate, MimeError, MIME_LIMITS, type MimeEnvelope } from './mime';
+import { renderBody } from './render';
 
 const META_BYTES = 512 * 1024;
 const MESSAGE_BYTES = 4 * 1024 * 1024;
@@ -540,6 +541,9 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         const parsed = mailInputSchemas.create_reply_draft.safeParse(input); if (!parsed.success) { throw new MailError('invalid_input'); }
         const data = parsed.data;
         try {
+            // Render first: a renderer failure stays preflight and needs no upstream I/O.
+            // Any quote is appended to the rendered parts by deriveReply, never to Markdown.
+            const body = renderBody(data.body);
             const [snapshot, identities, mailbox] = await Promise.all([this.rawMessage(session, data.original), this.ownedIdentities(session), this.resolveDraftMailbox(session)]);
             const original = this.projectMessage(snapshot, data.original);
             // SMTP recipient evidence handles Bcc delivery and takes precedence
@@ -554,7 +558,7 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
                 return owned === undefined ? undefined : this.stripReplySuffix ? owned : address;
             }).find(address => address !== undefined && identities.match(address) !== undefined);
             const from = this.selectFrom(identities, data.from ?? (selected ? { address: selected, ...(identities.name ? { name: identities.name } : {}) } : undefined));
-            const reply = deriveReply({ original: original.message, ownedAddresses: identities.ownedAddresses, isOwnedAddress: address => identities.match(address) !== undefined, mode: data.mode, body: data.body, quoteOriginal: data.quoteOriginal, ...(data.to === undefined && data.cc === undefined ? {} : { recipients: { to: data.to ?? [], cc: data.cc ?? [] } }) });
+            const reply = deriveReply({ original: original.message, ownedAddresses: identities.ownedAddresses, isOwnedAddress: address => identities.match(address) !== undefined, mode: data.mode, body, quoteOriginal: data.quoteOriginal, ...(data.to === undefined && data.cc === undefined ? {} : { recipients: { to: data.to ?? [], cc: data.cc ?? [] } }) });
             const mime = await createMime({ ...reply, from, attachments: data.attachments });
             const envelope = outbound(mime.envelope); if (envelope.from !== from.address) { throw new MailError('unsupported_content'); }
             const prepared: PreparedDraft = { mailboxId: mailbox.mailboxId, mime, marker };
@@ -569,8 +573,9 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         sessionValid(session); this.checkMarker(session, marker);
         const parsed = draftContentSchema.safeParse(input); if (!parsed.success) { throw new MailError('invalid_input'); }
         try {
+            const body = renderBody(parsed.data.body);
             const [mailbox, from] = await Promise.all([this.resolveDraftMailbox(session), this.ownedFrom(session, parsed.data.from)]);
-            const mime = await createMime({ ...parsed.data, from });
+            const mime = await createMime({ ...parsed.data, from, body });
             const envelope = outbound(mime.envelope); if (envelope.from !== from.address) { throw new MailError('unsupported_content'); }
             const prepared: PreparedDraft = { mailboxId: mailbox.mailboxId, mime, marker };
             this.preparations.set(prepared, { accountId: session.accountId, envelope,
@@ -584,6 +589,8 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         const parsed = mailInputSchemas.update_draft.safeParse({ ...patch, uid: snapshot.message.uid, expected_version: snapshot.message.version, operation_id: marker.operationId });
         if (!parsed.success) { throw new MailError('invalid_input'); }
         try {
+            // A body patch replaces the whole body; only the rendered parts are stored.
+            const body = parsed.data.body === undefined ? undefined : renderBody(parsed.data.body);
             const bytes = await this.authoredBytes(session, snapshot, trusted);
             const mailbox = await this.resolveDraftMailbox(session); if (mailbox.mailboxId !== snapshot.message.mailboxId) { throw new MailError('unsupported_draft'); }
             // Raw upload cannot copy received SMTP provenance, expiration or queue/authentication state.
@@ -591,7 +598,7 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
             if (!supportedDraftState(state.raw)) { throw new MailError('unsupported_content'); }
             if (patch.deleteAttachmentIds?.length && Array.isArray(state.raw['files']) && state.raw['files'].length > 0) { throw new MailError('unsupported_content'); }
             const source = await inspectSource(bytes, (state.raw['attachments'] as Json[]).map(item => ({ attachmentId: string(item['id']), hash: string(item['hash']) })));
-            const mime = await preparePatch(source, patch);
+            const mime = await preparePatch(source, { ...patch, body });
             const envelope = outbound(mime.envelope); await this.ownedFrom(session, { address: envelope.from });
             const flags = strings(state.raw['flags']); const labels = strings(state.raw['labels']);
             if (flags.some(flag => !/^\\(?:draft|deleted)$/iu.test(flag) && !addFlagSchema.safeParse(flag).success) || labels.some(label => !labelSchema.safeParse(label).success)) { throw new MailError('unsupported_content'); }
