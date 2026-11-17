@@ -20,7 +20,7 @@
     "@aws-sdk/client-ssm": "^3.1169.0",
     "@aws-sdk/lib-dynamodb": "^3.1169.0",
     "@aws-sdk/s3-request-presigner": "^3.1169.0",
-    "@better-auth/cimd": "^1.7.23",
+    "@better-auth/cimd": "^1.7.25",
     "@hapi/address": "5.1.1",
     "@hono/aws-lambda": "^1.0.1",
     "@modelcontextprotocol/server": "^2.4.0",
