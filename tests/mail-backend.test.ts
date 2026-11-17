@@ -15,6 +15,7 @@ import { createMime } from '../src/mail/mime';
 import { authoredParts, authoredText } from './mime-text';
 import { decodedAddresses, partViews } from './mime-fields';
 import { memoryOperations } from './wildduck-fake';
+import { steppedClock } from './dynamo-virtual';
 /** get_attachment_download always stages a streamed attachment source. */
 const attachmentSource = (source: DownloadSource): AttachmentDownloadSource => { if (!('open' in source)) { throw new Error('expected an attachment source'); } return source; };
 const accountId = 'a'.repeat(24); const mailboxId = 'b'.repeat(24); const token = 'c'.repeat(40);
@@ -82,7 +83,9 @@ async function parsedMime(source: Buffer) {
     await pipeline(Readable.from([source]), splitter, streamer, new Writable({ objectMode: true, write(_chunk, _encoding, done) { done(); } }));
     return { subject, text: text.join('\n'), html };
 }
-function model(aliases: string[] = [], options: Pick<MailBackendOptions, 'onDraftVerificationDiagnostic' | 'dotAsPlus' | 'stripReplySuffix'> = {}, primary = 'sender@example.com', accountName: unknown = 'Sender') {
+/** A request the test answers itself instead of the fake: (method, path after /users/:id) -> a response, or undefined to fall through. */
+type Intercept = (method: string, path: string) => Response | Promise<Response> | undefined;
+function model(aliases: string[] = [], options: Pick<MailBackendOptions, 'onDraftVerificationDiagnostic' | 'dotAsPlus' | 'stripReplySuffix' | 'timeoutMs'> = {}, primary = 'sender@example.com', accountName: unknown = 'Sender', intercept?: Intercept) {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const previous = new Map<number, ReturnType<typeof message>>(); let nextUid = 13;
     let source: Buffer = originalSource;
@@ -93,6 +96,7 @@ function model(aliases: string[] = [], options: Pick<MailBackendOptions, 'onDraf
         expect(parsed.origin).toBe(WILDDUCK_ORIGIN); expect(new Headers(init?.headers).get('X-Access-Token')).toBe(token); expect(init?.redirect).toBe('error');
         const prefix = `/users/${accountId}`; const path = parsed.pathname.slice(prefix.length);
         expect(parsed.pathname.startsWith(prefix)).toBe(true);
+        const answered = intercept?.(init?.method ?? 'GET', path); if (answered !== undefined) { return answered; }
         if (path === '') { return Response.json({ success: true, id: accountId, address: primary, name: accountName, fromWhitelist: ['alias@example.com'] }); }
         if (path === '/addresses') { return Response.json({ success: true, results: aliases.map(address => ({ id: 'e'.repeat(24), address })) }); }
         if (path === '/mailboxes') { return Response.json({ success: true, results: [{ id: mailboxId, path: 'Server-specific Drafts', specialUse: '\\Drafts' }] }); }
@@ -623,14 +627,20 @@ test('one sanitized diagnostic distinguishes deadline, network, HTTP, JSON, shap
     }
 });
 test('body and validation timings are retained and throwing logger or late fetch cannot change results or log twice', async () => {
-    const logs: SearchDiagnostic[] = [];
-    const backend = createMailBackend({ timeoutMs: 100, onSearchDiagnostic: value => { logs.push(value); throw new Error('logger failure'); }, fetch: (async _url => new Response(new ReadableStream({ async start(controller) { await pause(8); controller.enqueue(new TextEncoder().encode('{"success":true,"results":[]}')); controller.close(); } }), { headers: { 'content-type': 'application/json' } })) as typeof fetch });
-    expect(await backend.searchMessages(session, { subject: 'synthetic', limit: 1 })).toEqual({ messages: [], search: fastSearch });
-    expect(logs[0]?.bodyMs).toBeGreaterThanOrEqual(5); expect(logs[0]?.validationMs).toBeGreaterThanOrEqual(0);
-    const late: SearchDiagnostic[] = [];
-    const slow = createMailBackend({ timeoutMs: 5, onSearchDiagnostic: value => { late.push(value); }, fetch: (async _url => { await pause(20); return Response.json({ success: true, results: [] }); }) as typeof fetch });
+    const logs: SearchDiagnostic[] = []; const clock = steppedClock();
+    try {
+        // The body is only pulled once the transport reads it, after it recorded the headers' arrival; the pull then moves the clock 8 ms, so bodyMs is exactly that much, with no real waiting.
+        const body = () => new ReadableStream({ pull(controller) { clock.state.skew += 8; controller.enqueue(new TextEncoder().encode('{"success":true,"results":[]}')); controller.close(); } }, { highWaterMark: 0 });
+        const backend = createMailBackend({ timeoutMs: 100, onSearchDiagnostic: value => { logs.push(value); throw new Error('logger failure'); }, fetch: (async _url => new Response(body(), { headers: { 'content-type': 'application/json' } })) as typeof fetch });
+        expect(await backend.searchMessages(session, { subject: 'synthetic', limit: 1 })).toEqual({ messages: [], search: fastSearch });
+        expect(logs[0]?.bodyMs).toBeGreaterThanOrEqual(8); expect(logs[0]?.validationMs).toBeGreaterThanOrEqual(0);
+    } finally { clock.restore(); }
+    // The late answer is released by the test only after the request has timed out, so the order of the two never depends on timers.
+    const late: SearchDiagnostic[] = []; let release = () => {}; const gate = new Promise<void>(resolve => { release = resolve; });
+    const slow = createMailBackend({ timeoutMs: 5, onSearchDiagnostic: value => { late.push(value); }, fetch: (async _url => { await gate; return Response.json({ success: true, results: [] }); }) as typeof fetch });
     await errorCode(slow.searchMessages(session, { subject: 'synthetic', limit: 1 }), 'upstream_timeout');
-    const first = JSON.stringify(late); await pause(30); expect(late).toHaveLength(1); expect(JSON.stringify(late)).toBe(first);
+    const first = JSON.stringify(late); release(); for (let turn = 0; turn < 5; turn++) { await pause(0); }
+    expect(late).toHaveLength(1); expect(JSON.stringify(late)).toBe(first);
 });
 
 test('search false predicates never become silently ignored broad queries', async () => {
@@ -1355,4 +1365,125 @@ test('public mailbox listing requests counters once for 49 folders and preserves
     expect(new URL(f.calls[0]?.url ?? '').searchParams.get('counters')).toBe('true'); expect(f.calls).toHaveLength(1); expect(result.mailboxes).toHaveLength(49);
     expect(result.mailboxes[0]).toMatchObject({ total: 0, unseen: 0 }); expect(result.mailboxes[2]).not.toHaveProperty('total'); expect(result.mailboxes[2]).not.toHaveProperty('unseen');
     expect(result.mailboxes[48]).toMatchObject({ total: 1, unseen: 48 });
+});
+// WildDuck write failures: which ones prove the requested change did not happen (MailError.notApplied) and which prove nothing.
+const upstreamError = (status: number, code?: string) => Response.json({ error: `private ${token}`, ...(code === undefined ? {} : { code }) }, { status });
+const hang = () => new Promise<Response>(() => {});
+const otherMailbox = 'd'.repeat(24); const messagePath = `/mailboxes/${mailboxId}/messages/12`; const movedPath = `/mailboxes/${otherMailbox}/messages/42`;
+async function failure(action: Promise<unknown>): Promise<MailError> {
+    try { await action; } catch (error) { expect(error).toBeInstanceOf(MailError); return error as MailError; }
+    throw new Error('Expected failure');
+}
+const moveMarker = { ...marker, tool: 'move_message' as const }; const flagMarker = { ...marker, tool: 'update_message_flags' as const }; const sendMarker = { ...marker, tool: 'send_draft' as const };
+type Fixture = ReturnType<typeof model>; type Snapshot = Awaited<ReturnType<Fixture['backend']['inspectMessage']>>;
+const move = (f: Fixture, snapshot: Snapshot) => f.backend.moveMessage(session, snapshot, otherMailbox, moveMarker);
+const flag = (f: Fixture, snapshot: Snapshot, extra: { addFlags?: string[] } = {}) => f.backend.updateMessageFlags(session, snapshot, { ...target, expectedVersion: snapshot.message.version, operationId: marker.operationId, seen: true, ...extra }, flagMarker);
+const puts = (f: Fixture) => f.calls.filter(call => call.init.method === 'PUT').length;
+test('move and flag failures before the PUT are notApplied and send no mutating request', async () => {
+    const hooks: Array<[string, Intercept]> = [['destination read', (_method, path) => path === `/mailboxes/${otherMailbox}` ? upstreamError(500, 'InternalDatabaseError') : undefined], ['source read', (_method, path) => path.endsWith('/message.eml') ? upstreamError(503) : undefined]];
+    for (const [name, hook] of hooks) {
+        const f = model([], {}, 'sender@example.com', 'Sender', hook); const snapshot = await f.backend.inspectMessage(session, target);
+        const error = await failure(move(f, snapshot)); expect(error.code).toBe('temporarily_unavailable'); expect(error.notApplied).toBe(true); expect(puts(f)).toBe(0);
+        if (name === 'destination read') { expect(error.upstreamCode).toBe('InternalDatabaseError'); }
+        if (name !== 'source read') { continue; }
+        const flags = model([], {}, 'sender@example.com', 'Sender', hook); const marked = await flags.backend.inspectMessage(session, target);
+        const flagError = await failure(flag(flags, marked)); expect(flagError.code).toBe('temporarily_unavailable'); expect(flagError.notApplied).toBe(true); expect(puts(flags)).toBe(0);
+    }
+    const f = model(); const snapshot = await f.backend.inspectMessage(session, target);
+    const invalid = await failure(flag(f, snapshot, { addFlags: ['\\Draft'] })); expect(invalid.code).toBe('invalid_input'); expect(invalid.notApplied).toBe(true);
+    const same = await failure(f.backend.moveMessage(session, snapshot, mailboxId, moveMarker)); expect(same.code).toBe('invalid_input'); expect(same.notApplied).toBe(true); expect(puts(f)).toBe(0);
+});
+test('a move or flag failure after the PUT was sent proves nothing: timeout, 5xx, 429, 404 without the MessageNotFound code, malformed answer', async () => {
+    const cases: Array<[string, Intercept, string, string | undefined]> = [
+        ['timeout', (method) => method === 'PUT' ? hang() : undefined, 'upstream_timeout', undefined],
+        ['5xx', (method) => method === 'PUT' ? upstreamError(500, 'InternalDatabaseError') : undefined, 'temporarily_unavailable', 'InternalDatabaseError'],
+        ['429', (method) => method === 'PUT' ? upstreamError(429, 'RateLimitedError') : undefined, 'temporarily_unavailable', 'RateLimitedError'],
+        ['404 NoSuchMailbox', (method) => method === 'PUT' ? upstreamError(404, 'NoSuchMailbox') : undefined, 'not_found', 'NoSuchMailbox'],
+        ['404 without code', (method) => method === 'PUT' ? upstreamError(404) : undefined, 'not_found', undefined],
+        ['MessageNotFound with a 5xx status', (method) => method === 'PUT' ? upstreamError(500, 'MessageNotFound') : undefined, 'temporarily_unavailable', 'MessageNotFound'],
+        ['malformed success', (method) => method === 'PUT' ? Response.json({ success: true }) : undefined, 'verification_failed', undefined]];
+    for (const [name, hook, code, upstreamCode] of cases) {
+        for (const tool of ['move', 'flags'] as const) {
+            const f = model([], { timeoutMs: 50 }, 'sender@example.com', 'Sender', hook); const snapshot = await f.backend.inspectMessage(session, target);
+            const error = await failure(tool === 'move' ? move(f, snapshot) : flag(f, snapshot)); expect([name, tool, error.code]).toEqual([name, tool, code]);
+            expect([name, tool, error.notApplied]).toEqual([name, tool, undefined]); expect([name, tool, error.upstreamCode]).toEqual([name, tool, upstreamCode]); expect(puts(f)).toBe(1);
+        }
+    }
+});
+test('MessageNotFound with status 404 from the message PUT or DELETE is notApplied, nothing else is', async () => {
+    for (const tool of ['move', 'flags'] as const) {
+        const f = model([], {}, 'sender@example.com', 'Sender', (method) => method === 'PUT' ? upstreamError(404, 'MessageNotFound') : undefined); const snapshot = await f.backend.inspectMessage(session, target);
+        const error = await failure(tool === 'move' ? move(f, snapshot) : flag(f, snapshot)); expect(error.code).toBe('not_found'); expect(error.upstreamCode).toBe('MessageNotFound'); expect(error.notApplied).toBe(true); expect(puts(f)).toBe(1);
+    }
+    const gone = fixture([upstreamError(404, 'MessageNotFound')]); const deleted = await failure(gone.backend.deleteDraft(session, target)); expect(deleted.code).toBe('not_found'); expect(deleted.notApplied).toBe(true); expect(gone.calls).toHaveLength(1);
+    for (const response of [upstreamError(404, 'NoSuchMailbox'), upstreamError(404), upstreamError(500, 'InternalDatabaseError')]) { const f = fixture([response]); expect((await failure(f.backend.deleteDraft(session, target))).notApplied).toBeUndefined(); expect(f.calls).toHaveLength(1); }
+});
+test('send_draft stamp: notApplied only before the PUT, on a definite refusal, or after an acknowledged PUT; a PUT that may still land stays unset', async () => {
+    const source = authored();
+    const stamp = (f: Fixture, snapshot: Snapshot) => f.backend.stampSendMarker(session, snapshot, sendMarker, source);
+    let afterPut = false;
+    const readFailsAfterPut: Intercept = (method, path) => { if (method === 'PUT') { afterPut = true; return undefined; } return afterPut && path.endsWith('/message.eml') ? upstreamError(503) : undefined; };
+    const cases: Array<[string, Intercept, string, boolean, number]> = [
+        ['source read before the stamp', (_method, path) => path.endsWith('/message.eml') ? upstreamError(503) : undefined, 'temporarily_unavailable', true, 0],
+        ['stamp PUT answered MessageNotFound', (method) => method === 'PUT' ? upstreamError(404, 'MessageNotFound') : undefined, 'not_found', true, 1],
+        ['stamp PUT updated nothing', (method) => method === 'PUT' ? Response.json({ success: true, updated: 0 }) : undefined, 'verification_failed', true, 1],
+        ['stamp verification read failed after the acknowledged PUT', readFailsAfterPut, 'temporarily_unavailable', true, 1],
+        ['stamp PUT answered 500', (method) => method === 'PUT' ? upstreamError(500, 'InternalDatabaseError') : undefined, 'temporarily_unavailable', false, 1],
+        ['stamp PUT answered 429', (method) => method === 'PUT' ? upstreamError(429, 'RateLimitedError') : undefined, 'temporarily_unavailable', false, 1],
+        ['stamp PUT answered MessageNotFound with a 5xx status', (method) => method === 'PUT' ? upstreamError(500, 'MessageNotFound') : undefined, 'temporarily_unavailable', false, 1],
+        ['stamp PUT answered a malformed success', (method) => method === 'PUT' ? Response.json({ updated: 1 }) : undefined, 'temporarily_unavailable', false, 1],
+        ['stamp PUT timed out', (method) => method === 'PUT' ? hang() : undefined, 'upstream_timeout', false, 1]];
+    for (const [name, hook, code, expected, sent] of cases) {
+        afterPut = false; const f = model([], { timeoutMs: 50 }, 'sender@example.com', 'Sender', hook); const snapshot = await f.backend.inspectMessage(session, target);
+        const error = await failure(stamp(f, snapshot)); expect([name, error.code]).toEqual([name, code]); expect([name, error.notApplied]).toEqual([name, expected ? true : undefined]);
+        expect([name, puts(f)]).toEqual([name, sent]); expect(f.calls.some(call => call.init.method === 'POST')).toBe(false);
+    }
+});
+test('submit POST answers that WildDuck returns before queueing are notApplied, with their own status only', async () => {
+    for (const [status, code, expected] of [[400, 'MessageNotDraft', 'invalid_input'], [403, 'TooMany', 'forbidden'], [403, 'RateLimitedError', 'forbidden'], [403, 'UserDisabled', 'forbidden'], [404, 'UserNotFound', 'not_found']] as const) {
+        const f = fixture([upstreamError(status, code)]); const error = await failure(f.backend.submitDraft(session, target));
+        expect(error.code).toBe(expected); expect(error.upstreamCode).toBe(code); expect(error.notApplied).toBe(true); expect(f.calls).toHaveLength(1);
+        const wrongStatus = fixture([upstreamError(status === 403 ? 500 : 403, code)]); expect((await failure(wrongStatus.backend.submitDraft(session, target))).notApplied).toBeUndefined();
+    }
+});
+test('submit POST failures that can follow queueing leave notApplied unset', async () => {
+    const answers: Array<[string, Response, MailFailureCode, string | undefined]> = [
+        ['5xx', upstreamError(500, 'InternalDatabaseError'), 'temporarily_unavailable', 'InternalDatabaseError'], ['502 without a JSON code', upstreamError(502), 'temporarily_unavailable', undefined],
+        ['429', upstreamError(429, 'RateLimitedError'), 'temporarily_unavailable', 'RateLimitedError'], ['404 NoSuchMailbox', upstreamError(404, 'NoSuchMailbox'), 'not_found', 'NoSuchMailbox'],
+        ['404 MessageNotFound', upstreamError(404, 'MessageNotFound'), 'not_found', 'MessageNotFound'], ['404 without a code', upstreamError(404), 'not_found', undefined],
+        ['403 InvalidToken', upstreamError(403, 'InvalidToken'), 'reconnect_required', 'InvalidToken'], ['403 code that is not a token', Response.json({ code: 'rate limited!' }, { status: 403 }), 'forbidden', undefined],
+        ['redirect', new Response('', { status: 302, headers: { location: 'https://evil.example' } }), 'temporarily_unavailable', undefined], ['bad queueId', Response.json({ success: true, queueId: 'bad queue' }), 'temporarily_unavailable', undefined],
+        ['bad sent message', Response.json({ success: true, queueId: 'queue-1', message: { id: 'x' } }), 'verification_failed', undefined], ['queueId empty', Response.json({ success: true, queueId: '' }), 'temporarily_unavailable', undefined], ['success without queueId', Response.json({ success: true }), 'temporarily_unavailable', undefined]];
+    for (const [name, response, code, upstreamCode] of answers) {
+        const f = fixture([response]); const error = await failure(f.backend.submitDraft(session, target));
+        expect([name, error.code, error.upstreamCode, error.notApplied]).toEqual([name, code, upstreamCode, undefined]); expect(f.calls).toHaveLength(1);
+    }
+    let count = 0; const slow = createMailBackend({ timeoutMs: 5, fetch: (async (_url, _init) => { count++; return await hang(); }) as typeof fetch });
+    const timeout = await failure(slow.submitDraft(session, target)); expect(timeout.code).toBe('upstream_timeout'); expect(timeout.notApplied).toBeUndefined(); expect(count).toBe(1);
+});
+test('a failed verification GET after a mutation is retried once; the mutating request is sent once', async () => {
+    const failOnce = (match: (method: string, path: string) => boolean, how: () => Response | Promise<Response>) => { let after = false; let done = false; return ((method, path) => { if (method === 'PUT' || method === 'POST') { after = true; return undefined; } if (after && !done && match(method, path)) { done = true; return how(); } return undefined; }) as Intercept; };
+    const gets = (f: Fixture, suffix: string) => f.calls.filter(call => call.init.method !== 'PUT' && call.url.endsWith(suffix)).length;
+    for (const [name, match, how] of [['source 503', (_m: string, p: string) => p === `${movedPath}/message.eml`, () => upstreamError(503)], ['message read timeout', (_m: string, p: string) => p === movedPath, hang]] as const) {
+        const f = model([], { timeoutMs: 50 }, 'sender@example.com', 'Sender', failOnce(match, how)); const snapshot = await f.backend.inspectMessage(session, target);
+        const moved = await move(f, snapshot); expect([name, moved.message.uid]).toEqual([name, 42]); expect(puts(f)).toBe(1); expect(gets(f, name === 'source 503' ? '/42/message.eml' : '/42?markAsSeen=false&replaceCidLinks=false')).toBe(2);
+    }
+    const flags = model([], {}, 'sender@example.com', 'Sender', failOnce((_m, p) => p === messagePath, () => upstreamError(500, 'InternalDatabaseError'))); const snapshot = await flags.backend.inspectMessage(session, target);
+    expect((await flag(flags, snapshot)).sourceGrade).toBe('observed'); expect(puts(flags)).toBe(1);
+    const draft = model([], {}, 'sender@example.com', 'Sender', failOnce((_m, p) => p.endsWith('/message.eml'), () => upstreamError(503))); const prepared = await draft.backend.prepareCreate(session, content, marker);
+    const candidate = await draft.backend.uploadPreparedDraft(session, prepared); expect((await draft.backend.verifyPreparedDraft(session, candidate, prepared)).uid).toBe(candidate.uid); expect(draft.calls.filter(call => call.init.method === 'POST')).toHaveLength(1);
+    const send = model([], {}, 'sender@example.com', 'Sender', failOnce((_m, p) => p.endsWith('/message.eml'), () => upstreamError(503))); const sendSnapshot = await send.backend.inspectMessage(session, target);
+    await send.backend.stampSendMarker(session, sendSnapshot, sendMarker, authored()); expect(puts(send)).toBe(1);
+});
+test('a verification GET is not retried more than once, nor for other failures, nor without request budget; the outcome stays unproven', async () => {
+    const after = (match: (path: string) => boolean, how: () => Response) => { let put = false; return ((method, path) => { if (method === 'PUT') { put = true; return undefined; } return put && match(path) ? how() : undefined; }) as Intercept; };
+    const attempts = (f: Fixture) => f.calls.filter(call => call.url.endsWith('/42/message.eml')).length;
+    const twice = model([], {}, 'sender@example.com', 'Sender', after(path => path === `${movedPath}/message.eml`, () => upstreamError(503))); const snapshot = await twice.backend.inspectMessage(session, target);
+    const error = await failure(move(twice, snapshot)); expect(error.code).toBe('temporarily_unavailable'); expect(error.notApplied).toBeUndefined(); expect(attempts(twice)).toBe(2); expect(puts(twice)).toBe(1);
+    const absent = model([], {}, 'sender@example.com', 'Sender', after(path => path === `${movedPath}/message.eml`, () => upstreamError(404, 'MessageNotFound'))); const absentSnapshot = await absent.backend.inspectMessage(session, target);
+    expect((await failure(move(absent, absentSnapshot))).code).toBe('not_found'); expect(attempts(absent)).toBe(1);
+    const late = model([], {}, 'sender@example.com', 'Sender', after(path => path === `${movedPath}/message.eml`, () => upstreamError(503))); const lateSnapshot = await late.backend.inspectMessage(session, target);
+    const starved = await failure(withRequestBudget(() => 4000, () => move(late, lateSnapshot))); expect(starved.code).toBe('temporarily_unavailable'); expect(attempts(late)).toBe(1); expect(puts(late)).toBe(1);
+    const ample = model([], {}, 'sender@example.com', 'Sender', after(path => path === `${movedPath}/message.eml`, () => upstreamError(503))); const ampleSnapshot = await ample.backend.inspectMessage(session, target);
+    await failure(withRequestBudget(() => 60_000, () => move(ample, ampleSnapshot))); expect(attempts(ample)).toBe(2);
 });

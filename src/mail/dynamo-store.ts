@@ -2,11 +2,11 @@ import { randomUUID } from 'node:crypto';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, TransactWriteCommand, type TransactWriteCommandInput } from '@aws-sdk/lib-dynamodb';
 import { z } from 'zod';
-import { conditionalConflict, DEFAULT_THROTTLE_TIMEOUT_MS, DynamoRetrier, MAX_THROTTLE_TIMEOUT_MS, retryEnv, type DynamoBudget, type DynamoRetryEnv, type DynamoSender } from '../dynamo-retry';
+import { conditionalConflict, DEFAULT_THROTTLE_TIMEOUT_MS, DynamoRetrier, retryEnv, type DynamoBudget, type DynamoRetryEnv, type DynamoSender } from '../dynamo-retry';
 import { MailError, type ConfirmedReceipt, type DraftGuardKey, type DraftGuardRecord, type FailedReceipt, type MailOperationRecord, type MailOperationStore, type MailReceipt, type OperationClaim, type OperationKey, type ReservationResult, type UnknownReceipt, type WriteIntent } from './contracts';
 import { mailOutputSchemas, messageKeySchema, operationIdSchema, versionSchema } from './schemas';
 
-/** timeoutMs bounds an unthrottled operation; throttleTimeoutMs (default 10 s) is the total once DynamoDB has throttled it. */
+/** timeoutMs bounds an unthrottled operation; throttleTimeoutMs (default and maximum 10 s) is the total once DynamoDB has throttled it. */
 export interface DynamoMailStoreOptions { tableName: string; client?: DynamoSender; timeoutMs?: number; throttleTimeoutMs?: number; retry?: Partial<DynamoRetryEnv> }
 const safe = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/u);
 const owner = z.string().regex(/^[A-Za-z0-9_-]{16,128}$/u);
@@ -17,12 +17,14 @@ const createIntent = z.union([operationKey.extend({ payloadDigest: versionSchema
 const targetIntent = operationKey.extend({ payloadDigest: versionSchema, tool: z.enum(['update_draft', 'delete_draft', 'send_draft', 'move_message', 'update_message_flags']), target: messageKeySchema, expectedVersion: versionSchema });
 const intentSchema = z.union([createIntent, targetIntent]);
 const claimSchema = z.strictObject({ key: operationKey, ownerToken: owner, revision, state: z.enum(['reserved', 'dispatched']) });
-const operationBase = { key: operationKey, intent: intentSchema, ownerToken: owner, revision };
+const operationBase = { key: operationKey, intent: intentSchema, ownerToken: owner, revision, reservedAt: z.number().int().positive().safe().optional() };
 const operationSchema = z.union([
     z.strictObject({ ...operationBase, state: z.enum(['reserved', 'dispatched']) }),
     z.strictObject({ ...operationBase, state: z.literal('settled'), receipt: z.unknown() }),
 ]);
 const guardSchema = z.strictObject({ key: targetKey, operation: operationKey, ownerToken: owner, revision, state: z.enum(['reserved', 'dispatched', 'retired', 'queued', 'outcome_unknown']) });
+/** An item is its record plus, optionally, a numeric expiresAt (read and ignored); any other attribute is rejected. */
+const itemSchema = <Record extends z.ZodType>(record: Record) => z.strictObject({ record, expiresAt: z.number().optional() });
 const equal = (a: unknown, b: unknown): boolean => {
     if (a === b) { return true; }
     if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object' || Array.isArray(a) || Array.isArray(b)) { return false; }
@@ -36,8 +38,8 @@ function parse<Schema extends z.ZodType>(schema: Schema, value: unknown): z.outp
     if (!result.success) { throw unavailable(); }
     return result.data;
 }
-/** Stored receipts keep the 0.6 field name operation_id, so the stored format is unchanged and a
- * rollback to 0.6 can still read receipts written now; tool results call it operationId. */
+/** Stored receipts keep the 0.6 field name operation_id, so receipts written by 0.6.x to 0.9.x still
+ * replay unchanged; tool results call it operationId. */
 const STORED_OPERATION_ID = 'operation_id';
 function storedReceipt(receipt: MailReceipt): Record<string, unknown> {
     // The summary is worked out again from the receipt whenever a result is returned; it is never stored.
@@ -93,7 +95,8 @@ export class DynamoMailOperationStore implements MailOperationStore {
         const timeoutMs = options.timeoutMs ?? 5000;
         if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 5000) { throw new Error('Invalid mail store timeout'); }
         const throttleTimeoutMs = options.throttleTimeoutMs ?? DEFAULT_THROTTLE_TIMEOUT_MS;
-        if (!Number.isInteger(throttleTimeoutMs) || throttleTimeoutMs < 1 || throttleTimeoutMs > MAX_THROTTLE_TIMEOUT_MS) { throw new Error('Invalid mail store throttle timeout'); }
+        // The service's time arithmetic (mail/service.ts) is derived from the default, so no longer budget is accepted.
+        if (!Number.isInteger(throttleTimeoutMs) || throttleTimeoutMs < 1 || throttleTimeoutMs > DEFAULT_THROTTLE_TIMEOUT_MS) { throw new Error('Invalid mail store throttle timeout'); }
         const client = options.client ?? DynamoDBDocumentClient.from(new DynamoDBClient({ maxAttempts: 1 }));
         this.retrier = new DynamoRetrier({ store: 'mail', client, unavailable, env: retryEnv(options.retry), timeoutMs, throttleTimeoutMs, retryTransient: () => true });
     }
@@ -122,21 +125,20 @@ export class DynamoMailOperationStore implements MailOperationStore {
     private async getStoredOperation(key: OperationKey, deadline: DynamoBudget): Promise<MailOperationRecord | undefined> {
         const value = await this.read(opKey(key), deadline);
         if (value === undefined) { return undefined; }
-        const wrapper = parse(z.strictObject({ record: z.unknown() }), value);
+        const wrapper = parse(itemSchema(z.unknown()), value);
         return operation(wrapper.record, key);
     }
     private async getGuard(key: DraftGuardKey, deadline: DynamoBudget): Promise<DraftGuardRecord | undefined> {
         const value = await this.read(guardKey(key), deadline);
         if (value === undefined) { return undefined; }
-        const wrapper = parse(z.strictObject({ record: guardSchema }), value);
+        const wrapper = parse(itemSchema(guardSchema), value);
         if (!equal(wrapper.record.key, key) || wrapper.record.operation.accountId !== key.accountId) { throw unavailable(); }
         return wrapper.record;
     }
     async reserve(raw: WriteIntent, ownerToken: string): Promise<ReservationResult> {
         const deadline = this.deadline(); const intent = parse(intentSchema, raw); parse(owner, ownerToken);
         const key: OperationKey = { accountId: intent.accountId, clientIdHash: intent.clientIdHash, operationId: intent.operationId };
-        const existing = await this.getStoredOperation(key, deadline);
-        if (existing) { return equal(existing.intent, intent) ? { kind: 'replay', record: existing } : { kind: 'conflict', reason: 'operation_conflict' }; }
+        // No read first: the service has just read this key, and a record created since fails the absent-put below and is read then.
         const record: MailOperationRecord = { key, intent, ownerToken, revision: 0, state: 'reserved' };
         const items = [this.absentPut(opKey(key), record)];
         if (intent.tool !== 'create_draft' && intent.tool !== 'create_reply_draft') {
@@ -151,6 +153,7 @@ export class DynamoMailOperationStore implements MailOperationStore {
         if (intent.tool !== 'create_draft' && intent.tool !== 'create_reply_draft' && await this.getGuard({ accountId: key.accountId, ...intent.target }, deadline)) { return { kind: 'conflict', reason: 'draft_fenced' }; }
         throw unavailable();
     }
+    /** Writes pk, sk and record only: an expiresAt attribute on the item read is dropped by this Put. */
     private checkedPut(key: { pk: string; sk: string }, before: unknown, after: unknown): NonNullable<TransactWriteCommandInput['TransactItems']>[number] {
         return { Put: { TableName: this.options.tableName, Item: { ...key, record: after }, ConditionExpression: '#record = :before', ExpressionAttributeNames: { '#record': 'record' }, ExpressionAttributeValues: { ':before': before } } };
     }
@@ -160,7 +163,7 @@ export class DynamoMailOperationStore implements MailOperationStore {
         const before = await this.getStoredOperation(claim.key, deadline);
         if (!before || before.state !== expected || before.ownerToken !== claim.ownerToken || before.revision !== claim.revision) { throw unavailable(); }
         const receipt = typeof result === 'string' ? undefined : receiptFor(before.intent, result);
-        if (receipt && ((expected === 'reserved' && receipt.status !== 'failed') || (expected === 'dispatched' && !['completed', 'partial', 'queued', 'outcome_unknown'].includes(receipt.status)))) { throw unavailable(); }
+        if (receipt && !(expected === 'reserved' ? ['failed'] : ['completed', 'partial', 'queued', 'outcome_unknown', 'failed']).includes(receipt.status)) { throw unavailable(); }
         const nextRevision = before.revision + 1;
         const after = receipt ? { ...before, revision: nextRevision, state: 'settled' as const, receipt: storedReceipt(receipt) } : { ...before, revision: nextRevision, state: 'dispatched' as const };
         // Revalidate the complete stored value before any write.
@@ -191,6 +194,10 @@ export class DynamoMailOperationStore implements MailOperationStore {
     }
     async markOutcomeUnknown(claim: OperationClaim<'dispatched'>, receipt: UnknownReceipt): Promise<void> {
         if (receipt.status !== 'outcome_unknown') { throw unavailable(); }
+        await this.transition(claim, 'dispatched', receipt);
+    }
+    async failDispatched(claim: OperationClaim<'dispatched'>, receipt: FailedReceipt): Promise<void> {
+        if (receipt.status !== 'failed') { throw unavailable(); }
         await this.transition(claim, 'dispatched', receipt);
     }
 }

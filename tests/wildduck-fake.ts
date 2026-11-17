@@ -137,6 +137,7 @@ export function memoryOperations(): MailOperationStore {
         failPreflight: async (claim, receipt) => { await settle('settled')(claim, receipt); },
         complete: async (claim, receipt) => { await settle('settled')(claim, receipt); },
         markOutcomeUnknown: async (claim, receipt) => { await settle('settled')(claim, receipt); },
+        failDispatched: async (claim, receipt) => { await settle('settled')(claim, receipt); },
     };
 }
 /** Upload records bound to account and client, and their staged objects, as the DynamoDB store and

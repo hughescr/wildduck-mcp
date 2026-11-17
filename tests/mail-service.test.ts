@@ -1,4 +1,6 @@
 import { withRequestBudget } from '../src/request-budget';
+import { withRequestId } from '../src/request-id';
+import { captureWarnings } from './dynamo-virtual';
 import { expect, test } from 'bun:test';
 import { digest } from '../src/auth/crypto';
 import { createMailService } from '../src/mail/service';
@@ -20,8 +22,10 @@ const stored = <Receipt extends object>(receipt: Receipt, offered: string[]): Re
 };
 class Store implements MailOperationStore {
     records = new Map<string, MailOperationRecord>(); guards = new Map<string, string>(); calls: string[] = []; summariesOffered: string[] = [];
-    completeFault: 'none' | 'before' | 'after' = 'none'; markFault: 'none' | 'before' | 'after' = 'none'; unknownFault = false; preflightFault = false;
-    async getOperation(key: OperationKey): Promise<MailOperationRecord | undefined> { this.calls.push('get'); const record = this.records.get(keyOf(key)); return record && structuredClone(record); }
+    completeFault: 'none' | 'before' | 'after' = 'none'; completeFailures = 0; markFault: 'none' | 'before' | 'after' | 'shape' = 'none'; unknownFault = false; preflightFault = false;
+    /** failDispatched fails before it commits, or commits and then fails; readsFailAfterMark makes every read fail once markDispatched has faulted. */
+    failDispatchedFault: 'none' | 'before' | 'after' = 'none'; readsFailAfterMark = false; private readsFail = false;
+    async getOperation(key: OperationKey): Promise<MailOperationRecord | undefined> { this.calls.push('get'); if (this.readsFail) { throw new Error('secret read failure'); } const record = this.records.get(keyOf(key)); return record && structuredClone(record); }
     async reserve(intent: WriteIntent, ownerToken: string): Promise<ReservationResult> {
         this.calls.push('reserve'); const key = keyOf(intent); const existing = this.records.get(key);
         if (existing) { return JSON.stringify(existing.intent) === JSON.stringify(intent) ? { kind: 'replay', record: structuredClone(existing) } : { kind: 'conflict', reason: 'operation_conflict' }; }
@@ -37,9 +41,10 @@ class Store implements MailOperationStore {
         return record;
     }
     async markDispatched(claim: OperationClaim<'reserved'>): Promise<OperationClaim<'dispatched'>> {
-        this.calls.push('dispatch'); if (this.markFault === 'before') { throw new Error('secret dispatch failure'); }
+        this.calls.push('dispatch'); if (this.markFault === 'before') { this.readsFail = this.readsFailAfterMark; throw new Error('secret dispatch failure'); }
         const record = this.checked(claim); this.records.set(keyOf(claim.key), { ...record, state: 'dispatched', revision: record.revision + 1 });
-        if (this.markFault === 'after') { throw new Error('secret committed dispatch failure'); }
+        if (this.markFault === 'after') { this.readsFail = this.readsFailAfterMark; throw new Error('secret committed dispatch failure'); }
+        if (this.markFault === 'shape') { return { ...claim, state: 'dispatched', revision: claim.revision }; }
         return { ...claim, state: 'dispatched', revision: record.revision + 1 };
     }
     async failPreflight(claim: OperationClaim<'reserved'>, receipt: FailedReceipt): Promise<void> {
@@ -48,7 +53,7 @@ class Store implements MailOperationStore {
         const guard = guardOf(record.intent); if (guard) { this.guards.delete(guard); }
     }
     async complete(claim: OperationClaim<'dispatched'>, receipt: ConfirmedReceipt): Promise<void> {
-        this.calls.push('complete'); if (this.completeFault === 'before') { throw new Error('secret completion failure'); }
+        this.calls.push('complete'); if (this.completeFault === 'before' || this.completeFailures > 0) { this.completeFailures = Math.max(0, this.completeFailures - 1); throw new Error('secret completion failure'); }
         const record = this.checked(claim); this.records.set(keyOf(claim.key), { ...record, revision: record.revision + 1, state: 'settled', receipt: stored(receipt, this.summariesOffered) });
         if (record.intent.tool === 'update_message_flags') { const guard = guardOf(record.intent); if (guard) { this.guards.delete(guard); } }
         if (this.completeFault === 'after') { throw new Error('secret committed completion failure'); }
@@ -56,6 +61,12 @@ class Store implements MailOperationStore {
     async markOutcomeUnknown(claim: OperationClaim<'dispatched'>, receipt: UnknownReceipt): Promise<void> {
         this.calls.push('unknown'); if (this.unknownFault) { throw new Error('secret unknown failure'); }
         const record = this.checked(claim); this.records.set(keyOf(claim.key), { ...record, revision: record.revision + 1, state: 'settled', receipt: stored(receipt, this.summariesOffered) });
+    }
+    async failDispatched(claim: OperationClaim<'dispatched'>, receipt: FailedReceipt): Promise<void> {
+        this.calls.push('fail_dispatched'); if (this.failDispatchedFault === 'before') { throw new Error('secret settlement failure'); }
+        const record = this.checked(claim); this.records.set(keyOf(claim.key), { ...record, revision: record.revision + 1, state: 'settled', receipt: stored(receipt, this.summariesOffered) });
+        const guard = guardOf(record.intent); if (guard) { this.guards.delete(guard); }
+        if (this.failDispatchedFault === 'after') { throw new Error('secret committed settlement failure'); }
     }
 }
 function fixture(authored = true) {
@@ -191,13 +202,144 @@ test('unknown receipt persistence failure replays explicit uncertainty and fence
     expect((await f.service.send_draft(context, { ...target, operationId: 'operation_test_003' })).status).toBe('conflict');
     expect((await f.service.delete_draft({ ...context, clientId: 'another' }, { ...target, operationId: 'operation_test_002' })).status).toBe('conflict'); expect(posts(f)).toHaveLength(1);
 });
-test('crashed or uncertain dispatch markers never cause backend calls on replay', async () => {
-    for (const mode of ['before', 'after'] as const) {
-        const f = fixture(); f.operations.markFault = mode;
-        expect((await f.service.send_draft(context, target)).status).toBe('outcome_unknown');
-        expect((await f.service.send_draft(context, target)).status).toBe(mode === 'before' ? 'in_progress' : 'outcome_unknown');
-        expect(posts(f)).toHaveLength(0);
+const unsettledLine = (tool: string, step: string, code: string) => ({ event: 'mail_write_unsettled', tool, step, code });
+const temporarilyFailed = { status: 'failed', operationId, reason: 'temporarily_unavailable' } as const;
+const send = (f: ReturnType<typeof fixture>) => f.service.send_draft(context, target);
+test('a markDispatched failure made no WildDuck call, so it settles as failed whether or not the transition committed', async () => {
+    for (const mode of ['before', 'after', 'shape'] as const) {
+        const f = fixture(); f.operations.markFault = mode; const warnings = captureWarnings();
+        try {
+            expect(await send(f)).toEqual(temporarilyFailed);
+            expect(f.operations.calls).toContain(mode === 'before' ? 'fail' : 'fail_dispatched');
+            expect(posts(f)).toHaveLength(0); expect(f.calls.some(call => call.method === 'stamp')).toBe(false); expect(f.operations.guards.size).toBe(0);
+            expect(f.operations.records.get(keyOf({ accountId, clientIdHash: digest(context.clientId), operationId }))?.state).toBe('settled');
+            const calls = f.operations.calls.length; expect(await send(f)).toEqual(temporarilyFailed); expect(f.operations.calls.slice(calls)).toEqual(['get']);
+            f.operations.markFault = 'none'; expect((await f.service.send_draft(context, { ...target, operationId: 'operation_test_002' })).status).toBe('queued');
+            expect(warnings.lines).toEqual([]);
+        } finally { warnings.restore(); }
     }
+});
+test('a markDispatched failure that cannot be settled stays in_progress (reserved) or outcome_unknown (dispatched) and is logged once', async () => {
+    const reserved = fixture(); reserved.operations.markFault = 'before'; reserved.operations.preflightFault = true; const warnings = captureWarnings();
+    try {
+        expect(await send(reserved)).toEqual({ status: 'in_progress', operationId }); expect(reserved.operations.guards.size).toBe(1); expect(posts(reserved)).toHaveLength(0);
+        expect(warnings.lines).toEqual([unsettledLine('send_draft', 'dispatch_mark', 'temporarily_unavailable')]);
+        const unreadable = fixture(); unreadable.operations.markFault = 'before'; unreadable.operations.readsFailAfterMark = true; warnings.lines.length = 0;
+        expect((await send(unreadable)).status).toBe('in_progress'); expect(unreadable.operations.guards.size).toBe(1); expect(warnings.lines).toEqual([unsettledLine('send_draft', 'dispatch_mark', 'temporarily_unavailable')]);
+        const dispatched = fixture(); dispatched.operations.markFault = 'after'; dispatched.operations.failDispatchedFault = 'before'; warnings.lines.length = 0;
+        expect(await send(dispatched)).toEqual({ status: 'in_progress', operationId }); expect(dispatched.operations.guards.size).toBe(1); expect(posts(dispatched)).toHaveLength(0); expect(dispatched.calls.some(call => call.method === 'stamp')).toBe(false);
+        expect(dispatched.operations.calls).not.toContain('unknown'); expect(dispatched.operations.records.get(keyOf({ accountId, clientIdHash: digest(context.clientId), operationId }))?.state).toBe('dispatched');
+        expect(warnings.lines).toEqual([unsettledLine('send_draft', 'dispatch_mark', 'temporarily_unavailable')]);
+        const committed = fixture(); committed.operations.markFault = 'after'; committed.operations.failDispatchedFault = 'after'; warnings.lines.length = 0;
+        expect(await send(committed)).toEqual(temporarilyFailed); expect(committed.operations.guards.size).toBe(0); expect(warnings.lines).toEqual([]);
+    } finally { warnings.restore(); }
+});
+const notApplied = (code: 'not_found' | 'unsupported_draft' | 'temporarily_unavailable') => new MailError(code, undefined, { upstreamCode: 'MessageNotFound', notApplied: true });
+const unproven = (code: 'not_found' | 'unsupported_draft' | 'temporarily_unavailable') => new MailError(code, undefined, { upstreamCode: 'MessageNotFound' });
+/** Each write tool with a target, with the point where its first WildDuck mutation can be made to fail with a given error. */
+const targeted = [
+    { tool: 'update_draft', code: 'temporarily_unavailable', request: { ...target, subject: 'change' }, arm: (f: ReturnType<typeof fixture>, error: MailError) => { const upload = f.writer.uploadPreparedDraft; f.writer.uploadPreparedDraft = async () => { f.writer.uploadPreparedDraft = upload; throw error; }; } },
+    { tool: 'delete_draft', code: 'not_found', request: target, arm: (f: ReturnType<typeof fixture>, error: MailError) => { const remove = f.writer.deleteDraft; f.writer.deleteDraft = async () => { f.writer.deleteDraft = remove; throw error; }; } },
+    { tool: 'send_draft', code: 'unsupported_draft', request: target, arm: (f: ReturnType<typeof fixture>, error: MailError) => { const stamp = f.writer.stampSendMarker; f.writer.stampSendMarker = async () => { f.writer.stampSendMarker = stamp; throw error; }; } },
+    { tool: 'move_message', code: 'not_found', request: { ...target, mailboxId, destinationMailboxId: 'e'.repeat(24) }, arm: (f: ReturnType<typeof fixture>, error: MailError) => { const move = f.writer.moveMessage; f.writer.moveMessage = async () => { f.writer.moveMessage = move; throw error; }; } },
+    { tool: 'update_message_flags', code: 'not_found', request: { ...target, mailboxId, seen: true }, arm: (f: ReturnType<typeof fixture>, error: MailError) => { const flags = f.writer.updateMessageFlags; f.writer.updateMessageFlags = async () => { f.writer.updateMessageFlags = flags; throw error; }; } },
+] as const;
+test('an error that proves the change was not applied settles as failed and releases the message; the same error unproven stays outcome_unknown', async () => {
+    for (const { tool, code, request, arm } of targeted) {
+        const f = fixture(); const warnings = captureWarnings();
+        try {
+            arm(f, notApplied(code));
+            const failed = { status: 'failed', operationId, reason: code } as const;
+            expect(await f.service[tool](context, request as never)).toEqual(failed);
+            expect(f.operations.calls).toContain('fail_dispatched'); expect(f.operations.guards.size).toBe(0);
+            expect(f.operations.records.get(keyOf({ accountId, clientIdHash: digest(context.clientId), operationId }))?.state).toBe('settled');
+            const calls = f.calls.length; expect(await f.service[tool](context, request as never)).toEqual(failed); expect(f.calls).toHaveLength(calls);
+            const again = { ...request, operationId: 'operation_test_002' };
+            expect((await f.service[tool](context, again as never)).status).toBe(tool === 'send_draft' ? 'queued' : 'completed');
+            expect(warnings.lines).toEqual([]);
+            const g = fixture(); arm(g, unproven(code));
+            const unknown = { status: 'outcome_unknown', operationId, reason: 'dispatch_uncertain' } as const;
+            expect(await g.service[tool](context, request as never)).toEqual(unknown); expect(g.operations.calls).not.toContain('fail_dispatched'); expect(g.operations.guards.size).toBe(1);
+            expect((await g.service[tool](context, { ...request, operationId: 'operation_test_002' } as never)).status).toBe('conflict');
+            expect(warnings.lines).toEqual([unsettledLine(tool, 'upstream', 'MessageNotFound')]);
+        } finally { warnings.restore(); }
+    }
+});
+test('only a named WildDuck code is logged: an identifier-like upstream code is replaced by the local failure code and reaches no result', async () => {
+    const identifier = 'a1B2c3D4e5F6g7H8i9J0k1L2'; const warnings = captureWarnings();
+    try {
+        const f = fixture(); f.writer.stampSendMarker = async () => { throw new MailError('not_found', undefined, { upstreamCode: identifier }); };
+        const result = await send(f); expect(result).toEqual({ status: 'outcome_unknown', operationId, reason: 'dispatch_uncertain' });
+        expect(warnings.lines).toEqual([unsettledLine('send_draft', 'upstream', 'not_found')]);
+        expect(JSON.stringify([result, warnings.lines, [...f.operations.records.values()]])).not.toContain(identifier);
+    } finally { warnings.restore(); }
+});
+test('notApplied inside update_draft keeps the meaning of its own partial results', async () => {
+    const f = fixture(); f.behavior.deletionError = notApplied('not_found');
+    const result = await f.service.update_draft(context, { ...target, subject: 'change' });
+    expect(result.status).toBe('partial'); expect(f.operations.calls).not.toContain('fail_dispatched'); expect(f.operations.guards.size).toBe(1);
+});
+test('a notApplied error that arrives once complete has begun never settles as failed', async () => {
+    const f = fixture(); f.operations.completeFault = 'before'; const warnings = captureWarnings();
+    try {
+        f.operations.complete = async () => { throw notApplied('temporarily_unavailable'); };
+        expect((await send(f)).status).toBe('outcome_unknown'); expect(f.operations.calls).not.toContain('fail_dispatched');
+        expect(warnings.lines).toEqual([unsettledLine('send_draft', 'complete', 'MessageNotFound')]);
+    } finally { warnings.restore(); }
+});
+test('failDispatched failing falls back to the uncertain path, which returns the settlement if it committed', async () => {
+    const warnings = captureWarnings();
+    try {
+        for (const mode of ['before', 'after'] as const) {
+            const f = fixture(); f.operations.failDispatchedFault = mode; f.writer.stampSendMarker = async () => { throw notApplied('unsupported_draft'); }; warnings.lines.length = 0;
+            const result = await send(f);
+            if (mode === 'before') {
+                expect(result).toEqual({ status: 'outcome_unknown', operationId, reason: 'dispatch_uncertain' }); expect(f.operations.calls).toContain('unknown'); expect(f.operations.guards.size).toBe(1);
+                expect(warnings.lines).toEqual([unsettledLine('send_draft', 'upstream', 'MessageNotFound')]);
+            } else { expect(result).toEqual({ status: 'failed', operationId, reason: 'unsupported_draft' }); expect(f.operations.guards.size).toBe(0); expect(warnings.lines).toEqual([]); }
+            expect(posts(f)).toHaveLength(0);
+        }
+    } finally { warnings.restore(); }
+});
+test('complete is repeated once: one failure completes, two fail into the uncertain path, and no repeat starts without room in the request', async () => {
+    const once = fixture(); once.operations.completeFailures = 1; const warnings = captureWarnings();
+    try {
+        expect((await send(once)).status).toBe('queued'); expect(once.operations.calls.filter(call => call === 'complete')).toHaveLength(2); expect(posts(once)).toHaveLength(1); expect(once.operations.guards.size).toBe(1);
+        expect(warnings.lines).toEqual([]);
+        const twice = fixture(); twice.operations.completeFailures = 2;
+        expect(await send(twice)).toEqual({ status: 'outcome_unknown', operationId, reason: 'dispatch_uncertain' }); expect(twice.operations.calls.filter(call => call === 'complete')).toHaveLength(2); expect(posts(twice)).toHaveLength(1);
+        expect(warnings.lines).toEqual([unsettledLine('send_draft', 'complete', 'temporarily_unavailable')]);
+        const tight = fixture(); tight.operations.completeFailures = 1; let left = 60_000; const complete = tight.operations.complete.bind(tight.operations);
+        tight.operations.complete = async (...args) => { left = 5_000; return complete(...args); };
+        expect((await withRequestBudget(() => left, () => send(tight))).status).toBe('outcome_unknown'); expect(tight.operations.calls.filter(call => call === 'complete')).toHaveLength(1);
+    } finally { warnings.restore(); }
+});
+test('every unsettled step logs one line with only the tool, step, code and request ID', async () => {
+    const warnings = captureWarnings();
+    try {
+        const run = async (f: ReturnType<typeof fixture>, tool: 'send_draft' | 'create_draft' = 'send_draft') => { warnings.lines.length = 0; try { await (tool === 'send_draft' ? send(f) : f.service.create_draft(context, { ...content, operationId })); } catch { /* A thrown reserve or settlement failure. */ } return [...warnings.lines]; };
+        // reserve: the outcome of the reservation is unknown and the read-back finds nothing.
+        const reserve = fixture(); reserve.operations.reserve = async () => { throw new Error('secret reserve failure'); };
+        expect(await run(reserve)).toEqual([unsettledLine('send_draft', 'reserve', 'temporarily_unavailable')]);
+        // reserve: this call's reservation was found but could not be settled.
+        const readBack = fixture(); const reserved = readBack.operations.reserve.bind(readBack.operations);
+        readBack.operations.reserve = async (...args) => { await reserved(...args); throw new Error('secret reserve failure'); }; readBack.operations.preflightFault = true;
+        expect(await run(readBack)).toEqual([unsettledLine('send_draft', 'reserve', 'temporarily_unavailable')]);
+        const preflight = fixture(); preflight.behavior.snapshot.hasRecipients = false; preflight.operations.preflightFault = true;
+        expect(await run(preflight)).toEqual([unsettledLine('send_draft', 'preflight_settle', 'temporarily_unavailable')]);
+        const dispatchMark = fixture(); dispatchMark.operations.markFault = 'after'; dispatchMark.operations.failDispatchedFault = 'before';
+        expect(await run(dispatchMark)).toEqual([unsettledLine('send_draft', 'dispatch_mark', 'temporarily_unavailable')]);
+        const upstream = fixture(); upstream.behavior.postError = true;
+        expect(await run(upstream)).toEqual([unsettledLine('send_draft', 'upstream', 'temporarily_unavailable')]);
+        const complete = fixture(); complete.operations.completeFault = 'before';
+        expect(await run(complete, 'create_draft')).toEqual([unsettledLine('create_draft', 'complete', 'temporarily_unavailable')]);
+        const unknownMark = fixture(); unknownMark.behavior.postError = true; unknownMark.operations.unknownFault = true;
+        expect(await run(unknownMark)).toEqual([unsettledLine('send_draft', 'unknown_mark', 'temporarily_unavailable')]);
+        const withId = fixture(); withId.behavior.postError = true; warnings.lines.length = 0;
+        await withRequestId('request-id-1', () => send(withId));
+        expect(warnings.lines).toEqual([{ ...unsettledLine('send_draft', 'upstream', 'temporarily_unavailable'), requestId: 'request-id-1' }]);
+        expect(JSON.stringify(warnings.lines)).not.toMatch(/operation_test|secret|aaaaaaaa|bbbbbbbb/u);
+    } finally { warnings.restore(); }
 });
 test('replacement verifies candidate before fresh original inspection and deletion', async () => {
     const f = fixture(); const result = await f.service.update_draft(context, { subject: 'changed', ...target });
@@ -253,6 +395,14 @@ test('fresh original read outage yields verification partial without falsely cla
     expect(f.calls.some(call => call.method === 'delete')).toBe(false);
     f.behavior.originalReadError = false;
     expect((await f.service.send_draft(context, { ...target, uid: 8, operationId: 'candidate_send_001' })).status).toBe('failed');
+});
+test('one transient failure of the fresh original read is retried, so the update completes with one upload and one delete', async () => {
+    const f = fixture(); const verify = f.writer.verifyPreparedDraft; const inspect = f.writer.inspectMessage; let armed = false; let reads = 0;
+    f.writer.verifyPreparedDraft = async (...args) => { const result = await verify(...args); armed = true; return result; };
+    f.writer.inspectMessage = async (...args) => { if (armed) { reads++; if (reads === 1) { throw new MailError('temporarily_unavailable'); } } return inspect(...args); };
+    const result = await f.service.update_draft(context, { ...target, subject: 'change' });
+    expect(result.status).toBe('completed'); expect(reads).toBe(2);
+    expect(f.calls.filter(call => call.method === 'upload')).toHaveLength(1); expect(f.calls.filter(call => call.method === 'delete')).toHaveLength(1);
 });
 test('verified candidate with failed or uncertain original deletion has explicit partial and activation', async () => {
     for (const error of [new MailError('forbidden'), new Error('backend timeout with secret')]) {

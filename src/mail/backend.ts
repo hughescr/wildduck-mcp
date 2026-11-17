@@ -4,10 +4,11 @@ import libmime from 'libmime';
 import { WILDDUCK_ORIGIN } from '../wildduck';
 import { remainingRequestTimeMs, withRequestBudget } from '../request-budget';
 import { currentRequestId } from '../request-id';
-import { MailError, MAIL_OPERATION_METADATA_KEY, ATTACHMENT_UPLOAD_KEY_PREFIX, type BackendMailSession, type DraftMailSession, type MailBackendReader, type MailBackendWriter, type Mailbox, type MailInput, type MailInputRaw, type MailOutput, type MessageKey, type DraftContent, type DraftPatch, type MessageSnapshot, type PreparedDraft, type MailOperationMarker, type MessageRef, type MessageSummary, type MailAddress, type AttachmentMetadata, type AttachmentDownload, type AttachmentDownloadLink, type MessageSourceDownloadLink, type VerifiedMessageMutation, type AuthoredSourceDescriptor, type AttachmentUploadStore, type AttachmentUploadStager, type AttachmentUploadRecord, type AttachmentSource, type NewAttachment, type ResolvedAttachment } from './contracts';
+import { MailError, MAIL_OPERATION_METADATA_KEY, ATTACHMENT_UPLOAD_KEY_PREFIX, type KnownUpstreamCode, type BackendMailSession, type DraftMailSession, type MailBackendReader, type MailBackendWriter, type Mailbox, type MailInput, type MailInputRaw, type MailOutput, type MessageKey, type DraftContent, type DraftPatch, type MessageSnapshot, type PreparedDraft, type MailOperationMarker, type MessageRef, type MessageSummary, type MailAddress, type AttachmentMetadata, type AttachmentDownload, type AttachmentDownloadLink, type MessageSourceDownloadLink, type VerifiedMessageMutation, type AuthoredSourceDescriptor, type AttachmentUploadStore, type AttachmentUploadStager, type AttachmentUploadRecord, type AttachmentSource, type NewAttachment, type ResolvedAttachment } from './contracts';
 import { draftContentSchema, namedAddress, mailboxIdSchema, messageKeySchema, mailInputSchemas, mailOutputSchemas, canonicalReadMessageOutputSchema, attachmentDownloadLinkSchema, messageSourceDownloadLinkSchema, mailOperationMarkerSchema, addFlagSchema, labelSchema, attachmentFilenameSchema, attachmentContentTypeSchema, MAX_READ_TEXT_BYTES, MAX_HTML_BYTES, MAX_ATTACHMENT_BYTES, MAX_SNIPPET_BYTES, MAX_SEARCH_TEXT_CHARACTERS, MAX_UPLOAD_BYTES } from './schemas';
 import { MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS, SOURCE_DOWNLOAD_TIMEOUT_MS, type AttachmentDownloadStager } from './downloads';
 import { deriveReply, sanitizeHeaderText } from './reply';
+import { verifyRead } from './verify-read';
 import { ownedIdentityMatcher } from './identities';
 import { createMime, inspectSource, preparePatch, retainedAttachmentBytes, verifyCandidate, attachmentBodyBytes, AMBIGUOUS_INLINE, AUTHORED_LIMITS, MAX_MESSAGE_BYTES, MimeError, type MimeEnvelope } from './mime';
 import { renderBody } from './render';
@@ -104,7 +105,20 @@ interface TransportExtra {
     readonly signal?: AbortSignal | undefined;
     /** Told the bytes of a 200 body so far (its declared length first); throws to stop the read. */
     readonly meter?: ((bytes: number) => void) | undefined;
+    /** WildDuck body code -> the HTTP status it comes with, for answers that prove a MUTATING request changed nothing: the
+     * MailError then carries notApplied. A code with another status, or any code not listed, proves nothing. */
+    readonly unapplied?: ReadonlyMap<string, number> | undefined;
 }
+/** POST .../submit (wildduck/lib/api/messages.js, submitStoredMessage). Each of these is returned before submitMessage() queues the
+ * mail (:4393): UserNotFound :4255 and UserDisabled :4262 (user checks), MessageNotDraft :4290, TooMany :4344 and RateLimitedError :4380
+ * (rate checks). The handler rewrites the draft's Date first (:4310), which does not send anything. Errors thrown after queueing
+ * (moveAsync, flagReferencedMessage) can only carry NoSuchMailbox, StoreError, NothingChanged or InternalError (message-handler.js),
+ * so none of these five can follow queueing. MessageNotFound is left out on purpose, as is any code by HTTP status alone. */
+const SUBMIT_UNQUEUED = new Map<KnownUpstreamCode, number>([['MessageNotDraft', 400], ['TooMany', 403], ['RateLimitedError', 403], ['UserDisabled', 403], ['UserNotFound', 404]]);
+/** PUT and DELETE .../messages/:message. MessageNotFound is only answered when nothing matched: PUT (putMessageHandler :1494-:1529 before any
+ * write; :1601 moveAsync moved no message, destinationUid empty; :1627 updateAsync updated none: updatedCount counts only applied updates,
+ * message-handler.js:2339-2361) and DELETE (:3208 before any write; :3262 the cursor found no message and none failed). */
+const MESSAGE_ABSENT = new Map<KnownUpstreamCode, number>([['MessageNotFound', 404]]);
 /** The request's attachments sorted by source, before any I/O. */
 interface AttachmentPlan {
     readonly items: readonly NewAttachment[];
@@ -387,13 +401,16 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
                 if (timing) { timing.bodyMs = Math.round(performance.now() - headersAt); }
                 if (response.status === 200) { return { bytes, headers: response.headers }; }
                 const result = json(bytes);
-                if (response.status === 403 && result['code'] === 'InvalidToken') { throw new MailError('reconnect_required'); }
-                if (response.status === 404) { throw new MailError('not_found'); }
-                if (response.status === 401 || response.status === 403) { throw new MailError('forbidden'); }
-                if (response.status === 400) { throw new MailError('invalid_input'); }
+                // WildDuck's body code is kept as a bare token. It proves "nothing changed" only for the caller's allowlisted code with its own status.
+                const upstreamCode = typeof result['code'] === 'string' ? result['code'] : undefined;
+                const diagnostic = { upstreamCode, notApplied: upstreamCode !== undefined && extra.unapplied?.get(upstreamCode) === response.status };
+                if (response.status === 403 && result['code'] === 'InvalidToken') { throw new MailError('reconnect_required', undefined, diagnostic); }
+                if (response.status === 404) { throw new MailError('not_found', undefined, diagnostic); }
+                if (response.status === 401 || response.status === 403) { throw new MailError('forbidden', undefined, diagnostic); }
+                if (response.status === 400) { throw new MailError('invalid_input', undefined, diagnostic); }
                 const retry = response.headers.get('retry-after');
                 const retryAfter = retry !== null && /^\d{1,5}$/u.test(retry) && Number(retry) <= 86400 ? Number(retry) : undefined;
-                throw new MailError('temporarily_unavailable', retryAfter);
+                throw new MailError('temporarily_unavailable', retryAfter, diagnostic);
             } finally { controller.signal.removeEventListener('abort', cancel); cancel(); }
         };
         arm(timeoutMs);
@@ -405,6 +422,11 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         const result = json((await this.transport(session, path, method, body, cap, 'json', undefined, extra)).bytes);
         if (result['success'] !== true || result['error'] !== undefined || result['code'] !== undefined) { return fail(); }
         return result;
+    }
+    /** Runs a section of a write that the caller has proven is entirely before the change the tool requests, and tags any MailError
+     * from it notApplied. For move and flags that is the reads before the PUT, so keep the PUT out of `section`. */
+    private async notAppliedIfThrown<T>(section: () => Promise<T>): Promise<T> {
+        try { return await section(); } catch (error) { throw error instanceof MailError ? MailError.asNotApplied(error) : error; }
     }
     /** Every source this server reads (an authored draft, a read-back, a message before a move) is
      * bounded by the one message cap. */
@@ -916,8 +938,8 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         let check: DraftVerificationCheck = 'target';
         try {
             if (target.mailboxId !== prepared.mailboxId) { throw new MailError('verification_failed'); }
-            check = 'message'; const { raw, version: digest } = await this.rawMessage(session, target);
-            check = 'mime'; verifyCandidate(prepared.mime, await this.source(session, target));
+            check = 'message'; const { raw, version: digest } = await verifyRead(() => this.rawMessage(session, target));
+            check = 'mime'; verifyCandidate(prepared.mime, await verifyRead(() => this.source(session, target)));
             check = 'draft_state'; if (!bool(raw['draft']) || !supportedDraftState(raw)) { throw new MailError('verification_failed'); }
             check = 'envelope'; assertSame(raw['envelope'], { from: '', rcpt: [] });
             // The existing API does not expose its private submission envelope. The upload
@@ -942,12 +964,13 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
     }
     async deleteDraft(session: BackendMailSession, target: MessageKey): Promise<void> {
         sessionValid(session); targetValid(target);
-        const result = await this.request(session, `/mailboxes/${target.mailboxId}/messages/${target.uid}`, 'DELETE');
+        const result = await this.request(session, `/mailboxes/${target.mailboxId}/messages/${target.uid}`, 'DELETE', undefined, META_BYTES, { unapplied: MESSAGE_ABSENT });
         if (result['deleted'] !== 1 || result['errors'] !== 0) { return fail(); }
     }
     async submitDraft(session: BackendMailSession, target: MessageKey): Promise<{ queueId: string; sent?: MessageKey }> {
         sessionValid(session); targetValid(target);
-        const result = await this.request(session, `/mailboxes/${target.mailboxId}/messages/${target.uid}/submit`, 'POST', {});
+        const result = await this.request(session, `/mailboxes/${target.mailboxId}/messages/${target.uid}/submit`, 'POST', {}, META_BYTES, { unapplied: SUBMIT_UNQUEUED });
+        // A success without a usable queueId proves nothing (plugins get a mutable envelope, so the id is not independent of hooks): it stays unset, never notApplied.
         const queueId = result['queueId'];
         if (typeof queueId !== 'string' || !queueId || queueId.length > 256 || !/^\S+$/u.test(queueId)) { return fail(); }
         const sent = result['message'];
@@ -956,8 +979,8 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
     }
     private async verifyMutation(session: BackendMailSession, snapshot: MessageSnapshot, target: MessageKey, before: Buffer, expectedMetadata: Json, expectedFlags?: string[], expectedLabels?: string[], source?: AuthoredSourceDescriptor): Promise<VerifiedMessageMutation> {
         const state = this.state(session, snapshot);
-        const { raw, version: digest } = await this.rawMessage(session, target);
-        const after = await this.source(session, target);
+        const { raw, version: digest } = await verifyRead(() => this.rawMessage(session, target));
+        const after = await verifyRead(() => this.source(session, target));
         if (!before.equals(after)) { throw new MailError('verification_failed'); }
         const mutable = new Set(['metaData', ...(expectedFlags ? ['flags', 'seen', 'flagged', 'answered', 'forwarded'] : []), ...(expectedLabels ? ['labels'] : [])]);
         for (const field of VERSION_FIELDS) { if (!mutable.has(field)) { assertSame(raw[field], state.raw[field]); } }
@@ -974,35 +997,52 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         return { message: { ...target, version: digest }, contentDigest, sourceGrade: source ? 'mcp_authored' : 'observed' };
     }
     async stampSendMarker(session: BackendMailSession, snapshot: MessageSnapshot, marker: MailOperationMarker, source: AuthoredSourceDescriptor): Promise<MessageRef> {
-        const state = this.state(session, snapshot); this.checkMarker(session, marker);
-        const bytes = await this.authoredBytes(session, snapshot, source); const metaData = this.marked(state.raw, marker);
-        const result = await this.request(session, `/mailboxes/${snapshot.message.mailboxId}/messages/${snapshot.message.uid}`, 'PUT', { metaData });
-        if (result['updated'] !== 1) { throw new MailError('verification_failed'); }
-        return (await this.verifyMutation(session, snapshot, snapshot.message, bytes, metaData, undefined, undefined, source)).message;
+        // Zone 1, before the stamp PUT is sent: input checks and GETs only, nothing of ours in flight and the send not submitted, so notApplied.
+        const { bytes, metaData } = await this.notAppliedIfThrown(async () => {
+            const state = this.state(session, snapshot); this.checkMarker(session, marker);
+            return { bytes: await this.authoredBytes(session, snapshot, source), metaData: this.marked(state.raw, marker) };
+        });
+        // Zone 2, the stamp PUT: only a definite refusal (MESSAGE_ABSENT) is notApplied. A timeout, abort, 5xx, 429 or malformed answer proves nothing:
+        // the PUT can still land later and overwrite the marker of a later operation, so the message must stay locked.
+        const result = await this.request(session, `/mailboxes/${snapshot.message.mailboxId}/messages/${snapshot.message.uid}`, 'PUT', { metaData }, META_BYTES, { unapplied: MESSAGE_ABSENT });
+        // Zone 3, after the PUT was acknowledged: it is no longer in flight and the send (the submit POST, which follows this) was not submitted, so notApplied.
+        return this.notAppliedIfThrown(async () => {
+            if (result['updated'] !== 1) { throw new MailError('verification_failed'); }
+            return (await this.verifyMutation(session, snapshot, snapshot.message, bytes, metaData, undefined, undefined, source)).message;
+        });
     }
     async moveMessage(session: BackendMailSession, snapshot: MessageSnapshot, destinationMailboxId: string, marker: MailOperationMarker, source?: AuthoredSourceDescriptor): Promise<VerifiedMessageMutation> {
-        const state = this.state(session, snapshot); this.checkMarker(session, marker);
-        if (!mailboxIdSchema.safeParse(destinationMailboxId).success || destinationMailboxId === snapshot.message.mailboxId) { throw new MailError('invalid_input'); }
-        const destination = await this.request(session, `/mailboxes/${destinationMailboxId}`, 'GET');
-        if (id(destination['id']) !== destinationMailboxId) { throw new MailError('verification_failed'); }
-        const bytes = source ? await this.authoredBytes(session, snapshot, source) : await this.source(session, snapshot.message); const metaData = this.marked(state.raw, marker);
-        const result = await this.request(session, `/mailboxes/${snapshot.message.mailboxId}/messages/${snapshot.message.uid}`, 'PUT', { moveTo: destinationMailboxId, metaData });
+        // Before the mutation: input checks and GETs only. A failure here is notApplied because no mutating request has been sent.
+        const { bytes, metaData } = await this.notAppliedIfThrown(async () => {
+            const state = this.state(session, snapshot); this.checkMarker(session, marker);
+            if (!mailboxIdSchema.safeParse(destinationMailboxId).success || destinationMailboxId === snapshot.message.mailboxId) { throw new MailError('invalid_input'); }
+            const destination = await this.request(session, `/mailboxes/${destinationMailboxId}`, 'GET');
+            if (id(destination['id']) !== destinationMailboxId) { throw new MailError('verification_failed'); }
+            return { bytes: source ? await this.authoredBytes(session, snapshot, source) : await this.source(session, snapshot.message), metaData: this.marked(state.raw, marker) };
+        });
+        // The mutation: from here on a failure proves nothing, unless WildDuck answers MessageNotFound (MESSAGE_ABSENT).
+        const result = await this.request(session, `/mailboxes/${snapshot.message.mailboxId}/messages/${snapshot.message.uid}`, 'PUT', { moveTo: destinationMailboxId, metaData }, META_BYTES, { unapplied: MESSAGE_ABSENT });
         if (result['mailbox'] !== destinationMailboxId || !Array.isArray(result['id']) || result['id'].length !== 1 || !Array.isArray(result['id'][0]) || result['id'][0].length !== 2 || result['id'][0][0] !== snapshot.message.uid) { throw new MailError('verification_failed'); }
         const target = { mailboxId: destinationMailboxId, uid: uid(result['id'][0][1]) };
         return this.verifyMutation(session, snapshot, target, bytes, metaData, undefined, undefined, source);
     }
     async updateMessageFlags(session: BackendMailSession, snapshot: MessageSnapshot, patch: MailInput<'update_message_flags'>, marker: MailOperationMarker, source?: AuthoredSourceDescriptor): Promise<VerifiedMessageMutation> {
-        const state = this.state(session, snapshot); this.checkMarker(session, marker);
-        const parsed = mailInputSchemas.update_message_flags.safeParse(patch);
-        if (!parsed.success || patch.mailboxId !== snapshot.message.mailboxId || patch.uid !== snapshot.message.uid || patch.expectedVersion !== snapshot.message.version) { throw new MailError('invalid_input'); }
-        const flags = new Set(strings(state.raw['flags']).map(canonicalFlag));
-        for (const value of patch.removeFlags ?? []) { flags.delete(canonicalFlag(value)); } for (const value of patch.addFlags ?? []) { flags.add(canonicalFlag(value)); }
-        for (const [key, flag] of [['seen', '\\Seen'], ['flagged', '\\Flagged']] as const) { if (patch[key] === true) { flags.add(flag); } else if (patch[key] === false) { flags.delete(flag); } }
-        const labels = new Set(patch.labels ?? strings(state.raw['labels']));
-        for (const value of patch.removeLabels ?? []) { labels.delete(value); } for (const value of patch.addLabels ?? []) { labels.add(value); }
-        const bytes = source ? await this.authoredBytes(session, snapshot, source) : await this.source(session, snapshot.message); const metaData = this.marked(state.raw, marker); const body: Json = { metaData };
-        for (const key of ['seen', 'flagged', 'addFlags', 'removeFlags', 'labels', 'addLabels', 'removeLabels'] as const) { if (patch[key] !== undefined) { body[key] = patch[key]; } }
-        const result = await this.request(session, `/mailboxes/${snapshot.message.mailboxId}/messages/${snapshot.message.uid}`, 'PUT', body);
+        // Before the mutation: input checks and GETs only. A failure here is notApplied because no mutating request has been sent.
+        const { flags, labels, bytes, metaData, body } = await this.notAppliedIfThrown(async () => {
+            const state = this.state(session, snapshot); this.checkMarker(session, marker);
+            const parsed = mailInputSchemas.update_message_flags.safeParse(patch);
+            if (!parsed.success || patch.mailboxId !== snapshot.message.mailboxId || patch.uid !== snapshot.message.uid || patch.expectedVersion !== snapshot.message.version) { throw new MailError('invalid_input'); }
+            const flags = new Set(strings(state.raw['flags']).map(canonicalFlag));
+            for (const value of patch.removeFlags ?? []) { flags.delete(canonicalFlag(value)); } for (const value of patch.addFlags ?? []) { flags.add(canonicalFlag(value)); }
+            for (const [key, flag] of [['seen', '\\Seen'], ['flagged', '\\Flagged']] as const) { if (patch[key] === true) { flags.add(flag); } else if (patch[key] === false) { flags.delete(flag); } }
+            const labels = new Set(patch.labels ?? strings(state.raw['labels']));
+            for (const value of patch.removeLabels ?? []) { labels.delete(value); } for (const value of patch.addLabels ?? []) { labels.add(value); }
+            const bytes = source ? await this.authoredBytes(session, snapshot, source) : await this.source(session, snapshot.message); const metaData = this.marked(state.raw, marker); const body: Json = { metaData };
+            for (const key of ['seen', 'flagged', 'addFlags', 'removeFlags', 'labels', 'addLabels', 'removeLabels'] as const) { if (patch[key] !== undefined) { body[key] = patch[key]; } }
+            return { flags, labels, bytes, metaData, body };
+        });
+        // The mutation: from here on a failure proves nothing, unless WildDuck answers MessageNotFound (MESSAGE_ABSENT).
+        const result = await this.request(session, `/mailboxes/${snapshot.message.mailboxId}/messages/${snapshot.message.uid}`, 'PUT', body, META_BYTES, { unapplied: MESSAGE_ABSENT });
         if (result['updated'] !== 1) { throw new MailError('verification_failed'); }
         const verified = await this.verifyMutation(session, snapshot, snapshot.message, bytes, metaData, [...flags], [...labels], source);
         return verified;

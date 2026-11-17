@@ -53,6 +53,19 @@ export function conditionalConflict(error: unknown, count: number): boolean {
     const codes = reasonCodes(error);
     return codes !== undefined && codes.length === count && codes.every(code => code === 'None' || code === 'ConditionalCheckFailed') && codes.includes('ConditionalCheckFailed');
 }
+/** Why a store call ended without a result, other than throttling and a failed condition (both are normal outcomes). */
+export type DynamoFailureKind = 'stalled' | 'deadline' | 'transient_exhausted' | 'access_denied' | 'validation' | 'other';
+/** AWS error name to kind; a name not listed is 'transient_exhausted' after the short retries ran, else 'other'. */
+const FAILURE_KINDS: Readonly<Record<string, DynamoFailureKind>> = {
+    AccessDeniedException: 'access_denied', UnrecognizedClientException: 'access_denied', ExpiredTokenException: 'access_denied', InvalidSignatureException: 'access_denied', MissingAuthenticationTokenException: 'access_denied',
+    ValidationException: 'validation', SerializationException: 'validation', ItemCollectionSizeLimitExceededException: 'validation', IdempotentParameterMismatchException: 'validation',
+    InternalServerError: 'transient_exhausted', ServiceUnavailable: 'transient_exhausted', ServiceUnavailableException: 'transient_exhausted', RequestTimeout: 'transient_exhausted', TimeoutError: 'transient_exhausted',
+    TransactionCanceledException: 'transient_exhausted', TransactionInProgressException: 'transient_exhausted',
+};
+function failureKind(error: unknown, retried: boolean): DynamoFailureKind {
+    const name = object(error) && typeof error.name === 'string' ? error.name : undefined;
+    return (name === undefined ? undefined : Object.hasOwn(FAILURE_KINDS, name) ? FAILURE_KINDS[name] : undefined) ?? (retried ? 'transient_exhausted' : 'other');
+}
 function operationOf(command: DynamoCommand): 'get' | 'batch_get' | 'put' | 'transact' {
     return command instanceof TransactWriteCommand ? 'transact' : command instanceof BatchGetCommand ? 'batch_get' : command instanceof PutCommand ? 'put' : 'get';
 }
@@ -86,6 +99,11 @@ export class DynamoRetrier {
         // eslint-disable-next-line no-console -- Deliberate fixed-literal diagnostic: no ids, keys, tokens or error text; evidence of throttling for capacity decisions.
         try { console.warn(JSON.stringify({ event: 'dynamodb_throttled', store: this.options.store, operation, attempt })); } catch { /* Diagnostics must not alter results. */ }
     }
+    /** One line per call that ends in a failure that is neither throttling nor a failed condition: fixed fields only, never error text. */
+    private fail(operation: ReturnType<typeof operationOf>, kind: DynamoFailureKind): void {
+        // eslint-disable-next-line no-console -- Deliberate fixed-literal diagnostic: no ids, keys, table name or error text; tells a stall or denial from a conflict.
+        try { console.warn(JSON.stringify({ event: 'dynamodb_failed', store: this.options.store, operation, kind })); } catch { /* Diagnostics must not alter results. */ }
+    }
     private async pause(budget: DynamoBudget, throttles: number): Promise<void> {
         const { env } = this.options;
         const wait = Math.floor(env.random() * Math.min(THROTTLE_CAP_MS, THROTTLE_BASE_MS * 2 ** (throttles - 1)));
@@ -102,21 +120,26 @@ export class DynamoRetrier {
         let throttles = 0; let transients = 0;
         for (let attempt = 1; ; attempt++) {
             const left = budget.deadline - env.now();
-            if (left <= 0) { throw unavailable(); }
+            if (left <= 0) { this.fail(operationOf(command), 'deadline'); throw unavailable(); }
             const controller = new AbortController();
             let timer: ReturnType<typeof setTimeout> | undefined; let stalled = false;
             try {
                 return await Promise.race([client.send(command, { abortSignal: controller.signal }), new Promise<never>((_resolve, reject) => { timer = setTimeout(() => { stalled = true; controller.abort(); reject(unavailable()); }, left); })]);
             } catch (error) {
                 clearTimeout(timer); // The attempt is over; the timer must not fire during the backoff below.
-                if (stalled || (command instanceof TransactWriteCommand && conditionalConflict(error, command.input.TransactItems?.length ?? 0)) || (object(error) && typeof error.name === 'string' && FINAL_ERRORS.has(error.name))) { throw error; }
+                if (stalled) { this.fail(operationOf(command), 'stalled'); throw error; }
+                if (command instanceof TransactWriteCommand && conditionalConflict(error, command.input.TransactItems?.length ?? 0)) { throw error; }
+                if (object(error) && typeof error.name === 'string' && FINAL_ERRORS.has(error.name)) {
+                    if (error.name !== 'ConditionalCheckFailedException') { this.fail(operationOf(command), failureKind(error, false)); }
+                    throw error;
+                }
                 if (isThrottled(error)) {
                     budget.markThrottled(); throttles++; this.log(operationOf(command), attempt);
                     await this.pause(budget, throttles);
                 } else {
-                    if (transients >= TRANSIENT_RETRIES || !this.options.retryTransient(command)) { throw error; }
+                    if (transients >= TRANSIENT_RETRIES || !this.options.retryTransient(command)) { this.fail(operationOf(command), failureKind(error, transients > 0)); throw error; }
                     await env.sleep(25 * 2 ** transients++);
-                    if (budget.deadline <= env.now()) { throw unavailable(); }
+                    if (budget.deadline <= env.now()) { this.fail(operationOf(command), 'deadline'); throw unavailable(); }
                 }
             } finally { clearTimeout(timer); }
         }

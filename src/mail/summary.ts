@@ -39,7 +39,7 @@ export function errorText(code: MailFailureCode, name: MailToolName): string {
             : name === 'create_reply_draft' ? `The new draft could not be checked: a header did not read back exactly (simplify the subject, names or file names), the original message could not be confirmed, or ${uploadMismatch}.`
             : name === 'update_draft' ? `The draft could not be changed safely: its current state could not be confirmed (an earlier change to it may be unfinished or uncertain, or it was changed outside this server; read it again and check managedOperation), or ${uploadMismatch}.`
             : write ? 'The current state of the message could not be confirmed: an earlier change to it may be unfinished or uncertain, or it was changed outside this server. Read it again (see managedOperation) before deciding what to do.' : 'The mail server returned data that could not be checked. Try again later.',
-        no_recipients: write ? 'The draft has no recipients in to, cc or bcc. Add one with update_draft, then send it.' : 'The message has no recipient information.',
+        no_recipients: write ? 'The draft has no recipients in to, cc or bcc. Try update_draft to add one; if editing is refused, the draft must be created again.' : 'The message has no recipient information.',
         invalid_input: composes(name) ? 'The request was rejected as invalid. Check the arguments against the tool\'s input schema. If an attachment uses source, its own file name or type may not be usable here: give filename and contentType yourself.'
             : name === 'create_attachment_upload' ? 'The request was rejected: sizeBytes must be a whole number from 1 to 18 MiB (18874368), and sha256 must be 64 lowercase hex digits of the exact file.' : 'The request was rejected as invalid. Check the arguments against the tool\'s input schema.',
         upstream_timeout: 'The mail server did not answer in time. Try again later.',
@@ -77,18 +77,20 @@ function successText(name: MailWriteTool, result: MailOutput<MailWriteTool>): st
             ? `Message moved and verified (read back from the mail server): now uid ${uid} in mailbox ${mailboxId}, version ${version}; use these from now on, the old uid no longer exists.`
             : `Flags changed and verified (read back from the mail server): message uid ${uid}, version ${version}; pass the version as expectedVersion for the next change, and read the message to see all its flags.`;
     }
-    if ('queueId' in result) {
+    if (result.status === 'queued') {
         return `Draft sent: accepted by the mail server for delivery (queued), which does not confirm it arrived; ${result.sent === undefined ? 'the mail server reported no copy in Sent' : `the copy in Sent is uid ${result.sent.uid} in mailbox ${result.sent.mailboxId}`}.`;
     }
     return undefined;
 }
+const sendFailedText = (temporary: boolean): string => `The mail was not sent. ${temporary ? 'To try again, use a new operationId.' : 'Fix the cause above, then try again with a new operationId: this one now only returns this failure.'} If a new send of the same draft is refused, the draft must be created again.`;
 /** What a write result means, and what to do next: a one-sentence summary on success, an explanation otherwise. */
 export function receiptSummary(name: MailWriteTool, result: MailOutput<MailWriteTool>): string | undefined {
     switch (result.status) {
         case 'completed': case 'queued': return successText(name, result);
         // A failure is recorded under its operationId and replayed for any identical retry, so a retry needs a new one. When the
         // cause is in the request or the files, say it must be fixed first; waiting is enough for a temporary fault.
-        case 'failed': return `Not done: ${errorText(result.reason, name)} ${temporaryReasons.includes(result.reason) ? 'Nothing was changed; to try again, use a new operationId.' : 'Nothing was changed. Fix the cause above, then try again with a new operationId: this one now only returns this failure.'}`;
+        // A refused send can follow an attempt that already rewrote or marked the draft, so a failed send_draft never says the draft is untouched.
+        case 'failed': return `Not done: ${errorText(result.reason, name)} ${name === 'send_draft' ? sendFailedText(temporaryReasons.includes(result.reason)) : temporaryReasons.includes(result.reason) ? 'The requested change was not applied; to try again, use a new operationId.' : 'The requested change was not applied. Fix the cause above, then try again with a new operationId: this one now only returns this failure.'}`;
         case 'conflict': return result.reason === 'operation_conflict'
             ? 'Conflict: this operationId was already used for a request with other arguments. Nothing was changed. Use a new operationId for a new action.'
             : 'Conflict: another change to this message is unfinished or uncertain, or the message was already moved, replaced, sent or deleted. Nothing was changed. List or read again to find the message and its current uid.';

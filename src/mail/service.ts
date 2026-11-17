@@ -1,9 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { DEFAULT_THROTTLE_TIMEOUT_MS, RESPONSE_RESERVE_MS } from '../dynamo-retry';
 import { remainingRequestTimeMs, withRequestBudget } from '../request-budget';
+import { currentRequestId } from '../request-id';
 import { digest, randomId } from '../auth/crypto';
-import { MailError, ATTACHMENT_UPLOAD_KEY_PREFIX, type AttachmentUploadRecord, type CanonicalReadMessage, type ActivationProof, type AuthoredSourceDescriptor, type SourceGrade, type AttachmentDownloadLink, type MessageSourceDownloadLink, type AttachmentDownload, type AttachmentUploadLink, type AttachmentUploadStager, type AttachmentUploadStore, type BackendMailSession, type DraftMailSession, type ConfirmedReceipt, type FailedReceipt, type MailBackendReader, type MailBackendWriter, type MailContext, type MailInput, type MailOperationMarker, type MailOperationRecord, type MailOperationStore, type MailOutput, type MailService, type MailToolName, type MailWriteTool, type MessageKey, type MessageRef, type MessageSnapshot, type OperationClaim, type OperationKey, type PreparedDraft, type ReservationResult, type UnknownReceipt, type WriteIntent } from './contracts';
+import { MailError, ATTACHMENT_UPLOAD_KEY_PREFIX, KNOWN_UPSTREAM_CODES, type AttachmentUploadRecord, type CanonicalReadMessage, type ActivationProof, type AuthoredSourceDescriptor, type SourceGrade, type AttachmentDownloadLink, type MessageSourceDownloadLink, type AttachmentDownload, type AttachmentUploadLink, type AttachmentUploadStager, type AttachmentUploadStore, type BackendMailSession, type DraftMailSession, type ConfirmedReceipt, type FailedReceipt, type MailBackendReader, type MailBackendWriter, type MailContext, type MailInput, type MailOperationMarker, type MailOperationRecord, type MailOperationStore, type MailOutput, type MailService, type MailToolName, type MailWriteTool, type MessageKey, type MessageRef, type MessageSnapshot, type OperationClaim, type OperationKey, type PreparedDraft, type ReservationResult, type UnknownReceipt, type WriteIntent } from './contracts';
 import { batchSummary, errorText } from './summary';
+import { verifyRead } from './verify-read';
 import { activationProofSchema, draftContentSchema, failureReasonSchema, mailboxSchema, mailInputSchemas, mailOperationMarkerSchema, mailOutputSchemas, canonicalReadMessageOutputSchema, attachmentDownloadLinkSchema, messageSourceDownloadLinkSchema, attachmentUploadLinkSchema, UPLOAD_TTL_SECONDS, messageKeySchema, messageRefSchema, MAX_BATCH_BYTES, BATCH_CONCURRENCY } from './schemas';
 
 /** uploads is optional so deployments without an upload bucket still serve every other tool;
@@ -46,15 +48,28 @@ const temporary = () => new MailError('temporarily_unavailable');
 export const PREFLIGHT_RESERVE_MS = 20_000;
 /** The longest a reservation can take: one store operation's throttle budget, which bounds all its reads and its
  * transaction together and is at least its unthrottled timeout (at most 5 s). Derived from, and so only exact for,
- * the default the runtime's DynamoMailOperationStore uses; a store given a longer throttleTimeoutMs can overrun the
- * window, and its preflight is then cut off at once and its failure recorded on what is left of the request. */
+ * the default the runtime's DynamoMailOperationStore uses, which rejects a longer throttleTimeoutMs, so the window
+ * cannot be overrun. */
 export const RESERVE_ADMISSION_MS = DEFAULT_THROTTLE_TIMEOUT_MS;
 /** Kept back for settling an owned reservation whose outcome was unknown: failPreflight throttled for its whole
  * budget, plus the response. Its read-back runs under a request budget that ends this long before the request does. */
 const SETTLEMENT_RESERVE_MS = DEFAULT_THROTTLE_TIMEOUT_MS + RESPONSE_RESERVE_MS;
 function sanitized(error: unknown): MailError {
     const code = error instanceof MailError ? failureReasonSchema.safeParse(error.code) : undefined;
-    return code?.success ? new MailError(code.data, error instanceof MailError ? error.retryAfter : undefined, error instanceof MailError ? { cause: error.searchCause, status: error.upstreamStatus } : undefined) : temporary();
+    return code?.success && error instanceof MailError ? new MailError(code.data, error.retryAfter, { cause: error.searchCause, status: error.upstreamStatus, upstreamCode: error.upstreamCode, notApplied: error.notApplied }) : temporary();
+}
+/** Where a write ended with no settled record; the step of a mail_write_unsettled line. */
+type UnsettledStep = 'reserve' | 'preflight_settle' | 'dispatch_mark' | 'upstream' | 'complete' | 'unknown_mark';
+/** WildDuck's own code only when it is one the backend names (KNOWN_UPSTREAM_CODES), else the sanitised failure code: never arbitrary upstream data. */
+const failureCode = (error: unknown): string => {
+    const upstream = error instanceof MailError ? KNOWN_UPSTREAM_CODES.find(known => known === error.upstreamCode) : undefined;
+    return upstream ?? sanitized(error).code;
+};
+/** The one diagnostic line for a write that ends without a settled record: fixed fields only, no operation, account or message data. */
+function logUnsettled(tool: MailWriteTool, step: UnsettledStep, code: string): void {
+    const requestId = currentRequestId();
+    // eslint-disable-next-line no-console -- Deliberate fixed-field diagnostic: tool, step enum, allowlisted code, server-generated request ID; no ids, account data or error text.
+    try { console.warn(JSON.stringify({ event: 'mail_write_unsettled', tool, step, code, ...(requestId === undefined ? {} : { requestId }) })); } catch { /* Diagnostics must not alter mail results. */ }
 }
 function stable(value: unknown): string {
     if (Array.isArray(value)) { return `[${value.map(stable).join(',')}]`; }
@@ -298,12 +313,13 @@ export function createMailService({ reader, writer, operations, uploads }: Depen
             // The settlement has priority: the read-back ends SETTLEMENT_RESERVE_MS before the request, or is skipped.
             const left = remainingRequestTimeMs(); const readBackEnd = left === undefined ? undefined : performance.now() + left - SETTLEMENT_RESERVE_MS;
             const readBackLeft = () => readBackEnd === undefined ? Infinity : Math.max(0, readBackEnd - performance.now());
-            if (readBackLeft() <= 0) { throw sanitized(error); }
+            const unproven = (): MailError => { logUnsettled(tool, 'reserve', failureCode(error)); return sanitized(error); };
+            if (readBackLeft() <= 0) { throw unproven(); }
             let record: MailOperationRecord | undefined;
-            try { record = await (readBackEnd === undefined ? operations.getOperation(key) : withRequestBudget(readBackLeft, () => operations.getOperation(key))); } catch { throw sanitized(error); }
-            if (!record || record.state !== 'reserved' || record.ownerToken !== ownerToken || !matches(record, key, tool, parsed, payloadDigest)) { throw sanitized(error); }
+            try { record = await (readBackEnd === undefined ? operations.getOperation(key) : withRequestBudget(readBackLeft, () => operations.getOperation(key))); } catch { throw unproven(); }
+            if (!record || record.state !== 'reserved' || record.ownerToken !== ownerToken || !matches(record, key, tool, parsed, payloadDigest)) { throw unproven(); }
             const failed: FailedReceipt = { status: 'failed', operationId: key.operationId, reason: 'temporarily_unavailable' };
-            try { await operations.failPreflight({ key, ownerToken, revision: record.revision, state: 'reserved' }, failed); } catch { throw temporary(); }
+            try { await operations.failPreflight({ key, ownerToken, revision: record.revision, state: 'reserved' }, failed); } catch (failure) { logUnsettled(tool, 'reserve', failureCode(failure)); throw temporary(); }
             return output(tool, failed);
         }
         try {
@@ -341,7 +357,7 @@ export function createMailService({ reader, writer, operations, uploads }: Depen
         } catch (error) {
             // Outside the window: the full request budget, at least PREFLIGHT_RESERVE_MS of it, records the failure.
             const failed: FailedReceipt = { status: 'failed', operationId: key.operationId, reason: sanitized(error).code };
-            try { await operations.failPreflight(claim, failed); } catch { throw temporary(); }
+            try { await operations.failPreflight(claim, failed); } catch (failure) { logUnsettled(tool, 'preflight_settle', failureCode(failure)); throw temporary(); }
             return output(tool, failed);
         }
         const unknown: UnknownReceipt = { status: 'outcome_unknown', operationId: key.operationId, reason: 'dispatch_uncertain' };
@@ -349,31 +365,51 @@ export function createMailService({ reader, writer, operations, uploads }: Depen
             try { const record = await operations.getOperation(key); if (record && record.state === 'settled' && matches(record, key, tool, parsed, payloadDigest)) { return receipt(tool, record); } } catch { /* No durable outcome can be proved. */ }
             return undefined;
         }
-        async function uncertain(dispatched?: OperationClaim<'dispatched'>): Promise<MailOutput<MailWriteTool>> {
-            const known = await saved(); if (known) { return known; }
-            if (dispatched) {
-                try { await operations.markOutcomeUnknown(dispatched, unknown); } catch { /* Existing fence remains in place. */ }
-                const settled = await saved(); if (settled) { return settled; }
+        /** A dispatched record whose outcome is unknown: the stored result if one landed, else recorded as unknown. A returned outcome_unknown is logged once, at the step that left it. */
+        async function uncertain(dispatched: OperationClaim<'dispatched'>, step: UnsettledStep, code: string): Promise<MailOutput<MailWriteTool>> {
+            let result = await saved(); let at = step;
+            if (!result) {
+                try { await operations.markOutcomeUnknown(dispatched, unknown); } catch { at = 'unknown_mark'; /* Existing fence remains in place. */ }
+                result = await saved() ?? output(tool, unknown);
             }
-            return output(tool, unknown);
+            if (result.status === 'outcome_unknown') { logUnsettled(tool, at, code); }
+            return result;
         }
-        let dispatched: OperationClaim<'dispatched'>;
-        try {
-            dispatched = await operations.markDispatched(claim);
-            if (dispatched.state !== 'dispatched' || !sameKey(dispatched.key, key) || dispatched.ownerToken !== ownerToken || !Number.isSafeInteger(dispatched.revision) || dispatched.revision <= claim.revision) { return uncertain(); }
-        } catch {
+        /** markDispatched gave no usable claim, so this call has made no WildDuck call. One read-back decides: a settled record is replayed; a dispatched or reserved
+         * record that carries this call's ownerToken is settled as a failure that applied no change; anything else is in_progress. */
+        async function undispatched(code: string): Promise<MailOutput<MailWriteTool>> {
+            const failed: FailedReceipt = { status: 'failed', operationId: key.operationId, reason: 'temporarily_unavailable' };
             try {
                 const record = await operations.getOperation(key);
                 if (record && matches(record, key, tool, parsed, payloadDigest)) {
                     if (record.state === 'settled') { return receipt(tool, record); }
-                    if (record.state === 'dispatched' && record.ownerToken === ownerToken) { return uncertain({ key, ownerToken, revision: record.revision, state: 'dispatched' }); }
+                    if (record.state === 'dispatched' && record.ownerToken === ownerToken) {
+                        const own: OperationClaim<'dispatched'> = { key, ownerToken, revision: record.revision, state: 'dispatched' };
+                        // No WildDuck call was made, so never markOutcomeUnknown here: one re-read for a settlement that landed, else the record stays dispatched and this is in_progress.
+                        try { await operations.failDispatched(own, failed); return output(tool, failed); } catch { const landed = await saved(); if (landed) { return landed; } }
+                    }
+                    if (record.state === 'reserved' && record.ownerToken === ownerToken) {
+                        try { await operations.failPreflight({ key, ownerToken, revision: record.revision, state: 'reserved' }, failed); return output(tool, failed); } catch { /* Left reserved: in_progress below. */ }
+                    }
                 }
-            } catch { /* Explicit uncertainty without dispatching. */ }
-            return output(tool, unknown);
+            } catch { /* No record could be read: nothing proved. */ }
+            logUnsettled(tool, 'dispatch_mark', code);
+            return output(tool, { status: 'in_progress', operationId: key.operationId });
         }
+        let dispatched: OperationClaim<'dispatched'>;
+        try {
+            dispatched = await operations.markDispatched(claim);
+            if (dispatched.state !== 'dispatched' || !sameKey(dispatched.key, key) || dispatched.ownerToken !== ownerToken || !Number.isSafeInteger(dispatched.revision) || dispatched.revision <= claim.revision) { return undispatched('temporarily_unavailable'); }
+        } catch (error) { return undispatched(failureCode(error)); }
+        // complete is a compare-and-set: one repeat after a failure is harmless if the first landed (refused, and the re-read then finds the stored receipt).
+        // It runs only with room for a whole store operation and the response; past that, the uncertain path takes what is left of the request.
+        const stage = { step: 'upstream' as UnsettledStep };
         async function finish(result: unknown): Promise<MailOutput<MailWriteTool>> {
-            const validated = output(tool, result);
-            await operations.complete(dispatched, validated as ConfirmedReceipt);
+            const validated = output(tool, result); stage.step = 'complete';
+            try { await operations.complete(dispatched, validated as ConfirmedReceipt); } catch (error) {
+                const left = remainingRequestTimeMs(); if (left !== undefined && left < SETTLEMENT_RESERVE_MS) { throw error; }
+                await operations.complete(dispatched, validated as ConfirmedReceipt);
+            }
             return validated;
         }
         try {
@@ -389,7 +425,7 @@ export function createMailService({ reader, writer, operations, uploads }: Depen
                 }
                 const activation = proof(bound.accountId, verified, prepared.mime.sha256, 'mcp_authored');
                 if (intent.tool === 'create_draft' || intent.tool === 'create_reply_draft') { return await finish({ status: 'completed', operationId: key.operationId, draft: verified, verified: true, proof: activation }); }
-                try { await inspect(bound, intent.target, intent.expectedVersion, true); } catch (error) {
+                try { await verifyRead(() => inspect(bound, intent.target, intent.expectedVersion, true)); } catch (error) {
                     return await finish({ status: 'partial', operationId: key.operationId, candidate: verified, candidateVerified: true, proof: activation, reason: error instanceof MailError && error.code === 'version_conflict' ? 'original_version_changed' : 'original_verification_failed', originalDeletion: 'not_attempted' });
                 }
                 try { await writer.deleteDraft(bound, intent.target); } catch (error) {
@@ -417,7 +453,15 @@ export function createMailService({ reader, writer, operations, uploads }: Depen
             if (tool === 'move_message' ? message.mailboxId !== (parsed as MailInput<'move_message'>).destinationMailboxId : !sameMessage(message, intent.target)) { throw temporary(); }
             if (source ? mutation.sourceGrade !== 'mcp_authored' || mutation.contentDigest !== source.contentDigest : mutation.sourceGrade !== 'observed') { throw temporary(); }
             return await finish({ status: 'completed', operationId: key.operationId, message, verified: true, proof: proof(bound.accountId, message, mutation.contentDigest, mutation.sourceGrade) });
-        } catch { return uncertain(dispatched); }
+        } catch (error) {
+            // notApplied means the backend proved the change did not take effect, so it settles as a failure that releases the message. Never once complete has begun: the change then took effect.
+            if (stage.step === 'upstream' && error instanceof MailError && error.notApplied === true) {
+                const failed: FailedReceipt = { status: 'failed', operationId: key.operationId, reason: sanitized(error).code };
+                try { await operations.failDispatched(dispatched, failed); } catch { return uncertain(dispatched, 'upstream', failureCode(error)); }
+                return output(tool, failed);
+            }
+            return uncertain(dispatched, stage.step, failureCode(error));
+        }
     }
     /** Not a write tool: no operationId and no ledger. Each call stages a new upload record bound to
      * this account and OAuth client (digest(context.clientId)), expiring after UPLOAD_TTL_SECONDS. */

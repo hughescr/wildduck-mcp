@@ -5,12 +5,26 @@ export type { ActivationProof, AttachmentMetadata, AttachmentSource, AttachmentU
 
 export const searchFailureCauses = ['deadline', 'network', 'http_status', 'invalid_json', 'invalid_shape', 'mailbox_scope_mismatch', 'too_large'] as const;
 export type SearchFailureCause = typeof searchFailureCauses[number];
-/** Retain only allowlisted diagnostics. Never expose raw upstream errors, bodies or tokens. */
+/** upstreamCode: WildDuck's JSON body `code`, kept only as a short alphanumeric token, never as text. It is still arbitrary upstream data: only a member of KNOWN_UPSTREAM_CODES may be logged. */
+const UPSTREAM_CODE = /^[A-Za-z0-9]{1,64}$/u;
+/** The WildDuck body codes the backend names: InvalidToken and the allowlists that prove a mutation changed nothing. */
+export const KNOWN_UPSTREAM_CODES = ['InvalidToken', 'MessageNotDraft', 'TooMany', 'RateLimitedError', 'UserDisabled', 'UserNotFound', 'MessageNotFound'] as const;
+export type KnownUpstreamCode = typeof KNOWN_UPSTREAM_CODES[number];
+export interface MailErrorDiagnostic { cause?: SearchFailureCause | undefined; status?: number | undefined; upstreamCode?: string | undefined; notApplied?: boolean | undefined }
+/** Retain only allowlisted diagnostics. Never expose raw upstream errors, bodies or tokens.
+ * upstreamCode is WildDuck's body code of a non-success JSON answer (e.g. RateLimitedError). notApplied is set ONLY when
+ * the backend proved the write tool's requested change did not take effect (a failure before the first mutating request,
+ * or an upstream answer whose code is returned before any side effect); the service may then settle the write as failed.
+ * Unset means unproven, never "applied". Construct with diagnostic { notApplied: true }; copy one with MailError.asNotApplied. */
 export class MailError extends Error {
     declare readonly retryAfter?: number;
     declare readonly searchCause?: SearchFailureCause;
     declare readonly upstreamStatus?: number;
-    constructor(public readonly code: MailFailureCode, retryAfter: number | undefined = undefined, diagnostic: { cause?: SearchFailureCause | undefined; status?: number | undefined } | undefined = undefined) { super(code); this.name = 'MailError'; if (typeof retryAfter === 'number' && Number.isSafeInteger(retryAfter) && retryAfter >= 0 && retryAfter <= 86400) { this.retryAfter = retryAfter; } if (diagnostic && diagnostic.cause !== undefined && searchFailureCauses.includes(diagnostic.cause)) { this.searchCause = diagnostic.cause; if (typeof diagnostic.status === 'number' && Number.isInteger(diagnostic.status) && diagnostic.status >= 100 && diagnostic.status <= 599) { this.upstreamStatus = diagnostic.status; } } }
+    declare readonly upstreamCode?: string;
+    declare readonly notApplied?: true;
+    constructor(public readonly code: MailFailureCode, retryAfter: number | undefined = undefined, diagnostic: MailErrorDiagnostic | undefined = undefined) { super(code); this.name = 'MailError'; if (typeof retryAfter === 'number' && Number.isSafeInteger(retryAfter) && retryAfter >= 0 && retryAfter <= 86400) { this.retryAfter = retryAfter; } if (diagnostic && diagnostic.cause !== undefined && searchFailureCauses.includes(diagnostic.cause)) { this.searchCause = diagnostic.cause; if (typeof diagnostic.status === 'number' && Number.isInteger(diagnostic.status) && diagnostic.status >= 100 && diagnostic.status <= 599) { this.upstreamStatus = diagnostic.status; } } if (diagnostic && typeof diagnostic.upstreamCode === 'string' && UPSTREAM_CODE.test(diagnostic.upstreamCode)) { this.upstreamCode = diagnostic.upstreamCode; } if (diagnostic?.notApplied === true) { this.notApplied = true; } }
+    /** The same error with notApplied set; every other retained fact is copied. */
+    static asNotApplied(error: MailError): MailError { return error.notApplied ? error : new MailError(error.code, error.retryAfter, { cause: error.searchCause, status: error.upstreamStatus, upstreamCode: error.upstreamCode, notApplied: true }); }
 }
 /** Reserved upstream metaData field. Raw marker contents are never public output. */
 export const MAIL_OPERATION_METADATA_KEY = 'wildduckMcpOperationV1';
@@ -176,7 +190,8 @@ export type WriteIntent = OperationKey & { readonly payloadDigest: string } & (
 export interface OperationClaim<State extends 'reserved' | 'dispatched' = 'reserved' | 'dispatched'> {
     readonly key: OperationKey; readonly ownerToken: string; readonly revision: number; readonly state: State;
 }
-interface OperationRecordBase { readonly key: OperationKey; readonly ownerToken: string; readonly revision: number; readonly intent: WriteIntent }
+/** reservedAt: epoch seconds, read when present and carried unchanged through every transition; this version never writes it. */
+interface OperationRecordBase { readonly key: OperationKey; readonly ownerToken: string; readonly revision: number; readonly intent: WriteIntent; readonly reservedAt?: number | undefined }
 export type MailOperationRecord = OperationRecordBase & (
     | { readonly state: 'reserved' | 'dispatched' }
     | { readonly state: 'settled'; readonly receipt: MailReceipt }
@@ -193,8 +208,10 @@ export type ReservationResult =
     | { readonly kind: 'replay'; readonly record: MailOperationRecord }
     | { readonly kind: 'conflict'; readonly reason: 'operation_conflict' | 'draft_fenced' };
 /** Separate adapter over existing table; auth AtomicStore union is unchanged.
- * Strong reads, owner+revision CAS, atomic associated guard checks. NO TTL and
- * NO reclaim based on elapsed time for pending/unknown/queued/retired states.
+ * Strong reads, owner+revision CAS, atomic associated guard checks. Readers accept
+ * an optional expiresAt on an item and reservedAt in a record; this version writes
+ * neither, so nothing expires. NO reclaim based on elapsed time for
+ * pending/unknown/queued/retired states.
  * Store only digests and minimal references/proofs/queue receipts: never bodies,
  * subjects, addresses, tokens, custom flag/label names or complete inputs.
  * Match receipt to tool/operation ID. Ambiguous DB outcomes throw sanitized
@@ -206,7 +223,8 @@ export interface MailOperationStore {
     reserve(intent: WriteIntent, ownerToken: string): Promise<ReservationResult>;
     /** Confirm this transition BEFORE any irreversible call, including marker PUT. */
     markDispatched(claim: OperationClaim<'reserved'>): Promise<OperationClaim<'dispatched'>>;
-    /** Durable failed receipt and guard release together, only before dispatch. */
+    /** Durable failed receipt and guard release together, only before dispatch (from 'reserved').
+     * After dispatch (from 'dispatched') the sibling is failDispatched. */
     failPreflight(claim: OperationClaim<'reserved'>, receipt: FailedReceipt): Promise<void>;
     /** Atomic receipt+guard transition. Verified flag completion RELEASES same-UID
      * guard. Move/delete/update retire source; send queues/permanently fences it.
@@ -221,14 +239,22 @@ export interface MailOperationStore {
      * Send's actual receipt.sent key activates only as observed, never authored.
      * Flags receipt stays minimal; replay neither refetches nor echoes current sets. */
     complete(claim: OperationClaim<'dispatched'>, receipt: ConfirmedReceipt): Promise<void>;
-    /** Any unproved post-dispatch outcome permanently fences the target. */
+    /** Any unproved post-dispatch outcome permanently fences the target (this version never reclaims it by age). */
     markOutcomeUnknown(claim: OperationClaim<'dispatched'>, receipt: UnknownReceipt): Promise<void>;
+    /** Durable failed receipt and guard release together, from 'dispatched'. Only for a failure PROVEN to have changed
+     * nothing (MailError.notApplied) or for a call whose dispatch mark failed before any WildDuck request; anything
+     * unproved is markOutcomeUnknown. */
+    failDispatched(claim: OperationClaim<'dispatched'>, receipt: FailedReceipt): Promise<void>;
 }
 /** Service checks scope + active session BEFORE backend/store: reads mail:read,
  * drafts mail:draft, send mail:send, move/flags mail:modify. Every mutation checks
  * private marker -> durable original operation -> exact target activation proof,
  * except its own staged verification. Unactivated candidates never become sendable.
  * Public writes always pass this coordinator; no raw writer reaches MCP.
+ * After dispatch a write settles 'failed' (guard released) only when the backend proved the requested
+ * change did not take effect (MailError.notApplied); every unproved failure is 'outcome_unknown'.
+ * A call whose dispatch mark failed made no WildDuck request: it reports 'failed' or 'in_progress', never 'outcome_unknown'.
+ * Verification reads retry once, the completion write retries once, mutating WildDuck requests never.
  * Drafts whose attachments use source also need mail:read. create_attachment_upload needs
  * mail:draft and is not a write tool: no operationId, no ledger, a new record per call. */
 export type MailResult<Name extends MailToolName> = Name extends 'read_attachment' ? AttachmentDownload : Name extends 'get_attachment_download' ? AttachmentDownloadLink : Name extends 'get_message_source_download' ? MessageSourceDownloadLink : Name extends 'create_attachment_upload' ? AttachmentUploadLink : MailOutput<Name>;

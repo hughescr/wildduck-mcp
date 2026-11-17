@@ -82,6 +82,8 @@ describe('retrier', () => {
             await expect(failing.retrier.send(get(), failing.retrier.begin())).rejects.toThrow(name);
             expect(failing.calls).toHaveLength(1);
         }
+        // A failed condition is a normal outcome and says nothing; a reused token with another payload is a failure.
+        expect(logs).toEqual([{ event: 'dynamodb_failed', store: 'mail', operation: 'get', kind: 'validation' }]); logs.length = 0;
         const conflict = cancelled('ConditionalCheckFailed');
         const transact = make(async () => { throw conflict; }, { env: virtualRetry().retry });
         const command = new TransactWriteCommand({ ClientRequestToken: 'token', TransactItems: [{ ConditionCheck: { TableName: 'T', Key: { pk: 'p', sk: 'STATE' }, ConditionExpression: 'attribute_exists(pk)' } }] });
@@ -105,6 +107,38 @@ describe('retrier', () => {
         await expect(retrier.send(get(), retrier.begin())).rejects.toThrow('unavailable');
         expect(logs.length).toBeGreaterThan(1);
         logs.forEach((line, index) => expect(line).toEqual({ event: 'dynamodb_throttled', store: 'mail', operation: 'get', attempt: index + 1 }));
+    });
+    test('a final non-throttle failure is one fixed-literal dynamodb_failed line with a kind from a fixed set, and never error text', async () => {
+        const secret = 'secret table detail pk=wildduck-mcp#x account 123456789012';
+        const failed = async (error: unknown, options: Parameters<typeof make>[1] = {}, command: DynamoCommand = get()) => {
+            logs.length = 0; const { retrier } = make(async () => { throw error; }, { env: virtualRetry().retry, ...options });
+            await expect(retrier.send(command, retrier.begin())).rejects.toBe(error); return [...logs];
+        };
+        const named = (name: string) => Object.assign(new Error(secret), { name });
+        const line = (kind: string, operation = 'get') => ({ event: 'dynamodb_failed', store: 'mail', operation, kind });
+        expect(await failed(new Error(secret))).toEqual([line('transient_exhausted')]);
+        expect(await failed(new Error(secret), { retryTransient: false })).toEqual([line('other')]);
+        expect(await failed(named('InternalServerError'), { retryTransient: false })).toEqual([line('transient_exhausted')]);
+        for (const name of ['AccessDeniedException', 'UnrecognizedClientException', 'ExpiredTokenException']) { expect(await failed(named(name))).toEqual([line('access_denied')]); }
+        for (const name of ['ValidationException', 'SerializationException']) { expect(await failed(named(name))).toEqual([line('validation')]); }
+        expect(await failed(named('toString'), { retryTransient: false })).toEqual([line('other')]);
+        expect(await failed({ code: 'x' }, { retryTransient: false })).toEqual([line('other')]);
+        const transact = new TransactWriteCommand({ ClientRequestToken: 'token', TransactItems: [{ ConditionCheck: { TableName: 'T', Key: { pk: 'p', sk: 'STATE' }, ConditionExpression: 'attribute_exists(pk)' } }] });
+        expect(await failed(named('ValidationException'), {}, transact)).toEqual([line('validation', 'transact')]);
+        // Not logged: a failed condition, a cancelled transaction that only conflicted, and throttling (which has its own line).
+        expect(await failed(named('ConditionalCheckFailedException'))).toEqual([]);
+        expect(await failed(cancelled('ConditionalCheckFailed'), {}, transact)).toEqual([]);
+        // A stalled call and a spent budget.
+        logs.length = 0; const stalled = make(() => new Promise(() => {}), { timeoutMs: 20 });
+        await expect(stalled.retrier.send(get(), stalled.retrier.begin())).rejects.toThrow('unavailable');
+        expect(logs).toEqual([line('stalled')]); logs.length = 0;
+        const late = virtualRetry(); const slow = make(async () => { late.clock.ms += 6000; throw new Error(secret); }, { env: late.retry });
+        await expect(slow.retrier.send(get(), slow.retrier.begin())).rejects.toThrow('unavailable');
+        expect(logs).toEqual([line('deadline')]); logs.length = 0;
+        const spent = virtualRetry(); const over = make(async () => 'ok', { env: spent.retry }); const budget = over.retrier.begin(); spent.clock.ms += 6000;
+        await expect(over.retrier.send(get(), budget)).rejects.toThrow('unavailable');
+        expect(over.calls).toHaveLength(0); expect(logs).toEqual([line('deadline')]);
+        expect(JSON.stringify(logs)).not.toContain('secret');
     });
 });
 

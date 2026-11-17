@@ -184,10 +184,10 @@ test('actual upstream timeout reports read budget exhaustion without guessing ge
     expect(result.isError).toBe(true); expect(result.content[0].text).toContain('did not answer in time'); expect(result.content[0].text).not.toContain('narrow'); expect(result.content[0].text).not.toContain('operationId');
 });
 
-test('failed receipts say nothing changed and that another attempt needs a new operationId', async () => {
+test('failed receipts say the requested change was not applied and that another attempt needs a new operationId', async () => {
     const f = fixture(); f.mail.create_draft = async input => ({ status: 'failed', operationId: input.operationId, reason: 'upstream_timeout' });
     const result = (await f.call('create_draft', { operationId, subject: '', body: { text: '' } })).result;
-    expect(result.isError).toBe(true); expect(result.structuredContent.reason).toBe('upstream_timeout'); expect(summaryText(result)).toBe('Not done: The mail server did not answer in time. Try again later. Nothing was changed; to try again, use a new operationId.');
+    expect(result.isError).toBe(true); expect(result.structuredContent.reason).toBe('upstream_timeout'); expect(summaryText(result)).toBe('Not done: The mail server did not answer in time. Try again later. The requested change was not applied; to try again, use a new operationId.');
 });
 test('conflict and partial receipts explain each reason and the next step', async () => {
     const f = fixture(); const texts: string[] = [];
@@ -642,6 +642,16 @@ test('send_draft says so when the mail server reported no Sent copy', async () =
     const f = fixture(); const summary = summaryText((await f.call('send_draft', { uid: 1, expectedVersion: version, operationId })).result);
     expect(summary).toContain('Draft sent: accepted by the mail server for delivery'); expect(summary).toContain('reported no copy in Sent');
 });
+test('a queued send without a queueId still gets its summary, and a failed send says the mail was not sent', () => {
+    expect(receiptSummary('send_draft', { status: 'queued', operationId } as never)).toContain('Draft sent: accepted by the mail server for delivery');
+    for (const reason of ['temporarily_unavailable', 'no_recipients'] as const) {
+        const summary = receiptSummary('send_draft', { status: 'failed', operationId, reason }) ?? '';
+        expect(summary).toContain('The mail was not sent. '); expect(summary).toContain('If a new send of the same draft is refused, the draft must be created again.'); expect(summary).not.toMatch(/nothing was changed/iu); expect(summary).not.toMatch(BANNED);
+    }
+    expect(receiptSummary('move_message', { status: 'failed', operationId, reason: 'temporarily_unavailable' })).toContain('The requested change was not applied; to try again, use a new operationId.');
+    const none = receiptSummary('send_draft', { status: 'failed', operationId, reason: 'no_recipients' }) ?? '';
+    expect(none).toContain('if editing is refused, the draft must be created again'); expect(none).not.toContain('Add one with update_draft');
+});
 test('every non-success write result of every write tool carries its explanation first, in the structure and in the text', async () => {
     const f = fixture(); const target = { uid: 1, expectedVersion: version, operationId };
     const candidate = { mailboxId, uid: 9, version: versions.replaced };
@@ -651,7 +661,7 @@ test('every non-success write result of every write tool carries its explanation
         { status: 'partial', operationId, candidate: { mailboxId, uid: 3 }, candidateVerified: false, reason: 'candidate_verification_failed', originalDeletion: 'not_attempted' },
         ...[['original_deletion_failed', 'failed'], ['original_deletion_unconfirmed', 'unconfirmed'], ['original_version_changed', 'not_attempted'], ['original_verification_failed', 'not_attempted']].map(([reason, originalDeletion]) => ({ status: 'partial', operationId, candidate, candidateVerified: true, proof: confirmed(candidate, 'mcp_authored'), reason, originalDeletion })),
     ];
-    const advice = { upstream_timeout: 'Nothing was changed', version_conflict: 'Read it again', operation_conflict: 'Use a new operationId', draft_fenced: 'find the message and its current uid', in_progress: 'stop retrying', dispatch_uncertain: 'Do not repeat the change under a new operationId', candidate_verification_failed: 'cannot edit or send it', original_deletion_failed: `use uid 9, version ${versions.replaced}`, original_deletion_unconfirmed: `use uid 9, version ${versions.replaced}`, original_version_changed: 'both were kept', original_verification_failed: 'both were kept' } as const;
+    const advice = { upstream_timeout: 'The requested change was not applied', version_conflict: 'Read it again', operation_conflict: 'Use a new operationId', draft_fenced: 'find the message and its current uid', in_progress: 'stop retrying', dispatch_uncertain: 'Do not repeat the change under a new operationId', candidate_verification_failed: 'cannot edit or send it', original_deletion_failed: `use uid 9, version ${versions.replaced}`, original_deletion_unconfirmed: `use uid 9, version ${versions.replaced}`, original_version_changed: 'both were kept', original_verification_failed: 'both were kept' } as const;
     for (const name of mailWriteToolSchema.options) {
         for (const result of results) {
             // Only drafts that are created or replaced can end partly done, and only update_draft can leave the old copy behind.
@@ -665,7 +675,10 @@ test('every non-success write result of every write tool carries its explanation
             expect({ label, summary: typeof summary }).toEqual({ label, summary: 'string' }); expect({ label, first: firstKey(reply) }).toEqual({ label, first: 'summary' });
             expect({ label, same: jsonOf(reply) }).toEqual({ label, same: reply.structuredContent }); expect(reply.content).toHaveLength(1); expect(withoutSummary(reply.structuredContent)).toEqual(result);
             expect({ label, summary }).toEqual({ label, summary: receiptSummary(name, result as never) });
-            const key = 'reason' in result ? result.reason : result.status; expect({ label, advice: summary.includes(advice[key as keyof typeof advice]) }).toEqual({ label, advice: true });
+            // A failed send says the mail was not sent, never that nothing was changed: the refused attempt may already have rewritten the draft.
+            const key = 'reason' in result ? result.reason : result.status; const sendFailure = name === 'send_draft' && result.status === 'failed';
+            expect({ label, advice: summary.includes(advice[key as keyof typeof advice].replace('The requested change was not applied', sendFailure ? 'The mail was not sent' : 'The requested change was not applied')) }).toEqual({ label, advice: true });
+            if (sendFailure) { expect({ label, claimsUntouched: /nothing was changed/iu.test(summary), recreate: summary.includes('the draft must be created again') }).toEqual({ label, claimsUntouched: false, recreate: true }); }
         }
     }
 });
@@ -892,7 +905,7 @@ test('draft failures from uploads and copied attachments say what is wrong and h
         expect(errorText('too_large', name)).not.toContain('2 MiB of attachments');
     }
     // Temporary faults keep the earlier wording, and no tool but the drafts claims the new causes.
-    expect(receiptSummary('create_draft', { status: 'failed', operationId, reason: 'temporarily_unavailable' })).toBe('Not done: The mail service is temporarily unavailable. Try again later. Nothing was changed; to try again, use a new operationId.');
+    expect(receiptSummary('create_draft', { status: 'failed', operationId, reason: 'temporarily_unavailable' })).toBe('Not done: The mail service is temporarily unavailable. Try again later. The requested change was not applied; to try again, use a new operationId.');
     for (const name of ['delete_draft', 'send_draft', 'move_message', 'update_message_flags'] as const) { expect(errorText('not_found', name)).not.toContain('uploadId'); expect(errorText('too_large', name)).not.toContain('25 MiB'); }
     // A thrown error carries no stored failure: the same operationId stays right for the same arguments, a changed one needs a new id.
     for (const name of draftTools) {

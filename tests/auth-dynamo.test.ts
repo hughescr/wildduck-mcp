@@ -143,7 +143,7 @@ describe('throttling', () => {
     test('a condition failure beside a throttle stays an ambiguity: short retries only, no throttle log', async () => {
         const { store, calls, virtual } = fixture(async () => { throw cancelled('ConditionalCheckFailed', 'ProvisionedThroughputExceeded'); });
         await expect(store.transact({ ...write(), conditions: [...write().conditions, { kind: 'connection', id: 'other', revision: 1 }] })).rejects.toThrow('temporarily_unavailable');
-        expect(calls).toHaveLength(3); expect(virtual.sleeps).toEqual([25, 50]); expect(logs).toEqual([]);
+        expect(calls).toHaveLength(3); expect(virtual.sleeps).toEqual([25, 50]); expect(logs).toEqual([{ event: 'dynamodb_failed', store: 'auth', operation: 'transact', kind: 'transient_exhausted' }]);
     });
     test('other read errors are still not retried', async () => {
         const { store, calls } = fixture(async () => { throw new Error('socket closed'); });
