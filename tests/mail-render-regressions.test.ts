@@ -247,21 +247,88 @@ const pathological: Record<string, string> = {
  * mapped to invalid_input by renderBody, so it is detected through the diagnostic callback instead. */
 const depthBound = new Set(['unclosed <b> nesting', 'unclosed <div> nesting', 'unclosed list nesting']);
 
+const RSS_LIMIT_KIB = 300 * 1024;
+/** Memory figures, all in KiB, reported by the child process itself. */
+interface ChildMemory {
+    /** process.resourceUsage().maxRSS before rendering. */
+    before: number;
+    /** process.resourceUsage().maxRSS after rendering. */
+    after: number;
+    /** process.memoryUsage().rss (current, not peak) after rendering. */
+    rss: number;
+    /** Linux only: VmHWM from /proc/self/status, the child's own peak RSS. */
+    hwm?: number;
+}
+/**
+ * Decide whether a child stayed under RSS_LIMIT_KIB; returns the violated rules (empty = pass).
+ *
+ * Why not just assert on maxRSS: on Linux ru_maxrss is inherited across fork/exec from the
+ * parent's RSS at spawn time (verified: a child of a 377 MB bun parent reports maxRSS 377 MB
+ * while its current RSS is 12 MB), so the number can reflect the test runner, not the child.
+ * macOS does not inherit it. Units are KiB on both platforms in Bun.
+ *
+ * Rules, strictest first:
+ *  1. Current RSS after rendering must be under the limit; the parent cannot inflate it.
+ *  2. If /proc gave the child's own high-water mark (Linux), it must be under the limit. This is
+ *     the real peak check and is immune to inheritance (it comes from the new process image).
+ *  3. Without that, if maxRSS rose during the child's life (after > before) the rise is the
+ *     child's own peak, so it must be under the limit. If it did not rise, the value is either
+ *     below the limit (so passes) or an inherited value at or above it. The latter hides the
+ *     child's own peak anywhere below the inherited value, so the peak cannot be proven here and
+ *     only rule 1 applies; a child that peaked and shrank back inside that window is covered
+ *     only by the parent-side ps poll. This gap does not exist where /proc is available.
+ */
+const memoryViolations = ({ before, after, rss, hwm }: ChildMemory, limit = RSS_LIMIT_KIB): string[] => {
+    const violations: string[] = [];
+    if (!(rss < limit)) { violations.push(`current rss ${rss} KiB >= ${limit}`); }
+    if (hwm !== undefined) {
+        if (!(hwm < limit)) { violations.push(`own peak rss ${hwm} KiB >= ${limit}`); }
+    } else if (after > before) {
+        if (!(after < limit)) { violations.push(`maxRSS rose to ${after} KiB (from ${before}) >= ${limit}`); }
+    }
+    return violations;
+};
+
+describe('child memory decision', () => {
+    test.each([
+        ['inherited high-water mark, small child', { before: 321116, after: 321116, rss: 60000 }, false],
+        ['child grew far past an inherited mark', { before: 321116, after: 900000, rss: 880000 }, true],
+        ['ordinary child', { before: 30000, after: 110000, rss: 90000 }, false],
+        ['child peaked then shrank, own mark rose', { before: 30000, after: 500000, rss: 100000 }, true],
+        ['child current rss over limit despite inherited mark', { before: 321116, after: 321116, rss: 350000 }, true],
+        ['own peak from /proc beats an inherited mark', { before: 321116, after: 321116, rss: 60000, hwm: 120000 }, false],
+        ['own peak from /proc over the limit is caught under an inherited mark', { before: 321116, after: 321116, rss: 60000, hwm: 310000 }, true],
+        ['rss exactly at the limit fails', { before: 30000, after: 30000, rss: RSS_LIMIT_KIB }, true],
+        ['a rise from a small start to over the limit fails even with a small current rss', { before: 20000, after: 400000, rss: 20000 }, true],
+        ['a rise that stays under the limit passes', { before: 20000, after: 290000, rss: 20000 }, false],
+    ] as const)('%s', (_name, memory, fails) => {
+        expect(memoryViolations(memory).length > 0).toBe(fails);
+    });
+});
+
 describe('isolated pathological Markdown, 128 KiB', () => {
     for (const [name, markdown] of Object.entries(pathological)) {
         test(name, async () => {
             expect(Buffer.byteLength(markdown)).toBe(LIMIT);
+            // The child reports its own memory before and after rendering (see memoryViolations).
             const script = `
+                import { readFileSync } from 'node:fs';
                 import { renderBody } from ${JSON.stringify(new URL('../src/mail/render.ts', import.meta.url).pathname)};
-                const input = await Bun.stdin.text(); const start = performance.now();
+                const usage = () => ({ maxRSS: process.resourceUsage().maxRSS, rss: Math.round(process.memoryUsage().rss / 1024) });
+                const ownPeak = () => { try { const match = /^VmHWM:\\s+(\\d+) kB/m.exec(readFileSync('/proc/self/status', 'utf8')); return match ? Number(match[1]) : undefined; } catch { return undefined; } };
+                const input = await Bun.stdin.text();
+                const before = usage(); const start = performance.now();
                 let status = 'ok'; let internal = false;
                 try { renderBody({markdown:input}, { onDiagnostic: () => { internal = true; } }); } catch(error) { status = error.code ?? 'unexpected'; }
-                console.log(JSON.stringify({status: internal ? 'render_internal_error' : status, ms:performance.now()-start, rss:process.resourceUsage().maxRSS}));
+                const ms = performance.now() - start;
+                const after = usage();
+                console.log(JSON.stringify({status: internal ? 'render_internal_error' : status, ms, before: before.maxRSS, after: after.maxRSS, rss: after.rss, hwm: ownPeak()}));
             `;
             // A heap hint is NOT a hard cap: also poll the child RSS and kill on
             // excess, with an independent deadline even while its parser is busy.
-            // The ps poll is best effort (ps may be missing or denied); the maxRSS asserted
-            // after the child exits is the real memory check.
+            // The ps poll reads the child's own pid (immune to the inherited high-water mark) but is
+            // best effort (ps may be missing or denied); the child's self-reported memory asserted
+            // after it exits is the real memory check.
             const child = Bun.spawn([process.execPath, '-e', script], { stdin: new Blob([markdown]), stdout: 'pipe', stderr: 'pipe',
                 env: { ...process.env, BUN_JSC_forceRAMSize: String(300 * 1024 * 1024) } });
             let exceeded = false;
@@ -276,11 +343,11 @@ describe('isolated pathological Markdown, 128 KiB', () => {
             const status = await child.exited;
             clearInterval(monitor); clearTimeout(deadline);
             expect(exceeded).toBe(false); expect(timedOut).toBe(false); expect(status).toBe(0);
-            const result = JSON.parse(await new Response(child.stdout).text()) as { status: string; ms: number; rss: number };
+            const result = JSON.parse(await new Response(child.stdout).text()) as { status: string; ms: number } & ChildMemory;
             expect(result.status).not.toBe('render_internal_error');
             expect(result.status).toBeOneOf(depthBound.has(name) ? ['invalid_input'] : ['ok', 'too_large']);
             expect(result.ms).toBeLessThan(1500);
-            expect(result.rss).toBeLessThan(300 * 1024);
+            expect(memoryViolations(result)).toEqual([]);
         });
     }
 });
