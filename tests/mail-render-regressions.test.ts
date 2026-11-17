@@ -290,21 +290,34 @@ describe('isolated pathological Markdown, 128 KiB', () => {
             // The ps poll reads the child's own pid (immune to the inherited high-water mark) but is
             // best effort (ps may be missing or denied); the child's self-reported memory asserted
             // after it exits is the real memory check.
-            const child = Bun.spawn([process.execPath, '-e', script], { stdin: new Blob([markdown]), stdout: 'pipe', stderr: 'pipe',
-                env: { ...process.env, BUN_JSC_forceRAMSize: String(300 * 1024 * 1024) } });
-            let exceeded = false;
-            let timedOut = false;
-            const deadline = setTimeout(() => { timedOut = true; child.kill(); }, 3000);
-            const monitor = setInterval(() => {
-                try {
-                    const rss = Number(execFileSync('ps', ['-o', 'rss=', '-p', String(child.pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim());
-                    if (rss > 300 * 1024) { exceeded = true; child.kill(); }
-                } catch { /* ps can race a normally exiting child. */ }
-            }, 20);
-            const status = await child.exited;
-            clearInterval(monitor); clearTimeout(deadline);
-            expect(exceeded).toBe(false); expect(timedOut).toBe(false); expect(status).toBe(0);
-            const result = JSON.parse(await new Response(child.stdout).text()) as { status: string; ms: number } & ChildMemory;
+            const spawnChild = async () => {
+                const child = Bun.spawn([process.execPath, '-e', script], { stdin: new Blob([markdown]), stdout: 'pipe', stderr: 'pipe',
+                    env: { ...process.env, BUN_JSC_forceRAMSize: String(300 * 1024 * 1024) } });
+                let exceeded = false;
+                let timedOut = false;
+                const deadline = setTimeout(() => { timedOut = true; child.kill(); }, 3000);
+                const monitor = setInterval(() => {
+                    try {
+                        const rss = Number(execFileSync('ps', ['-o', 'rss=', '-p', String(child.pid)], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim());
+                        if (rss > 300 * 1024) { exceeded = true; child.kill(); }
+                    } catch { /* ps can race a normally exiting child. */ }
+                }, 20);
+                const [status, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+                clearInterval(monitor); clearTimeout(deadline);
+                return { exceeded, timedOut, status, signal: child.signalCode, stdout, stderr };
+            };
+            let run = await spawnChild();
+            // Bun 1.4.4 on macOS intermittently crashes at process startup (SIGTRAP, exit 133, "Bun has
+            // crashed", ~1 ms in, before any script runs; roughly 1 spawn in 1000 of this script under
+            // `bun test`, not reproduced outside it). That is a runtime bug, not a renderer result: a child that died
+            // from a signal we did not send, having printed nothing, is run once more. Our own kills
+            // (memory or deadline), assertion-relevant output and plain non-zero exits are never retried.
+            // Remove this when a Bun upgrade stops the crashes.
+            if (!run.exceeded && !run.timedOut && run.status !== 0 && run.signal !== null && run.stdout === '') { run = await spawnChild(); }
+            const { exceeded, timedOut, status, signal, stdout, stderr } = run;
+            // stderr is included only when the child failed, so the failure shows why.
+            expect({ exceeded, timedOut, status, signal, stderr: status === 0 ? '' : stderr }).toEqual({ exceeded: false, timedOut: false, status: 0, signal: null, stderr: '' });
+            const result = JSON.parse(stdout) as { status: string; ms: number } & ChildMemory;
             expect(result.status).not.toBe('render_internal_error');
             expect(result.status).toBeOneOf(depthBound.has(name) ? ['invalid_input'] : ['ok', 'too_large']);
             expect(result.ms).toBeLessThan(1500);
