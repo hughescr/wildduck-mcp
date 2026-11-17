@@ -548,10 +548,12 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
             const body = renderBody(data.body);
             const [snapshot, identities, mailbox] = await Promise.all([this.rawMessage(session, data.original), this.ownedIdentities(session), this.resolveDraftMailbox(session)]);
             const original = this.projectMessage(snapshot, data.original);
-            // SMTP recipient evidence handles Bcc delivery and takes precedence
-            // over untrusted visible recipients. None of it is copied to output.
+            // Continuing the account's own sent mail keeps the identity that sent it:
+            // an owned original From comes first. Otherwise SMTP recipient evidence
+            // handles Bcc delivery and takes precedence over untrusted visible
+            // recipients. None of it is copied to output.
             const delivered = (snapshot.raw['envelope'] as Json)['rcpt'] as Json[];
-            const candidates = [...delivered.map(item => string(item['value'])), ...original.message.to.map(item => item.address), ...original.message.cc.map(item => item.address)];
+            const candidates = [...original.message.from.map(item => item.address), ...delivered.map(item => string(item['value'])), ...original.message.to.map(item => item.address), ...original.message.cc.map(item => item.address)];
             // Routing recognition and reply identity are independent. Stripping
             // selects the registered identity behind the tag, never a guessed
             // substring. Skip bases that the resolver cannot use as a sender.

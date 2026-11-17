@@ -708,7 +708,7 @@ test.each([
     [[], [{ address: 'external@example.net' }], [{ address: 'second@example.com' }], 'second@example.com'],
     [[], [{ address: 'external@example.net' }], [], 'sender@example.com']
 ] as const)('reply selects visible owned recipients in To/Cc order or the primary fallback', async (rcpt, to, cc, expected) => {
-    const f = model(['alias@example.com', 'second@example.com']); f.patch({ envelope: { from: '', rcpt }, to, cc });
+    const f = model(['alias@example.com', 'second@example.com']); f.patch({ envelope: { from: '', rcpt }, from: { address: 'author@example.net' }, to, cc });
     if (!f.backend.prepareReply) { throw new Error("Missing reply implementation"); }
     const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
     expect(prepared.mime.envelope.from).toEqual([{ address: expected, name: 'Sender' }]);
@@ -738,7 +738,7 @@ test.each([
     [true, true, 'alias.service@example.com', 'alias@example.com'],
 ] as const)('dotAsPlus=%s stripReplySuffix=%s independently select reply From for %s', async (dotAsPlus, stripReplySuffix, address, expected) => {
     const f = model(['alias@example.com'], { dotAsPlus, stripReplySuffix });
-    f.patch({ envelope: { from: '', rcpt: [{ value: address }] }, to: [{ address: 'reader@example.net' }], cc: [], bcc: [{ address }] });
+    f.patch({ envelope: { from: '', rcpt: [{ value: address }] }, from: { address: 'author@example.net' }, to: [{ address: 'reader@example.net' }], cc: [], bcc: [{ address }] });
     if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
     const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
     expect(prepared.mime.envelope.from).toEqual([{ address: expected, name: 'Sender' }]);
@@ -746,7 +746,7 @@ test.each([
 });
 test('retaining a tag can use a routed dotted alias whose registered spelling cannot be selected', async () => {
     const f = model(['alice.smith@example.com'], { dotAsPlus: true, stripReplySuffix: false });
-    f.patch({ envelope: { from: '', rcpt: [{ value: 'alicesmith.service@example.com' }] }, to: [], cc: [] });
+    f.patch({ envelope: { from: '', rcpt: [{ value: 'alicesmith.service@example.com' }] }, from: { address: 'author@example.net' }, to: [], cc: [] });
     if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
     const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
     expect(prepared.mime.envelope.from).toEqual([{ address: 'alicesmith.service@example.com', name: 'Sender' }]);
@@ -761,7 +761,7 @@ test.each([
     [true, 'sender.primary@example.com', true, 'sender.primary@example.com']
 ] as const)('%s reply maps owned recipient %s to its registered identity without stripping aliases', async (dotAsPlus, address, blind, expected) => {
     const f = model(['alias@example.com', 'real.alias@example.com', 'alice.smith@example.com'], { dotAsPlus }, expected === 'sender.primary@example.com' ? expected : undefined);
-    f.patch({ envelope: { from: 'author@example.net', rcpt: blind ? [{ value: address }] : [] }, to: blind ? [{ address: 'reader@example.net' }] : [{ address }], cc: [], bcc: blind ? [{ address }] : [] });
+    f.patch({ envelope: { from: 'author@example.net', rcpt: blind ? [{ value: address }] : [] }, from: { address: 'author@example.net' }, to: blind ? [{ address: 'reader@example.net' }] : [{ address }], cc: [], bcc: blind ? [{ address }] : [] });
     if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
     const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
     expect(prepared.mime.envelope.from).toEqual([{ address: expected, name: 'Sender' }]);
@@ -769,10 +769,84 @@ test.each([
 });
 test('an unselectable dotted alias base does not prevent a later owned recipient from being chosen', async () => {
     const f = model(['alice.smith@example.com', 'alias@example.com'], { dotAsPlus: true });
-    f.patch({ envelope: { from: '', rcpt: [{ value: 'alicesmith.tag@example.com' }] }, to: [{ address: 'alias.service@example.com' }], cc: [] });
+    f.patch({ envelope: { from: '', rcpt: [{ value: 'alicesmith.tag@example.com' }] }, from: { address: 'author@example.net' }, to: [{ address: 'alias.service@example.com' }], cc: [] });
     if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
     const prepared = await f.backend.prepareReply(session, { original: target, mode: 'reply', body: { text: 'Response' }, quoteOriginal: false, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
     expect(prepared.mime.envelope.from).toEqual([{ address: 'alias@example.com', name: 'Sender' }]);
+});
+async function replyTo(f: ReturnType<typeof model>, extra: { mode?: 'reply' | 'reply_all'; from?: { address: string; name?: string } } = {}) {
+    if (!f.backend.prepareReply) { throw new Error('Missing reply implementation'); }
+    return f.backend.prepareReply(session, { original: target, mode: extra.mode ?? 'reply', ...(extra.from ? { from: extra.from } : {}), body: { text: 'Response' }, quoteOriginal: false, attachments: [], operationId: marker.operationId }, { ...marker, tool: 'create_reply_draft' });
+}
+test.each([
+    ['the primary', 'sender@example.com', 'sender@example.com'],
+    ['a registered alias, keeping its identity and the account name', 'ALIAS@example.com', 'alias@example.com'],
+    ['a second registered alias', 'second@example.com', 'second@example.com']
+])('a reply to mail sent from %s keeps that identity even when delivery evidence names another owned address', async (_name, sentFrom, expected) => {
+    const f = model(['alias@example.com', 'second@example.com']);
+    f.patch({ from: { address: sentFrom, name: 'Untrusted sent name' }, replyTo: [], envelope: { from: sentFrom, rcpt: [{ value: expected === 'alias@example.com' ? 'second@example.com' : 'alias@example.com' }] }, to: [{ address: 'reader@example.net' }], cc: [{ address: 'alias@example.com' }] });
+    const prepared = await replyTo(f);
+    expect(prepared.mime.envelope.from).toEqual([{ address: expected, name: 'Sender' }]);
+    expect(prepared.mime.envelope.to.map(item => item.address)).toEqual(['reader@example.net']);
+    expect(prepared.mime.envelope.cc).toEqual([]);
+});
+test.each([
+    [{}, 'alias+tag@example.com', 'alias@example.com'],
+    [{ stripReplySuffix: false }, 'alias+tag@example.com', 'alias+tag@example.com'],
+    [{}, 'sender+tag@example.com', 'sender@example.com'],
+    [{ dotAsPlus: true }, 'alias.tag@example.com', 'alias@example.com'],
+    [{ dotAsPlus: false }, 'alias.tag@example.com', 'sender@example.com']
+] as const)('a reply to mail sent from the tagged form %j %s follows the existing tag policy', async (options, sentFrom, expected) => {
+    const f = model(['alias@example.com'], options);
+    f.patch({ from: { address: sentFrom }, replyTo: [], to: [{ address: 'reader@example.net' }], cc: [], envelope: { from: '', rcpt: [] } });
+    expect((await replyTo(f)).mime.envelope.from).toEqual([{ address: expected, name: 'Sender' }]);
+});
+test('a reply to mail from someone else still follows the delivery recipient and then the primary', async () => {
+    const f = model(['alias@example.com']);
+    f.patch({ from: { address: 'author@example.net' }, replyTo: [], envelope: { from: 'author@example.net', rcpt: [{ value: 'alias@example.com' }] }, to: [{ address: 'sender@example.com' }], cc: [] });
+    expect((await replyTo(f)).mime.envelope.from).toEqual([{ address: 'alias@example.com', name: 'Sender' }]);
+    const none = model(['alias@example.com']);
+    none.patch({ from: { address: 'author@example.net' }, replyTo: [], envelope: { from: 'author@example.net', rcpt: [] }, to: [{ address: 'reader@example.net' }], cc: [] });
+    expect((await replyTo(none)).mime.envelope.from).toEqual([{ address: 'sender@example.com', name: 'Sender' }]);
+});
+test('an explicit sender overrides the sent-from identity and must still be owned', async () => {
+    const f = model(['alias@example.com', 'second@example.com']);
+    f.patch({ from: { address: 'alias@example.com' }, replyTo: [], to: [{ address: 'reader@example.net' }], cc: [] });
+    expect((await replyTo(f, { from: { address: 'second@example.com', name: 'Chosen' } })).mime.envelope.from).toEqual([{ address: 'second@example.com', name: 'Chosen' }]);
+    await errorCode(replyTo(f, { from: { address: 'stranger@example.net' } }), 'forbidden');
+});
+test('a sent-from address that is no longer owned or cannot be used as a sender falls back to the existing order', async () => {
+    const removed = model(['second@example.com']);
+    removed.patch({ from: { address: 'alias@example.com' }, replyTo: [], envelope: { from: '', rcpt: [{ value: 'second@example.com' }] }, to: [{ address: 'reader@example.net' }], cc: [] });
+    expect((await replyTo(removed)).mime.envelope.from).toEqual([{ address: 'second@example.com', name: 'Sender' }]);
+    const gone = model([]);
+    gone.patch({ from: { address: 'alias@example.com' }, replyTo: [], envelope: { from: '', rcpt: [] }, to: [{ address: 'reader@example.net' }], cc: [] });
+    expect((await replyTo(gone)).mime.envelope.from).toEqual([{ address: 'sender@example.com', name: 'Sender' }]);
+    // The registered spelling alice.smith cannot be selected as a sender under dot-as-plus, so selection moves on.
+    const unusable = model(['alice.smith@example.com', 'second@example.com'], { dotAsPlus: true });
+    unusable.patch({ from: { address: 'alicesmith.tag@example.com' }, replyTo: [], envelope: { from: '', rcpt: [{ value: 'second@example.com' }] }, to: [{ address: 'reader@example.net' }], cc: [] });
+    expect((await replyTo(unusable)).mime.envelope.from).toEqual([{ address: 'second@example.com', name: 'Sender' }]);
+    const bare = model(['alice.smith@example.com'], { dotAsPlus: true });
+    bare.patch({ from: { address: 'alicesmith.tag@example.com' }, replyTo: [], envelope: { from: '', rcpt: [] }, to: [{ address: 'reader@example.net' }], cc: [] });
+    expect((await replyTo(bare)).mime.envelope.from).toEqual([{ address: 'sender@example.com', name: 'Sender' }]);
+});
+test('replying to your own sent mail leaves the derived recipients unchanged for reply, reply_all and Reply-To', async () => {
+    const sent = { from: { address: 'alias@example.com' }, to: [{ address: 'reader@example.net' }, { address: 'sender@example.com' }, { address: 'alias@example.com' }], cc: [{ address: 'other@example.net' }, { address: 'second@example.com' }], envelope: { from: '', rcpt: [] } };
+    for (const [mode, replyToList, to, cc] of [['reply', [], ['reader@example.net'], []], ['reply_all', [], ['reader@example.net'], ['other@example.net']], ['reply', [{ address: 'help@example.com' }], ['help@example.com'], []]] as const) {
+        const f = model(['alias@example.com', 'second@example.com']); f.patch({ ...sent, replyTo: replyToList });
+        const prepared = await replyTo(f, { mode });
+        expect(prepared.mime.envelope.from).toEqual([{ address: 'alias@example.com', name: 'Sender' }]);
+        expect({ mode, to: prepared.mime.envelope.to.map(item => item.address), cc: prepared.mime.envelope.cc.map(item => item.address) }).toEqual({ mode, to: [...to], cc: [...cc] });
+    }
+});
+test('the Message-ID domain and envelope sender follow the sent-from identity', async () => {
+    const f = model(['alias@other.example']);
+    f.patch({ from: { address: 'alias@other.example' }, replyTo: [], to: [{ address: 'reader@example.net' }], cc: [] });
+    const prepared = await replyTo(f);
+    expect(prepared.mime.raw.toString()).toMatch(/^Message-ID: <[^@>\r\n]+@other\.example>\r$/mu);
+    expect(prepared.mime.envelope.from[0]?.address).toBe('alias@other.example');
+    const candidate = await f.backend.uploadPreparedDraft(session, prepared); await f.backend.verifyPreparedDraft(session, candidate, prepared);
+    expect((await uploadBody(f.calls.filter(call => call.init.method === 'POST').at(-1)?.init)).from.address).toBe('alias@other.example');
 });
 test.each(['alias+chosen@example.com', 'alias.chosen@example.com'])('explicit sender %s and recipient overrides win, remain editable, and unsupported tagged senders fail before upload', async address => {
     const f = model(['alias@example.com'], { dotAsPlus: true }); f.patch({ envelope: { from: '', rcpt: [{ value: 'sender.service@example.com' }] } });

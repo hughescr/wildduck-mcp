@@ -614,7 +614,7 @@ test('create_reply_draft says who the reply goes to, and that the result does no
     expect(description).toContain('The result does not list the recipients, so read the draft to see who it will go to before sending.'); expect(description).toContain('replying to your own sent mail goes to its original To recipients');
     const properties = tool?.inputSchema.properties ?? {};
     expect(properties['mode']?.description).toContain('if that is you, to the original To recipients'); expect(properties['mode']?.description).toContain('Your own addresses are left out');
-    expect(properties['from']?.description).toContain('else your primary address'); expect(properties['from']?.description).toContain('for your own sent mail');
+    expect(properties['from']?.description).toContain('else your primary address'); expect(properties['from']?.description).toContain('the address you sent the original from, if you sent it'); expect(properties['from']?.description).toContain('it was delivered to');
 });
 test('summaries are built from ids, versions, statuses and counts only, never from message content', async () => {
     const f = fixture(); const summaries: string[] = [];
