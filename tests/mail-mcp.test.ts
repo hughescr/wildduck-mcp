@@ -12,6 +12,11 @@ import { currentRequestId } from '../src/request-id';
 const mailboxId = 'b'.repeat(24);
 const version = 'v'.repeat(43);
 const operationId = '9ea75b7b-64fa-455e-b83b-37081fc1ec2a';
+type TextItem = { type: string; text?: string };
+/** The JSON item of a result's text content; an explanatory sentence, when there is one, comes before it. */
+const jsonOf = (result: { content: TextItem[] }) => JSON.parse(result.content.find(item => item.type === 'text' && item.text?.startsWith('{'))?.text ?? 'null');
+/** The sentence that starts a result's text content, or undefined when the text starts with the JSON. */
+const sentenceOf = (result: { content: TextItem[] }) => { const first = result.content[0]?.text; return first?.startsWith('{') ? undefined : first; };
 const toolNames = ['list_mailboxes', 'list_messages', 'search_messages', 'read_message', 'read_attachment', 'get_attachment_download', 'get_thread', 'read_messages', 'create_draft', 'create_reply_draft', 'update_draft', 'delete_draft', 'send_draft', 'move_message', 'update_message_flags'];
 function fixture() {
     const calls: { tool: string; input: unknown }[] = [];
@@ -65,7 +70,7 @@ test('native schemas apply pagination defaults and reject caller identity, token
 test('read output preserves untrusted mail as structured data and writes return actual typed references/queue acceptance', async () => {
     const f = fixture(); const read = await f.call('read_message', { mailboxId, uid: 1 }); expect(read.result.structuredContent.subject).toBe('<untrusted mail subject>'); expect(read.result._meta).toBeUndefined();
     const created = await f.call('create_draft', { operationId, to: [], cc: [], bcc: [], subject: 'Draft', body: { text: 'Body' } }); expect(created.result.structuredContent.draft).toEqual({ mailboxId, uid: 2, version });
-    const updated = await f.call('update_draft', { operationId, uid: 2, expectedVersion: version, to: [], cc: [], bcc: [], subject: 'Draft', body: { text: 'Body' } }); expect(updated.result.isError).toBe(true); expect(updated.result.content[1].text).toContain('Partial: the updated draft was saved (use its new uid and version)'); expect(updated.result.structuredContent.status).toBe('partial'); expect(updated.result.structuredContent.originalDeletion).toBe('unconfirmed');
+    const updated = await f.call('update_draft', { operationId, uid: 2, expectedVersion: version, to: [], cc: [], bcc: [], subject: 'Draft', body: { text: 'Body' } }); expect(updated.result.isError).toBe(true); expect(updated.result.content[0].text).toContain(`Partial: the updated draft was saved (use uid 3, version ${version})`); expect(updated.result.structuredContent.status).toBe('partial'); expect(updated.result.structuredContent.originalDeletion).toBe('unconfirmed');
     const sent = await f.call('send_draft', { uid: 3, operationId, expectedVersion: version }); expect(sent.result.structuredContent).toEqual({ status: 'queued', operationId, queueId: 'synthetic-queue-id' }); expect(JSON.stringify(sent)).not.toContain('delivered');
 });
 test('mail exceptions redact backend messages and uncertain sends never trigger a transport resend', async () => {
@@ -73,7 +78,7 @@ test('mail exceptions redact backend messages and uncertain sends never trigger 
     const unexpected = await f.call('list_mailboxes'); expect(unexpected.result.isError).toBe(true); expect(JSON.stringify(unexpected)).not.toContain('private');
     f.mail.list_mailboxes = async () => { throw new MailError('reconnect_required'); }; expect((await f.call('list_mailboxes')).result.content[0].text).toContain('reconnect the mail account');
     let submissions = 0; f.mail.send_draft = async input => { submissions++; return { status: 'outcome_unknown', operationId: input.operationId, reason: 'dispatch_uncertain' }; };
-    const unknown = await f.call('send_draft', { uid: 1, expectedVersion: version, operationId }); expect(unknown.result.isError).toBe(true); expect(unknown.result.structuredContent.status).toBe('outcome_unknown'); expect(unknown.result.content[1].text).toContain('Do not repeat the change under a new operationId'); expect(submissions).toBe(1);
+    const unknown = await f.call('send_draft', { uid: 1, expectedVersion: version, operationId }); expect(unknown.result.isError).toBe(true); expect(unknown.result.structuredContent.status).toBe('outcome_unknown'); expect(unknown.result.content[0].text).toContain('Do not repeat the change under a new operationId'); expect(submissions).toBe(1);
 });
 test('attachment binary appears once in embedded resource; metadata stays binary-free and size is checked', async () => {
     const f = fixture(); const result = (await f.call('read_attachment', { mailboxId, uid: 1, attachmentId: 'ATT1' })).result;
@@ -85,9 +90,9 @@ test('attachment binary appears once in embedded resource; metadata stays binary
 });
 test('HTML truncation and pending receipts are explicit incomplete errors', async () => {
     const f = fixture(); const read = f.mail.read_message; f.mail.read_message = async input => ({ ...await read(input), htmlTruncated: true });
-    const html = await f.call('read_message', { mailboxId, uid: 1 }); expect(html.result.isError).toBe(true); expect(html.result.content[1].text).toContain('Incomplete read');
+    const html = await f.call('read_message', { mailboxId, uid: 1 }); expect(html.result.isError).toBe(true); expect(html.result.content[0].text).toContain('Incomplete read: the HTML (htmlTruncated) is or may be cut short');
     f.mail.send_draft = async input => ({ status: 'in_progress', operationId: input.operationId });
-    const pending = await f.call('send_draft', { uid: 1, expectedVersion: version, operationId }); expect(pending.result.isError).toBe(true); expect(pending.result.content[1].text).toContain('Retry the identical request');
+    const pending = await f.call('send_draft', { uid: 1, expectedVersion: version, operationId }); expect(pending.result.isError).toBe(true); expect(pending.result.content[0].text).toContain('Retry the identical request');
 });
 test('moves and custom flag/label writes validate native schemas and return minimal verified references', async () => {
     const f = fixture(); const target = { mailboxId, uid: 1, expectedVersion: version, operationId };
@@ -164,17 +169,17 @@ test('actual upstream timeout reports read budget exhaustion without guessing ge
 test('failed receipts say nothing changed and that another attempt needs a new operationId', async () => {
     const f = fixture(); f.mail.create_draft = async input => ({ status: 'failed', operationId: input.operationId, reason: 'upstream_timeout' });
     const result = (await f.call('create_draft', { operationId, subject: '', body: { text: '' } })).result;
-    expect(result.isError).toBe(true); expect(result.structuredContent.reason).toBe('upstream_timeout'); expect(result.content[1].text).toBe('Not done: The mail server did not answer in time. Try again later. Nothing was changed; to try again, use a new operationId.');
+    expect(result.isError).toBe(true); expect(result.structuredContent.reason).toBe('upstream_timeout'); expect(result.content[0].text).toBe('Not done: The mail server did not answer in time. Try again later. Nothing was changed; to try again, use a new operationId.');
 });
 test('conflict and partial receipts explain each reason and the next step', async () => {
     const f = fixture(); const texts: string[] = [];
     for (const reason of ['operation_conflict', 'draft_fenced'] as const) {
         f.mail.delete_draft = async input => ({ status: 'conflict', operationId: input.operationId, reason });
-        const result = (await f.call('delete_draft', { uid: 1, expectedVersion: version, operationId })).result; expect(result.isError).toBe(true); texts.push(result.content[1].text);
+        const result = (await f.call('delete_draft', { uid: 1, expectedVersion: version, operationId })).result; expect(result.isError).toBe(true); texts.push(result.content[0].text);
     }
     expect(texts[0]).toContain('Use a new operationId'); expect(texts[1]).toContain('find the message and its current uid'); expect(texts.every(text => text.includes('Nothing was changed'))).toBe(true);
     f.mail.create_draft = async input => ({ status: 'partial', operationId: input.operationId, candidate: { mailboxId, uid: 3 }, candidateVerified: false, reason: 'candidate_verification_failed', originalDeletion: 'not_attempted' });
-    const partial = (await f.call('create_draft', { operationId, subject: '', body: { text: '' } })).result; expect(partial.isError).toBe(true); expect(partial.content[1].text).toContain('cannot edit or send it');
+    const partial = (await f.call('create_draft', { operationId, subject: '', body: { text: '' } })).result; expect(partial.isError).toBe(true); expect(partial.content[0].text).toContain('cannot edit or send it');
 });
 
 test('structured errors expose stable sanitized code and only a supplied validated retry hint', async () => {
@@ -234,7 +239,7 @@ test('batch defaults retain HTML while text-only and mixed failed/truncated item
     const defaults = (await f.call('read_messages', { messages: [{ mailboxId, uid: 1 }, { mailboxId, uid: 2 }] })).result;
     expect(defaults.isError).toBeUndefined(); expect(defaults.structuredContent.includeHtml).toBe(true); expect(defaults.structuredContent.results[0].message).toMatchObject({ html: [privateHtml], htmlOmitted: false, htmlTruncated: true, htmlRepresentation: 'wildduck_normalized' });
     const text = await f.call('read_messages', { messages: [{ mailboxId, uid: 1 }, { mailboxId, uid: 2 }], includeHtml: false });
-    expect(text.result.isError).toBeUndefined(); expect(text.result.structuredContent.includeHtml).toBe(false); expect(text.result.structuredContent.results[0].message).toMatchObject({ htmlOmitted: true, textTruncated: true }); for (const key of ['html', 'htmlTruncated', 'htmlRepresentation']) { expect(text.result.structuredContent.results[0].message).not.toHaveProperty(key); expect(JSON.parse(text.result.content[0].text).results[0].message).not.toHaveProperty(key); } expect(JSON.stringify(text)).not.toContain(privateHtml);
+    expect(text.result.isError).toBeUndefined(); expect(text.result.structuredContent.includeHtml).toBe(false); expect(text.result.structuredContent.results[0].message).toMatchObject({ htmlOmitted: true, textTruncated: true }); for (const key of ['html', 'htmlTruncated', 'htmlRepresentation']) { expect(text.result.structuredContent.results[0].message).not.toHaveProperty(key); expect(jsonOf(text.result).results[0].message).not.toHaveProperty(key); } expect(JSON.stringify(text)).not.toContain(privateHtml);
     expect(message.htmlOmitted).toBe(false);
 });
 test('whole batch scope, input and execution failures remain tool errors', async () => {
@@ -298,7 +303,7 @@ test('single text-only reads ignore HTML-only truncation but retain genuine text
     const full = (await f.call('read_message', { mailboxId, uid: 1 })).result; expect(full.isError).toBe(true); expect(full.structuredContent.htmlTruncated).toBe(true); expect(full.structuredContent.htmlOmitted).toBe(false);
     const text = (await f.call('read_message', { mailboxId, uid: 1, includeHtml: false })).result; expect(text.isError).toBeUndefined(); expect(text.structuredContent.htmlOmitted).toBe(true); expect(text.structuredContent).not.toHaveProperty('htmlTruncated');
     f.mail.read_message = async input => ({ ...await original(input), textTruncated: true });
-    const truncated = (await f.call('read_message', { mailboxId, uid: 1, includeHtml: false })).result; expect(truncated.isError).toBe(true); expect(truncated.structuredContent.textTruncated).toBe(true); expect(truncated.content[1].text).toContain('Incomplete read');
+    const truncated = (await f.call('read_message', { mailboxId, uid: 1, includeHtml: false })).result; expect(truncated.isError).toBe(true); expect(truncated.structuredContent.textTruncated).toBe(true); expect(truncated.content[0].text).toContain('Incomplete read: the text (textTruncated) is or may be cut short');
 });
 test('mailbox public schema and tool description identify optional unseen values as unread counts', async () => {
     const f = fixture(); const tool = (await f.rpc('tools/list')).result.tools.find((item: { name: string }) => item.name === 'list_mailboxes');
@@ -307,7 +312,9 @@ test('mailbox public schema and tool description identify optional unseen values
 
 test('published search schemas describe verified fast results, exhaustiveness and To/Cc scope', async () => {
     const f = fixture(); const tool = (await f.rpc('tools/list')).result.tools.find((item: { name: string }) => item.name === 'search_messages');
-    expect(tool.description).toContain('Check search.complete: a fast search can miss matches.');
+    expect(tool.description).toContain('If search.complete is false, a fast search may have missed matches: repeat it from the first page with searchMode exhaustive (search.retryWith).');
+    expect(tool.description).toContain('A page can be empty and still have next; keep paging until next is absent.');
+    expect(tool.description).toContain('Ignore search.strategy and search.verified.');
     const searchMode = tool.inputSchema.properties.searchMode.description;
     expect(tool.inputSchema.properties.searchMode).toMatchObject({ default: 'fast', enum: ['fast', 'exhaustive'] });
     expect(searchMode).toContain('fast can miss matches'); expect(searchMode).toContain('Start it without a cursor');
@@ -337,8 +344,8 @@ test('indexed fast MCP search returns verified matches and retry guidance withou
     expect(result.isError).toBeUndefined();
     expect(result.structuredContent).toMatchObject({ messages: [{ uid: 1 }], next: 'candidate-next', search: { mode: 'fast', strategy: 'fulltext_prefilter', complete: false, verified: true, retryWith: { searchMode: 'exhaustive' } } });
     expect(result.structuredContent.messages).toHaveLength(1);
-    expect(JSON.parse(result.content[0].text)).toEqual(result.structuredContent);
-    expect(result.content[1]).toEqual({ type: 'text', text: 'Fast search returned only confirmed matches and may have missed some. To find every match, repeat the same search from the first page with searchMode: "exhaustive" (slower).' });
+    expect(jsonOf(result)).toEqual(result.structuredContent);
+    expect(result.content[0]).toEqual({ type: 'text', text: 'Fast search returned only confirmed matches and may have missed some. To find every match, repeat the same search from the first page with searchMode: "exhaustive" (slower).' });
     const complete = (await f.call('search_messages', { subject: 'Planning', searchMode: 'exhaustive' })).result;
     expect(complete.isError).toBeUndefined(); expect(complete.content).toHaveLength(1);
     expect(complete.structuredContent.search).toEqual({ mode: 'exhaustive', strategy: 'structured', complete: true, verified: false });
@@ -422,6 +429,23 @@ function* schemaNodes(schema: JsonSchema, path = ''): Generator<[string, JsonSch
     for (const value of [schema.items, schema.anyOf, schema.oneOf, schema.allOf].flat()) { if (value) { yield [path, value, undefined]; yield* schemaNodes(value, path); } }
 }
 const BANNED = /\b(?:canonical|proofs?|fenced?|fences|legacy|observed|candidates?|authored grade|durable|provenance|upstream)\b/iu;
+const versions = { created: 'k'.repeat(42) + '1', replaced: 'k'.repeat(42) + '2', moved: 'k'.repeat(42) + '3', flagged: 'k'.repeat(42) + '4' };
+const confirmed = (ref: { mailboxId: string; uid: number; version: string }, sourceGrade: 'mcp_authored' | 'observed') => ({ ...ref, accountId: mailboxId, contentDigest: 'a'.repeat(64), sourceGrade });
+/** One successful result per write tool, with distinctive uids and versions, and valid arguments for the call. */
+const successes: { name: (typeof toolNames)[number]; args: Record<string, unknown>; result: Record<string, unknown>; mentions: (string | number)[] }[] = (() => {
+    const created = { mailboxId, uid: 38605, version: versions.created }, replaced = { mailboxId, uid: 38606, version: versions.replaced };
+    const moved = { mailboxId: 'c'.repeat(24), uid: 77, version: versions.moved }, flagged = { mailboxId, uid: 5, version: versions.flagged };
+    const target = { uid: 1, expectedVersion: version, operationId };
+    return [
+        { name: 'create_draft', args: { operationId, subject: 'x', body: { text: 'x' } }, result: { status: 'completed', operationId, draft: created, verified: true, proof: confirmed(created, 'mcp_authored') }, mentions: [created.uid, created.version] },
+        { name: 'create_reply_draft', args: { operationId, original: { mailboxId, uid: 1 }, body: { text: 'x' } }, result: { status: 'completed', operationId, draft: created, verified: true, proof: confirmed(created, 'mcp_authored') }, mentions: [created.uid, created.version] },
+        { name: 'update_draft', args: { ...target, subject: 'x' }, result: { status: 'completed', operationId, draft: replaced, verified: true, proof: confirmed(replaced, 'mcp_authored'), previousDeleted: true }, mentions: [replaced.uid, replaced.version, 'previousDeleted'] },
+        { name: 'delete_draft', args: target, result: { status: 'completed', operationId, deleted: { mailboxId, uid: 1 } }, mentions: [1, 'permanently', 'Trash'] },
+        { name: 'send_draft', args: target, result: { status: 'queued', operationId, queueId: 'synthetic-queue-id', sent: { mailboxId: 'd'.repeat(24), uid: 6159 } }, mentions: [6159, 'does not confirm it arrived'] },
+        { name: 'move_message', args: { ...target, mailboxId, destinationMailboxId: moved.mailboxId }, result: { status: 'completed', operationId, message: moved, verified: true, proof: confirmed(moved, 'observed') }, mentions: [moved.uid, moved.version, moved.mailboxId] },
+        { name: 'update_message_flags', args: { ...target, mailboxId, seen: true }, result: { status: 'completed', operationId, message: flagged, verified: true, proof: confirmed(flagged, 'observed') }, mentions: [flagged.uid, flagged.version, 'expectedVersion'] },
+    ];
+})();
 test('initialize returns the server instructions', async () => {
     const f = fixture(); const reply = await f.rpc('initialize', { protocolVersion: '2025-11-25', capabilities: {}, clientInfo: { name: 'test-client', version: '1.0.0' } });
     expect(reply.result.instructions).toBe(SERVER_INSTRUCTIONS); expect(SERVER_INSTRUCTIONS.length).toBeLessThanOrEqual(1000);
@@ -450,7 +474,7 @@ test('in_progress and outcome_unknown texts forbid a new operationId, and expect
 test('every input property of every tool has a short description and no field name uses an underscore', async () => {
     const f = fixture(); const tools: { name: string; description: string; inputSchema: JsonSchema; outputSchema: JsonSchema }[] = (await f.rpc('tools/list')).result.tools;
     for (const tool of tools) {
-        expect(tool.description.length).toBeGreaterThan(0); expect(tool.description.length).toBeLessThanOrEqual(260);
+        expect(tool.description.length).toBeGreaterThan(0); expect(tool.description.length).toBeLessThanOrEqual(430);
         for (const [path, node, key] of schemaNodes(tool.inputSchema)) {
             if (key === undefined) { continue; }
             expect({ tool: tool.name, path, description: (node.description ?? '').trim().length > 0 }).toEqual({ tool: tool.name, path, description: true });
@@ -482,10 +506,107 @@ test('client-visible prose avoids internal vocabulary', async () => {
             const text = receiptText(name, result as never); expect(text).toBeDefined(); texts.push(text ?? '');
         }
     }
+    for (const { name, result } of successes) { texts.push(receiptText(name as never, result as never) ?? ''); }
+    texts.push(receiptText('send_draft', { status: 'queued', operationId, queueId: 'q' } as never) ?? '');
+    const candidate = { mailboxId, uid: 9, version };
+    texts.push(receiptText('update_draft', { status: 'partial', operationId, candidate, candidateVerified: true, proof: confirmed(candidate, 'mcp_authored'), reason: 'original_deletion_failed', originalDeletion: 'failed' } as never) ?? '');
     const read = f.mail.read_message; f.mail.read_message = async input => ({ ...await read(input), textTruncated: true });
-    texts.push((await f.call('read_message', { mailboxId, uid: 1 })).result.content[1].text, (await f.call('list_mailboxes', {}, [])).result.content[0].text);
+    for (const verification of ['verified', 'pending', 'outcome_unknown', 'unverified', 'not_checked']) {
+        f.mail.read_message = async input => ({ ...await read(input), htmlTruncated: true, managedOperation: { operationId, verification } as never });
+        texts.push((await f.call('read_message', { mailboxId, uid: 1 })).result.content[0].text);
+    }
+    const listed = { ...await read({ mailboxId, uid: 1, includeHtml: true }), managedOperation: { operationId, verification: 'not_checked' as const } };
+    f.mail.list_messages = async () => ({ messages: [summaryOf(listed, {}), summaryOf(listed, {})] }); texts.push((await f.call('list_messages', { mailboxId })).result.content[0].text);
+    const textOnly = await read({ mailboxId, uid: 1, includeHtml: false });
+    f.mail.read_messages = async input => ({ includeHtml: input.includeHtml, results: [{ status: 'ok', message: { ...textOnly, textTruncated: true } }, { status: 'failed', mailboxId, uid: 2, error: { code: 'not_found', message: 'not_found' } }], byteBudget: 1048576, bytesReturned: 100 });
+    texts.push((await f.call('read_messages', { messages: [{ mailboxId, uid: 1 }, { mailboxId, uid: 2 }], includeHtml: false })).result.content[0].text);
+    f.mail.read_message = async input => ({ ...await read(input), textTruncated: true });
+    texts.push((await f.call('read_message', { mailboxId, uid: 1 })).result.content[0].text, (await f.call('list_mailboxes', {}, [])).result.content[0].text);
+    // The new result sentences must really be among the texts checked, not replaced by an error text.
+    for (const phrase of ['Draft created and verified', 'Reply draft created', 'Draft replaced by a new copy', 'permanently deleted', 'Draft sent: accepted', 'Message moved', 'Flags changed', 'use uid 9, version', 'managedOperation.verification is verified', 'This server cannot change this message', 'not_checked in lists', 'Of 2 messages']) {
+        expect({ phrase, found: texts.some(text => text.includes(phrase)) }).toEqual({ phrase, found: true });
+    }
     for (const text of texts) {
-        const prose = [...values].reduce((value, name) => value.replaceAll(`${name}:`, ''), text);
+        const prose =[...values].reduce((value, name) => value.replaceAll(`${name}:`, ''), text);
         expect({ text, banned: prose.match(BANNED)?.[0] }).toEqual({ text, banned: undefined });
     }
+});
+const MARKER = 'MARKER_7f3a91';
+/** A list-item summary: the full read message without the fields only a read returns. */
+const summaryOf = (message: object, extra: object) => { const { replyTo: _replyTo, cc: _cc, bcc: _bcc, messageId: _messageId, references: _references, text: _text, textTruncated: _textTruncated, html: _html, htmlTruncated: _htmlTruncated, htmlRepresentation: _htmlRepresentation, htmlOmitted: _htmlOmitted, attachments: _attachments, version: _version, ...summary } = message as Record<string, unknown>; return { ...summary, ...extra } as never; };
+test('every write tool starts a successful result with one sentence that carries the ids to use next, then the same JSON', async () => {
+    const f = fixture();
+    for (const { name, args, result, mentions } of successes) {
+        (f.mail as unknown as Record<string, unknown>)[name] = async () => result;
+        const reply = (await f.call(name, args)).result; expect({ name, error: reply.isError }).toEqual({ name, error: undefined });
+        const sentence = sentenceOf(reply); expect({ name, sentence: typeof sentence }).toEqual({ name, sentence: 'string' });
+        expect(sentence?.startsWith('{')).toBe(false); expect(reply.content).toHaveLength(2); expect(jsonOf(reply)).toEqual(reply.structuredContent); expect(reply.structuredContent).toEqual(result);
+        for (const mention of mentions) { expect({ name, mention, ok: sentence?.includes(String(mention)) }).toEqual({ name, mention, ok: true }); }
+    }
+});
+test('send_draft says so when the mail server reported no Sent copy', async () => {
+    const f = fixture(); const sentence = sentenceOf((await f.call('send_draft', { uid: 1, expectedVersion: version, operationId })).result);
+    expect(sentence).toContain('Draft sent: accepted by the mail server for delivery'); expect(sentence).toContain('reported no copy in Sent');
+});
+test('every non-success write result also starts with its explanation, then the JSON', async () => {
+    const f = fixture(); const target = { uid: 1, expectedVersion: version, operationId };
+    for (const result of [{ status: 'failed', operationId, reason: 'upstream_timeout' }, { status: 'conflict', operationId, reason: 'draft_fenced' }, { status: 'in_progress', operationId }, { status: 'outcome_unknown', operationId, reason: 'dispatch_uncertain' }]) {
+        f.mail.delete_draft = async () => result as never;
+        const reply = (await f.call('delete_draft', target)).result; expect(reply.isError).toBe(true);
+        expect(sentenceOf(reply)).toBe(receiptText('delete_draft', result as never)); expect(jsonOf(reply)).toEqual(result);
+    }
+});
+test('delete_draft says in its description and its result that deletion is permanent and not a move to Trash', async () => {
+    const f = fixture(); const tools: { name: string; description: string }[] = (await f.rpc('tools/list')).result.tools;
+    const description = tools.find(tool => tool.name === 'delete_draft')?.description ?? '';
+    expect(description).toMatch(/^Permanently delete a draft/u); expect(description).toContain('not moved to the Trash mailbox'); expect(description).toContain('cannot be recovered through this server');
+    expect(description).toContain('to discard other mail, move it to the Trash mailbox with move_message');
+    const move = tools.find(tool => tool.name === 'move_message')?.description ?? ''; expect(move).not.toMatch(/restor|recover|undo/iu);
+    const sentence = sentenceOf((await f.call('delete_draft', { uid: 1, expectedVersion: version, operationId })).result);
+    expect(sentence).toContain('permanently deleted'); expect(sentence).toContain('not moved to the Trash mailbox'); expect(sentence).toContain('cannot be recovered through this server');
+});
+test('create_reply_draft says who the reply goes to, and that the result does not list the recipients', async () => {
+    const f = fixture(); const tools: { name: string; description: string; inputSchema: JsonSchema }[] = (await f.rpc('tools/list')).result.tools;
+    const tool = tools.find(item => item.name === 'create_reply_draft'); const description = tool?.description ?? '';
+    expect(description).toContain('The result does not list the recipients, so read the draft to see who it will go to before sending.'); expect(description).toContain('replying to your own sent mail goes to its original To recipients');
+    const properties = tool?.inputSchema.properties ?? {};
+    expect(properties['mode']?.description).toContain('if that is you, to the original To recipients'); expect(properties['mode']?.description).toContain('Your own addresses are left out');
+    expect(properties['from']?.description).toContain('else your primary address'); expect(properties['from']?.description).toContain('for your own sent mail');
+});
+test('result sentences are built from ids, versions and statuses only, never from message content', async () => {
+    const f = fixture(); const sentences: string[] = [];
+    for (const { name, args, result } of successes) {
+        (f.mail as unknown as Record<string, unknown>)[name] = async () => result;
+        const marked = { ...args, ...name === 'create_draft' || name === 'create_reply_draft' ? { subject: MARKER, to: [{ address: 'to@example.com', name: MARKER }], body: { text: MARKER } } : {} };
+        const reply = (await f.call(name, marked)).result; sentences.push(sentenceOf(reply) ?? '');
+    }
+    const read = f.mail.read_message;
+    for (const verification of ['verified', 'unverified']) {
+        f.mail.read_message = async input => ({ ...await read(input), subject: MARKER, from: [{ address: 'sender@example.com', name: MARKER }], text: MARKER, textTruncated: true, htmlTruncated: true, managedOperation: { operationId, verification } as never });
+        const reply = (await f.call('read_message', { mailboxId, uid: 1 })).result; expect(JSON.stringify(reply.structuredContent)).toContain(MARKER); sentences.push(sentenceOf(reply) ?? '');
+    }
+    const listed = { ...await read({ mailboxId, uid: 1, includeHtml: true }), subject: MARKER, managedOperation: { operationId, verification: 'not_checked' as const } };
+    f.mail.list_messages = async () => ({ messages: [summaryOf(listed, {})] }); sentences.push(sentenceOf((await f.call('list_messages', { mailboxId })).result) ?? '');
+    expect(sentences.every(sentence => sentence.length > 0 && !sentence.startsWith('{'))).toBe(true);
+    for (const sentence of sentences) { expect(sentence).not.toContain(MARKER); }
+});
+test('read results explain managedOperation, truncation and batch outcomes in their text', async () => {
+    const f = fixture(); const read = f.mail.read_message;
+    f.mail.read_message = async input => ({ ...await read(input), managedOperation: { operationId, verification: 'verified' as const } });
+    expect(sentenceOf((await f.call('read_message', { mailboxId, uid: 1 })).result)).toContain('can be edited or sent here');
+    f.mail.read_message = async input => ({ ...await read(input), managedOperation: { operationId, verification: 'outcome_unknown' as const } });
+    expect(sentenceOf((await f.call('read_message', { mailboxId, uid: 1 })).result)).toContain('This server cannot change this message (managedOperation.verification is outcome_unknown)');
+    f.mail.read_message = read; expect(sentenceOf((await f.call('read_message', { mailboxId, uid: 1 })).result)).toBeUndefined();
+    const listed = { ...await read({ mailboxId, uid: 1, includeHtml: true }), managedOperation: { operationId, verification: 'not_checked' as const } };
+    f.mail.list_messages = async () => ({ messages: [summaryOf(listed, {}), summaryOf(listed, {})] });
+    expect(sentenceOf((await f.call('list_messages', { mailboxId })).result)).toContain('2 of these messages were created or changed through this server; managedOperation.verification is not_checked in lists, so read the message');
+    const textOnly = await read({ mailboxId, uid: 1, includeHtml: false });
+    f.mail.read_messages = async input => ({ includeHtml: input.includeHtml, results: [{ status: 'ok', message: { ...textOnly, textTruncated: true } }, { status: 'failed', mailboxId, uid: 2, error: { code: 'not_found', message: 'not_found' } }], byteBudget: 1048576, bytesReturned: 100 });
+    const batch = (await f.call('read_messages', { messages: [{ mailboxId, uid: 1 }, { mailboxId, uid: 2 }], includeHtml: false })).result;
+    expect(sentenceOf(batch)).toBe('Of 2 messages, 1 could not be read (see the error in each failed item) and 1 is cut short (textTruncated or htmlTruncated is true), so do not treat it as complete.'); expect(batch.isError).toBeUndefined();
+});
+test('tool descriptions stay short in total and name the fields an agent can ignore without using internal vocabulary', async () => {
+    const f = fixture(); const tools: { name: string; description: string }[] = (await f.rpc('tools/list')).result.tools;
+    expect(tools.reduce((sum, tool) => sum + tool.description.length, 0)).toBeLessThanOrEqual(4000);
+    const text = tools.map(tool => tool.description).join(' '); expect(text).toContain('ignore sourceGrade, contentDigest and accountId'); expect(text).toContain('Ignore search.strategy and search.verified'); expect(text).not.toMatch(BANNED);
 });
