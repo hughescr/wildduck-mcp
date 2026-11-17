@@ -1,0 +1,5 @@
+# Newly published versions are held back for 72 hours (259200 seconds) so a compromised release is likely to be caught first.
+# Urgent security fix: exempt the exact version with minimumReleaseAgeExcludes = ["pkg@1.2.3"] (remove it afterwards), or pass --minimum-release-age-excludes pkg@1.2.3 for a single command.
+
+[install]
+minimumReleaseAge = 259200

@@ -87,6 +87,8 @@ bun run validate
 bun run dev
 ```
 
+The standing rule for this project's installs and updates is a 72-hour minimum package release age, set as `install.minimumReleaseAge` in `bunfig.toml`, so newly published npm versions are not selected until they are 72 hours old.
+
 The local server binds `127.0.0.1:3000`; `PORT` changes the port. With auth configuration absent, `/healthz` reports the package version, `/readyz` and `/mcp` return 503, and no AWS request is made. Configuration is not a credential bypass. `bun run validate` runs Bun's TypeScript checker, Oxlint, tests, bundling and a real Node 26 Lambda-event smoke test. HTTP tests inject a typed test runtime with the real engine/crypto/store contracts and exercise password/TOTP consent, CSRF, redirects, code exchange, refresh and request-scoped MCP identity; production never installs a test verifier.
 
 ## Runtime and storage
