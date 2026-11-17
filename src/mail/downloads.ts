@@ -1,11 +1,20 @@
 import { createHash } from 'node:crypto';
-import { AbortMultipartUploadCommand, CompleteMultipartUploadCommand, CreateMultipartUploadCommand, GetObjectCommand, HeadObjectCommand, S3Client, UploadPartCommand, type HeadObjectCommandOutput } from '@aws-sdk/client-s3';
+import { AbortMultipartUploadCommand, CompleteMultipartUploadCommand, CreateMultipartUploadCommand, GetObjectCommand, HeadObjectCommand, PutObjectCommand, S3Client, UploadPartCommand, type HeadObjectCommandOutput } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { remainingRequestTimeMs } from '../request-budget';
 import { MailError, type AttachmentMetadata } from './contracts';
+import { MAX_MESSAGE_BYTES } from './mime';
 
+/** An attachment download (get_attachment_download). */
 export const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024;
+/** A whole message source (get_message_source_download): as large as the largest message this server composes. */
+export const MAX_SOURCE_DOWNLOAD_BYTES = MAX_MESSAGE_BYTES;
 export const DOWNLOAD_TIMEOUT_MS = 30_000;
+/** get_message_source_download's whole operation (fetch up to 25 MiB from WildDuck, then stage it),
+ * always within the request's remaining time. 25 MiB at the transport's stall floor of 1 MiB/s plus its
+ * 10 s base is about 36 s; the upload to S3 in the same region normally takes a few seconds more. Its
+ * 2 s epilogue and the 60 s Lambda leave about 13 s for authentication and the response. */
+export const SOURCE_DOWNLOAD_TIMEOUT_MS = 45_000;
 export const DOWNLOAD_URL_TTL_SECONDS = 300;
 const PART_BYTES = 5 * 1024 * 1024;
 const MIME_TYPE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+\/[A-Za-z0-9!#$%&'*+.^_`|~-]+$/u;
@@ -14,16 +23,36 @@ export interface AttachmentDownloadBody {
     /** Validated decoded Content-Length, never an approximate metadata size. */
     readonly expectedSize?: number;
 }
+/** What the stager uses of a file's metadata: its response headers and any exact size. */
+export type DownloadMetadata = Pick<AttachmentMetadata, 'filename' | 'contentType' | 'size' | 'sizeIsApproximate'>;
+/** An attachment: streamed from WildDuck only after a cache miss and uploaded in 5 MiB multipart parts,
+ * at most MAX_DOWNLOAD_BYTES. */
 export interface AttachmentDownloadSource {
-    /** Server-derived SHA-256 of authenticated account, mailbox/UID, attachment ID
-     * and immutable upstream attachment hash. Never supplied by a tool caller. */
+    /** Server-derived SHA-256 of authenticated account, mailbox/UID, attachment ID and immutable
+     * upstream attachment hash. Never supplied by a tool caller. */
     readonly cacheIdentity: string;
-    readonly metadata: AttachmentMetadata;
+    readonly metadata: DownloadMetadata;
     /** Called only after a cache miss, with the same whole-stage deadline. */
     open(signal: AbortSignal): Promise<AttachmentDownloadBody>;
 }
+/** A whole message source, already read and hashed, at most MAX_SOURCE_DOWNLOAD_BYTES. A miss uploads it with one
+ * conditional PutObject carrying its SHA-256, which S3 checks against the body before storing the object and keeps
+ * as the object's full-object checksum. Every object served, new or cached, must report that stored checksum equal
+ * to sha256, so the hash the caller returns is bound by S3 to the bytes the link serves. */
+export interface ChecksummedDownloadSource {
+    /** Server-derived SHA-256 of account, mailbox/UID and the SHA-256 of the source bytes, under a domain
+     * string of its own. Never supplied by a tool caller. */
+    readonly cacheIdentity: string;
+    /** The object's size is always bytes.length. */
+    readonly metadata: Pick<DownloadMetadata, 'filename' | 'contentType'>;
+    /** Sent as the request body as it is; never copied. */
+    readonly bytes: Uint8Array;
+    /** Lowercase hex SHA-256 of bytes. */
+    readonly sha256: string;
+}
+export type DownloadSource = AttachmentDownloadSource | ChecksummedDownloadSource;
 export interface StagedAttachmentDownload { readonly url: string; readonly expiresAt: string; readonly size: number }
-export interface AttachmentDownloadStager { stage(source: AttachmentDownloadSource, signal?: AbortSignal): Promise<StagedAttachmentDownload> }
+export interface AttachmentDownloadStager { stage(source: DownloadSource, signal?: AbortSignal): Promise<StagedAttachmentDownload> }
 interface Options {
     readonly bucketName: string;
     readonly client?: S3Client;
@@ -40,9 +69,9 @@ export function attachmentDisposition(filename: string | null): string {
     return `attachment; filename="${ascii}"; filename*=UTF-8''${encoded}`;
 }
 const sha256 = (value: unknown): string => createHash('sha256').update(JSON.stringify(value)).digest('hex');
-function exactSize(value: number | undefined): void {
+function exactSize(value: number | undefined, limit: number): void {
     if (value !== undefined && (!Number.isSafeInteger(value) || value < 0)) { throw new MailError('invalid_input'); }
-    if (value !== undefined && value > MAX_DOWNLOAD_BYTES) { throw new MailError('too_large'); }
+    if (value !== undefined && value > limit) { throw new MailError('too_large'); }
 }
 function status(error: unknown): number | undefined {
     if (!error || typeof error !== 'object' || !('$metadata' in error)) { return undefined; }
@@ -57,7 +86,8 @@ function expirationTime(header: string | undefined): number | undefined {
     if (!Number.isFinite(time)) { throw new MailError('verification_failed'); }
     return time;
 }
-/** The stable opaque key contains no account, filename or other public identity.
+/** The stable opaque key contains no account, filename or other public identity. Attachments and
+ * message sources share the downloads/v1/ prefix; their cache identities hash different domain strings.
  * Cache hits only HEAD and sign: they never rewrite the object or extend lifecycle.
  * URLs are reusable bearer credentials until expiry; never log or persist them. */
 export function createS3AttachmentDownloadStager(options: Options): AttachmentDownloadStager {
@@ -68,10 +98,14 @@ export function createS3AttachmentDownloadStager(options: Options): AttachmentDo
     const client = options.client ?? new S3Client({}); const presign = options.presign ?? getSignedUrl;
     return {
         async stage(source, externalSignal) {
-            const { metadata, cacheIdentity } = source;
+            const { metadata, cacheIdentity } = source; const checksummed = 'bytes' in source;
+            const limit = checksummed ? MAX_SOURCE_DOWNLOAD_BYTES : MAX_DOWNLOAD_BYTES;
             const contentType = MIME_TYPE.test(metadata.contentType) ? metadata.contentType : 'application/octet-stream';
             const contentDisposition = attachmentDisposition(metadata.filename);
-            const metadataSize = metadata.sizeIsApproximate ? undefined : metadata.size ?? undefined;
+            const bytesValid = 'bytes' in source && source.bytes instanceof Uint8Array;
+            const metadataSize = 'bytes' in source ? bytesValid ? source.bytes.byteLength : undefined : source.metadata.sizeIsApproximate ? undefined : source.metadata.size ?? undefined;
+            /** S3's base64 form of the expected full-object SHA-256; undefined for an attachment or an invalid checksummed source. */
+            const checksum = 'bytes' in source && bytesValid && typeof source.sha256 === 'string' && /^[a-f0-9]{64}$/u.test(source.sha256) ? Buffer.from(source.sha256, 'hex').toString('base64') : undefined;
             const descriptor = sha256(['wildduck-mcp/download-descriptor/v1', contentType, contentDisposition, metadataSize ?? null]);
             const binding = sha256(['wildduck-mcp/attachment-cache/v1', cacheIdentity, descriptor]);
             const key = `downloads/v1/${binding}`;
@@ -98,14 +132,17 @@ export function createS3AttachmentDownloadStager(options: Options): AttachmentDo
             };
             const head = async (): Promise<HeadObjectCommandOutput | undefined> => {
                 check(); let result: HeadObjectCommandOutput;
-                try { result = await client.send(new HeadObjectCommand({ Bucket: bucketName, Key: key }), { abortSignal: signal }); }
+                try { result = await client.send(new HeadObjectCommand({ Bucket: bucketName, Key: key, ...(checksummed ? { ChecksumMode: 'ENABLED' } : {}) }), { abortSignal: signal }); }
                 catch (error) { check(); if (status(error) === 404) { return undefined; } throw error; }
                 check();
                 const size = result.ContentLength;
-                if (size === undefined || !Number.isSafeInteger(size) || size < 0 || size > MAX_DOWNLOAD_BYTES ||
+                if (size === undefined || !Number.isSafeInteger(size) || size < 0 || size > limit ||
                     metadataSize !== undefined && size !== metadataSize || result.Metadata?.['binding'] !== binding || result.Metadata?.['descriptor'] !== descriptor ||
                     result.ContentType !== contentType || result.ContentDisposition !== contentDisposition || result.CacheControl !== 'private, no-store' ||
                     result.ServerSideEncryption !== 'AES256' || !result.ETag || result.StorageClass !== undefined && result.StorageClass !== 'STANDARD') { throw new MailError('verification_failed'); }
+                // A checksummed object is served only if S3's own stored full-object SHA-256 of its body is the expected
+                // one: a missing checksum, a composite (multipart checksum-of-checksums) or another value is refused.
+                if (checksummed && (checksum === undefined || result.ChecksumSHA256 !== checksum || result.ChecksumType !== 'FULL_OBJECT')) { throw new MailError('verification_failed'); }
                 expirationTime(result.Expiration);
                 return result;
             };
@@ -120,11 +157,25 @@ export function createS3AttachmentDownloadStager(options: Options): AttachmentDo
                 check();
                 return { url, expiresAt: new Date(now + expiresIn * 1000).toISOString(), size: object.ContentLength as number };
             };
-            const operation = async (): Promise<StagedAttachmentDownload> => {
-                check(); if (!/^[a-f0-9]{64}$/u.test(cacheIdentity)) { throw new MailError('invalid_input'); } exactSize(metadataSize);
-                const cached = await head(); if (cached) { return sign(cached); }
-                const opened = await source.open(signal); reader = opened.body.getReader(); check();
-                exactSize(opened.expectedSize);
+            /** A checksummed source: one PutObject, so S3's checksum is a full-object SHA-256 (a multipart upload's
+             * SHA-256 can only be a composite). S3 rejects the body if it does not match ChecksumSHA256. */
+            const put = async (bytes: Uint8Array): Promise<number> => {
+                check();
+                try {
+                    await client.send(new PutObjectCommand({ Bucket: bucketName, Key: key, Body: bytes, ChecksumSHA256: checksum, IfNoneMatch: '*',
+                        ContentType: contentType, ContentDisposition: contentDisposition, CacheControl: 'private, no-store', ServerSideEncryption: 'AES256',
+                        Metadata: { binding, descriptor } }), { abortSignal: signal });
+                } catch (error) {
+                    // 412: another request stored this key first. Its object is verified by HEAD exactly as a cache hit;
+                    // it is never overwritten or deleted.
+                    check(); if (status(error) !== 412) { throw error; }
+                }
+                return bytes.byteLength;
+            };
+            /** An attachment: streamed in bounded multipart parts while counting the actual bytes. */
+            const multipart = async (opener: AttachmentDownloadSource): Promise<number> => {
+                const opened = await opener.open(signal); reader = opened.body.getReader(); check();
+                exactSize(opened.expectedSize, limit);
                 if (opened.expectedSize !== undefined && metadataSize !== undefined && opened.expectedSize !== metadataSize) { throw new MailError('verification_failed'); }
                 const expectedSize = opened.expectedSize ?? metadataSize;
                 const created = await client.send(new CreateMultipartUploadCommand({ Bucket: bucketName, Key: key,
@@ -143,7 +194,7 @@ export function createS3AttachmentDownloadStager(options: Options): AttachmentDo
                     check(); const next = await reader.read(); check(); if (next.done) { break; }
                     if (!(next.value instanceof Uint8Array)) { throw new MailError('temporarily_unavailable'); }
                     size += next.value.byteLength;
-                    if (size > MAX_DOWNLOAD_BYTES) { throw new MailError('too_large'); }
+                    if (size > limit) { throw new MailError('too_large'); }
                     if (expectedSize !== undefined && size > expectedSize) { throw new MailError('verification_failed'); }
                     for (let offset = 0; offset < next.value.byteLength;) {
                         const length = Math.min(PART_BYTES - partSize, next.value.byteLength - offset);
@@ -162,6 +213,13 @@ export function createS3AttachmentDownloadStager(options: Options): AttachmentDo
                     // a deterministic key could erase its completed object.
                     await abortUpload();
                 }
+                return size;
+            };
+            const operation = async (): Promise<StagedAttachmentDownload> => {
+                check(); if (!/^[a-f0-9]{64}$/u.test(cacheIdentity) || checksummed && checksum === undefined) { throw new MailError('invalid_input'); }
+                exactSize(metadataSize, limit);
+                const cached = await head(); if (cached) { return sign(cached); }
+                const size = 'bytes' in source ? await put(source.bytes) : await multipart(source);
                 check(); const completed = await head();
                 if (!completed || completed.ContentLength !== size) { throw new MailError('verification_failed'); }
                 return sign(completed);

@@ -77,6 +77,7 @@ export function createApp(options: AppOptions = {}) {
                 get_thread: input => auth.mail.get_thread(mailContext, input),
                 read_messages: input => auth.mail.read_messages(mailContext, input),
                 get_attachment_download: input => auth.mail.get_attachment_download(mailContext, input),
+                get_message_source_download: input => auth.mail.get_message_source_download(mailContext, input),
                 read_attachment: input => auth.mail.read_attachment(mailContext, input),
                 create_attachment_upload: input => auth.mail.create_attachment_upload(mailContext, input),
                 move_message: input => auth.mail.move_message(mailContext, input),

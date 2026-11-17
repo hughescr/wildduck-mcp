@@ -93,6 +93,53 @@ describe('attachments copied from many large messages', () => {
     }, 30_000);
 });
 
+/** Peak RSS bound for get_message_source_download of a 25 MiB source through the real S3 stager (a fake S3 client that
+ * keeps no body). The backend holds the source once and the stager sends that buffer itself as the one PutObject body
+ * (the SDK writes a Buffer body without copying it); the fake WildDuck's stored source is one more copy. Measured on
+ * macOS arm64 (bun 1.4.4) from a ~73 MiB baseline: 94-95 MiB peak. Half the Lambda still fails if several
+ * whole-message copies come back. */
+const SOURCE_DOWNLOAD_RSS_LIMIT_KIB = 512 * 1024;
+const sourceDownloadScript = `
+    ${CHILD_MEMORY_SOURCE}
+    import { createHash } from 'node:crypto';
+    import { createMailBackend } from ${path('../src/mail/backend.ts')};
+    import { createS3AttachmentDownloadStager } from ${path('../src/mail/downloads.ts')};
+    import { MAX_MESSAGE_BYTES } from ${path('../src/mail/mime.ts')};
+    import { inboxId, session } from ${path('./wildduck-fake.ts')};
+    // Bytes without repetition, so nothing downstream can share or compress them.
+    const stored = Buffer.allocUnsafe(MAX_MESSAGE_BYTES); for (let i = 0; i < stored.length; i += 4) { stored.writeUInt32LE(Math.imul(i + 1, 2654435761) >>> 0, i); }
+    const fetcher = async () => new Response(new ReadableStream({ start(controller) { for (let offset = 0; offset < stored.length; offset += 64 * 1024) { controller.enqueue(stored.subarray(offset, offset + 64 * 1024)); } controller.close(); } }), { headers: { 'content-type': 'message/rfc822', 'content-length': String(stored.length) } });
+    const objects = new Map(); let puts = 0;
+    const client = { config: { credentials: async () => ({ accessKeyId: 'test', secretAccessKey: 'test' }) }, send: async command => {
+        const input = command.input; const name = command.constructor.name;
+        if (name === 'HeadObjectCommand') { const object = objects.get(input.Key); if (!object) { throw Object.assign(new Error('missing'), { $metadata: { httpStatusCode: 404 } }); } return object; }
+        if (name === 'PutObjectCommand') {
+            // As S3 does, store the object only if the body matches the sent SHA-256 (hashing reads the body in place).
+            puts++; if (createHash('sha256').update(input.Body).digest('base64') !== input.ChecksumSHA256) { throw Object.assign(new Error('BadDigest'), { $metadata: { httpStatusCode: 400 } }); }
+            objects.set(input.Key, { ContentLength: input.Body.byteLength, ETag: '"e"', ContentType: input.ContentType, ContentDisposition: input.ContentDisposition, CacheControl: input.CacheControl, ServerSideEncryption: 'AES256', Metadata: input.Metadata, ChecksumSHA256: input.ChecksumSHA256, ChecksumType: 'FULL_OBJECT' }); return {};
+        }
+        throw new Error('unexpected ' + name);
+    } };
+    const stager = createS3AttachmentDownloadStager({ bucketName: 'private-test-bucket', client, presign: async (_client, command) => 'https://private-bucket.s3.example/' + command.input.Key });
+    const backend = createMailBackend({ fetch: fetcher, downloadStager: stager });
+    Bun.gc(true);
+    const before = usage(); const start = performance.now();
+    const result = await backend.getMessageSourceDownload(session, { mailboxId: inboxId, uid: 1 });
+    const ms = performance.now() - start; const after = usage();
+    console.log(JSON.stringify({ size: result.metadata.size, puts, ms, before: before.maxRSS, after: after.maxRSS, rss: after.rss, hwm: ownPeak() }));
+`;
+describe('25 MiB message source download memory', () => {
+    test('staging a 25 MiB message source stays under the RSS bound', async () => {
+        const child = await runChild(sourceDownloadScript, { ramBytes: LAMBDA_BYTES, killKiB: SOURCE_DOWNLOAD_RSS_LIMIT_KIB, deadlineMs: 20_000 });
+        expect(child.stderr).toBe(''); expect(child.exceeded).toBe(false); expect(child.timedOut).toBe(false); expect(child.status).toBe(0);
+        const result = JSON.parse(child.stdout) as { size: number; puts: number; ms: number } & ChildMemory;
+        expect(result.size).toBe(25 * 1024 * 1024); expect(result.puts).toBe(1);
+        expect(memoryViolations(result, SOURCE_DOWNLOAD_RSS_LIMIT_KIB)).toEqual([]);
+        // eslint-disable-next-line no-console -- The measured figures are the point of this test; they go to the report.
+        console.info(JSON.stringify({ mode: 'source_download', sizeBytes: result.size, ms: Math.round(result.ms), peakKiB: childPeak(result), beforeKiB: result.before, rssKiB: result.rss }));
+    }, 30_000);
+});
+
 describe('25 MiB message memory', () => {
     test.each(['create', 'update'] as const)('%s of a 25 MiB draft stays under the RSS bound', async mode => {
         const child = await runChild(script(mode), { ramBytes: LAMBDA_BYTES, killKiB: RSS_LIMIT_KIB, deadlineMs: 20_000 });

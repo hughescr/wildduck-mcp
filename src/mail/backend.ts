@@ -4,9 +4,9 @@ import libmime from 'libmime';
 import { WILDDUCK_ORIGIN } from '../wildduck';
 import { remainingRequestTimeMs, withRequestBudget } from '../request-budget';
 import { currentRequestId } from '../request-id';
-import { MailError, MAIL_OPERATION_METADATA_KEY, ATTACHMENT_UPLOAD_KEY_PREFIX, type BackendMailSession, type DraftMailSession, type MailBackendReader, type MailBackendWriter, type Mailbox, type MailInput, type MailInputRaw, type MailOutput, type MessageKey, type DraftContent, type DraftPatch, type MessageSnapshot, type PreparedDraft, type MailOperationMarker, type MessageRef, type MessageSummary, type MailAddress, type AttachmentMetadata, type AttachmentDownload, type AttachmentDownloadLink, type VerifiedMessageMutation, type AuthoredSourceDescriptor, type AttachmentUploadStore, type AttachmentUploadStager, type AttachmentUploadRecord, type AttachmentSource, type NewAttachment, type ResolvedAttachment } from './contracts';
-import { draftContentSchema, namedAddress, mailboxIdSchema, messageKeySchema, mailInputSchemas, mailOutputSchemas, canonicalReadMessageOutputSchema, attachmentDownloadLinkSchema, mailOperationMarkerSchema, addFlagSchema, labelSchema, attachmentFilenameSchema, attachmentContentTypeSchema, MAX_READ_TEXT_BYTES, MAX_HTML_BYTES, MAX_ATTACHMENT_BYTES, MAX_SNIPPET_BYTES, MAX_SEARCH_TEXT_CHARACTERS, MAX_UPLOAD_BYTES } from './schemas';
-import { MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS, type AttachmentDownloadStager } from './downloads';
+import { MailError, MAIL_OPERATION_METADATA_KEY, ATTACHMENT_UPLOAD_KEY_PREFIX, type BackendMailSession, type DraftMailSession, type MailBackendReader, type MailBackendWriter, type Mailbox, type MailInput, type MailInputRaw, type MailOutput, type MessageKey, type DraftContent, type DraftPatch, type MessageSnapshot, type PreparedDraft, type MailOperationMarker, type MessageRef, type MessageSummary, type MailAddress, type AttachmentMetadata, type AttachmentDownload, type AttachmentDownloadLink, type MessageSourceDownloadLink, type VerifiedMessageMutation, type AuthoredSourceDescriptor, type AttachmentUploadStore, type AttachmentUploadStager, type AttachmentUploadRecord, type AttachmentSource, type NewAttachment, type ResolvedAttachment } from './contracts';
+import { draftContentSchema, namedAddress, mailboxIdSchema, messageKeySchema, mailInputSchemas, mailOutputSchemas, canonicalReadMessageOutputSchema, attachmentDownloadLinkSchema, messageSourceDownloadLinkSchema, mailOperationMarkerSchema, addFlagSchema, labelSchema, attachmentFilenameSchema, attachmentContentTypeSchema, MAX_READ_TEXT_BYTES, MAX_HTML_BYTES, MAX_ATTACHMENT_BYTES, MAX_SNIPPET_BYTES, MAX_SEARCH_TEXT_CHARACTERS, MAX_UPLOAD_BYTES } from './schemas';
+import { MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS, SOURCE_DOWNLOAD_TIMEOUT_MS, type AttachmentDownloadStager } from './downloads';
 import { deriveReply, sanitizeHeaderText } from './reply';
 import { ownedIdentityMatcher } from './identities';
 import { createMime, inspectSource, preparePatch, retainedAttachmentBytes, verifyCandidate, attachmentBodyBytes, AMBIGUOUS_INLINE, AUTHORED_LIMITS, MAX_MESSAGE_BYTES, MimeError, type MimeEnvelope } from './mime';
@@ -408,9 +408,9 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
     }
     /** Every source this server reads (an authored draft, a read-back, a message before a move) is
      * bounded by the one message cap. */
-    private async source(session: BackendMailSession, target: MessageKey): Promise<Buffer> {
+    private async source(session: BackendMailSession, target: MessageKey, signal?: AbortSignal): Promise<Buffer> {
         sessionValid(session); targetValid(target);
-        return (await this.transport(session, `/mailboxes/${target.mailboxId}/messages/${target.uid}/message.eml`, 'GET', undefined, MAX_MESSAGE_BYTES, 'source')).bytes;
+        return (await this.transport(session, `/mailboxes/${target.mailboxId}/messages/${target.uid}/message.eml`, 'GET', undefined, MAX_MESSAGE_BYTES, 'source', undefined, { signal })).bytes;
     }
     async listMailboxes(session: BackendMailSession): Promise<MailOutput<'list_mailboxes'>> { return this.mailboxListing(session, true); }
     private async mailboxListing(session: BackendMailSession, counters: boolean): Promise<MailOutput<'list_mailboxes'>> {
@@ -596,6 +596,40 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
             try { return await Promise.race([operation(), new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new MailError('upstream_timeout')); }, budget); })]); }
             catch (error) { if (error instanceof MailError) { throw error; } throw new MailError('temporarily_unavailable'); }
             finally { if (timer !== undefined) { clearTimeout(timer); } controller.abort(); if (response && !response.bodyUsed) { void response.body?.cancel().catch(() => {}); } }
+        });
+    }
+    /** A message has no immutable upstream content hash, unlike an attachment, and S3 fixes an object's metadata
+     * before its bytes are sent. So the source is read first, through the bounded source() path every other
+     * source read uses (at most MAX_MESSAGE_BYTES, a declared exact length, identity encoding), and hashed; the
+     * cache identity binds that SHA-256, so the object key is content-addressed. The stager uploads the bytes with
+     * that SHA-256 as S3's checksum, and serves a new or cached object only if S3 reports the same full-object
+     * SHA-256, so the returned sha256 is bound by S3 to the bytes the URL serves; a cache hit skips only the upload.
+     * WildDuck itself refuses another account's message (404, not_found). The buffer is the one copy held and is
+     * the upload's body as it is. One deadline (SOURCE_DOWNLOAD_TIMEOUT_MS, within the request) covers the fetch,
+     * the staging and the signing. */
+    async getMessageSourceDownload(session: BackendMailSession, input: MailInput<'get_message_source_download'>): Promise<MessageSourceDownloadLink> {
+        sessionValid(session); const parsed = mailInputSchemas.get_message_source_download.safeParse(input); if (!parsed.success) { throw new MailError('invalid_input'); }
+        const stager = this.downloadStager; if (!stager) { throw new MailError('temporarily_unavailable'); }
+        const ceiling = SOURCE_DOWNLOAD_TIMEOUT_MS + 2000;
+        const inherited = remainingRequestTimeMs(); const deadline = performance.now() + Math.min(inherited ?? ceiling, ceiling);
+        return withRequestBudget(() => Math.max(0, deadline - performance.now()), async () => {
+            const target = parsed.data; const controller = new AbortController(); let timer: ReturnType<typeof setTimeout> | undefined;
+            const budget = Math.max(0, deadline - performance.now() - 2000); if (budget === 0) { throw new MailError('upstream_timeout'); }
+            const operation = async () => {
+                const bytes = await this.source(session, target, controller.signal);
+                const sha256 = createHash('sha256').update(bytes).digest('hex');
+                // Flags, versions and OAuth clients deliberately do not affect this private account-scoped identity.
+                const cacheIdentity = createHash('sha256').update(JSON.stringify(['wildduck-mcp/message-source-cache/v2', session.accountId, target.mailboxId, target.uid, sha256])).digest('hex');
+                const staged = await stager.stage({ cacheIdentity, metadata: { filename: `message-${target.uid}.eml`, contentType: 'message/rfc822' }, bytes, sha256 }, controller.signal);
+                if (controller.signal.aborted) { throw new MailError('upstream_timeout'); }
+                if (staged.size !== bytes.length) { throw new MailError('verification_failed'); }
+                const result = { metadata: { mailboxId: target.mailboxId, uid: target.uid, size: staged.size, sha256, expiresAt: staged.expiresAt }, url: staged.url };
+                if (!messageSourceDownloadLinkSchema.safeParse(result).success) { throw new MailError('verification_failed'); }
+                return result;
+            };
+            try { return await Promise.race([operation(), new Promise<never>((_, reject) => { timer = setTimeout(() => { controller.abort(); reject(new MailError('upstream_timeout')); }, budget); })]); }
+            catch (error) { if (controller.signal.aborted) { throw new MailError('upstream_timeout'); } if (error instanceof MailError) { throw error; } throw new MailError('temporarily_unavailable'); }
+            finally { if (timer !== undefined) { clearTimeout(timer); } controller.abort(); }
         });
     }
     async readAttachment(session: BackendMailSession, input: MailInput<'read_attachment'>): Promise<AttachmentDownload> {

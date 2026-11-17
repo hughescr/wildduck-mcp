@@ -2,15 +2,15 @@ import { randomUUID } from 'node:crypto';
 import { DEFAULT_THROTTLE_TIMEOUT_MS, RESPONSE_RESERVE_MS } from '../dynamo-retry';
 import { remainingRequestTimeMs, withRequestBudget } from '../request-budget';
 import { digest, randomId } from '../auth/crypto';
-import { MailError, ATTACHMENT_UPLOAD_KEY_PREFIX, type AttachmentUploadRecord, type CanonicalReadMessage, type ActivationProof, type AuthoredSourceDescriptor, type SourceGrade, type AttachmentDownloadLink, type AttachmentDownload, type AttachmentUploadLink, type AttachmentUploadStager, type AttachmentUploadStore, type BackendMailSession, type DraftMailSession, type ConfirmedReceipt, type FailedReceipt, type MailBackendReader, type MailBackendWriter, type MailContext, type MailInput, type MailOperationMarker, type MailOperationRecord, type MailOperationStore, type MailOutput, type MailService, type MailToolName, type MailWriteTool, type MessageKey, type MessageRef, type MessageSnapshot, type OperationClaim, type OperationKey, type PreparedDraft, type ReservationResult, type UnknownReceipt, type WriteIntent } from './contracts';
+import { MailError, ATTACHMENT_UPLOAD_KEY_PREFIX, type AttachmentUploadRecord, type CanonicalReadMessage, type ActivationProof, type AuthoredSourceDescriptor, type SourceGrade, type AttachmentDownloadLink, type MessageSourceDownloadLink, type AttachmentDownload, type AttachmentUploadLink, type AttachmentUploadStager, type AttachmentUploadStore, type BackendMailSession, type DraftMailSession, type ConfirmedReceipt, type FailedReceipt, type MailBackendReader, type MailBackendWriter, type MailContext, type MailInput, type MailOperationMarker, type MailOperationRecord, type MailOperationStore, type MailOutput, type MailService, type MailToolName, type MailWriteTool, type MessageKey, type MessageRef, type MessageSnapshot, type OperationClaim, type OperationKey, type PreparedDraft, type ReservationResult, type UnknownReceipt, type WriteIntent } from './contracts';
 import { batchSummary, errorText } from './summary';
-import { activationProofSchema, draftContentSchema, failureReasonSchema, mailboxSchema, mailInputSchemas, mailOperationMarkerSchema, mailOutputSchemas, canonicalReadMessageOutputSchema, attachmentDownloadLinkSchema, attachmentUploadLinkSchema, UPLOAD_TTL_SECONDS, messageKeySchema, messageRefSchema, MAX_BATCH_BYTES, BATCH_CONCURRENCY } from './schemas';
+import { activationProofSchema, draftContentSchema, failureReasonSchema, mailboxSchema, mailInputSchemas, mailOperationMarkerSchema, mailOutputSchemas, canonicalReadMessageOutputSchema, attachmentDownloadLinkSchema, messageSourceDownloadLinkSchema, attachmentUploadLinkSchema, UPLOAD_TTL_SECONDS, messageKeySchema, messageRefSchema, MAX_BATCH_BYTES, BATCH_CONCURRENCY } from './schemas';
 
 /** uploads is optional so deployments without an upload bucket still serve every other tool;
  * create_attachment_upload then fails closed with temporarily_unavailable. */
 interface Dependencies { reader: MailBackendReader; writer: MailBackendWriter; operations: MailOperationStore; uploads?: { store: AttachmentUploadStore; stager: AttachmentUploadStager } }
 type WriteInput = MailInput<MailWriteTool>;
-type ReadTool = Exclude<MailToolName, MailWriteTool | 'read_attachment' | 'get_attachment_download' | 'read_messages' | 'create_attachment_upload'>;
+type ReadTool = Exclude<MailToolName, MailWriteTool | 'read_attachment' | 'get_attachment_download' | 'get_message_source_download' | 'read_messages' | 'create_attachment_upload'>;
 /** Copying an attachment of a stored message reads mail, so it needs mail:read as well as mail:draft. */
 const copiesMailboxAttachment = (parsed: WriteInput) => 'attachments' in parsed && (parsed.attachments ?? []).some(item => 'source' in item);
 type Verification = 'verified' | 'pending' | 'outcome_unknown' | 'unverified';
@@ -232,6 +232,14 @@ export function createMailService({ reader, writer, operations, uploads }: Depen
             return result;
         } catch (error) { throw sanitized(error); }
     }
+    async function sourceDownloadLink(context: MailContext, raw: MailInput<'get_message_source_download'>): Promise<MessageSourceDownloadLink> {
+        const bound = session(context, 'mail:read'); const parsed = input('get_message_source_download', raw);
+        try {
+            const result = messageSourceDownloadLinkSchema.parse(await reader.getMessageSourceDownload(bound, parsed));
+            if (!sameMessage(result.metadata, parsed)) { throw temporary(); }
+            return result;
+        } catch (error) { throw sanitized(error); }
+    }
     async function attachment(context: MailContext, raw: MailInput<'read_attachment'>): Promise<AttachmentDownload> {
         const bound = session(context, 'mail:read'); const parsed = input('read_attachment', raw);
         try {
@@ -435,6 +443,7 @@ export function createMailService({ reader, writer, operations, uploads }: Depen
         read_message: (context, raw) => read('read_message', context, raw),
         read_attachment: attachment,
         get_attachment_download: downloadLink,
+        get_message_source_download: sourceDownloadLink,
         get_thread: (context, raw) => read('get_thread', context, raw),
         read_messages: (context, raw) => batch(context, raw, true),
         create_attachment_upload: attachmentUpload,

@@ -74,6 +74,7 @@ function fixture(authored = true) {
     const find = (key: { mailboxId: string; uid: number }): MessageSnapshot => messages.get(JSON.stringify(key)) ?? { ...behavior.snapshot, ...(behavior.marker ? { marker: behavior.marker } : {}) };
     const reader: MailBackendReader = {
         getAttachmentDownload: async (_bound, input) => ({ metadata: { ...input, filename: null, contentType: 'text/plain', size: 5, expiresAt: '2026-10-26T10:00:00.000Z' }, url: 'https://example.s3.amazonaws.com/file' }),
+        getMessageSourceDownload: async (...args) => { record('getMessageSourceDownload', ...args); const [, input] = args; return { metadata: { ...input, size: 9, sha256: 'd'.repeat(64), expiresAt: '2026-10-26T10:05:00.000Z' }, url: 'https://example.s3.amazonaws.com/source' }; },
         getThread: async (_bound, input) => ({ threadId: input.threadId ?? mailboxId, messages: [message] }),
         listMailboxes: async (...args) => { record('listMailboxes', ...args); return { mailboxes: [mailbox] }; },
         listMessages: async (...args) => { record('listMessages', ...args); return { messages: [message] }; },
@@ -539,6 +540,33 @@ test('download link carrier validates public metadata identity and URL before re
     }
     f.reader.getAttachmentDownload = async (bound, input) => ({ ...await valid(bound, input), url: 'http://example.s3.amazonaws.com/private-secret' });
     await expect(f.service.get_attachment_download(context, request)).rejects.toMatchObject({ code: 'temporarily_unavailable' });
+    expect(f.operations.calls).toHaveLength(0);
+});
+
+test('message source link needs mail:read and an active session, binds only the verified account, and validates its carrier', async () => {
+    const f = fixture(false); const request = { mailboxId, uid: 7 }; const valid = f.reader.getMessageSourceDownload;
+    const link = await f.service.get_message_source_download(context, request);
+    expect(link).toEqual({ metadata: { ...request, size: 9, sha256: 'd'.repeat(64), expiresAt: '2026-10-26T10:05:00.000Z' }, url: 'https://example.s3.amazonaws.com/source' });
+    // The backend sees only the account and its token: no client id, scopes or connection state.
+    expect(f.calls).toEqual([{ method: 'getMessageSourceDownload', args: [{ accountId, accessToken: context.accessToken }, request] }]);
+    for (const [bad, code] of [[{ ...context, scopes: ['mail:draft', 'mail:send', 'mail:modify'] }, 'forbidden'], [{ ...context, scopes: [] }, 'forbidden'], [{ ...context, accountId: 'not-an-account' }, 'forbidden'], [{ ...context, accessToken: '' }, 'forbidden'], [{ ...context, connectionStatus: 'reconnect_required' as const }, 'reconnect_required']] as const) {
+        await expect(f.service.get_message_source_download(bad, request)).rejects.toMatchObject({ code });
+    }
+    for (const bad of [{ mailboxId, uid: 0 }, { mailboxId, uid: 7, attachmentId: 'ATT1' }, { mailboxId, uid: 7, accountId }]) { await expect(f.service.get_message_source_download(context, bad as never)).rejects.toMatchObject({ code: 'invalid_input' }); }
+    expect(f.calls).toHaveLength(1);
+    for (const metadata of [{ mailboxId: 'f'.repeat(24) }, { uid: 8 }, { size: -1 }, { sha256: 'not-a-hash' }, { expiresAt: 'invalid-expiry' }, { url: 'https://example.s3.amazonaws.com/leak' }]) {
+        f.reader.getMessageSourceDownload = async (bound, input) => { const original = await valid(bound, input); return { ...original, metadata: { ...original.metadata, ...metadata } }; };
+        await expect(f.service.get_message_source_download(context, request)).rejects.toMatchObject({ code: 'temporarily_unavailable' });
+    }
+    f.reader.getMessageSourceDownload = async (bound, input) => ({ ...await valid(bound, input), url: 'http://example.s3.amazonaws.com/private-secret' });
+    await expect(f.service.get_message_source_download(context, request)).rejects.toMatchObject({ code: 'temporarily_unavailable' });
+    for (const code of ['not_found', 'too_large', 'upstream_timeout', 'source_integrity_unavailable'] as const) {
+        f.reader.getMessageSourceDownload = async () => { throw new MailError(code); };
+        await expect(f.service.get_message_source_download(context, request)).rejects.toMatchObject({ code });
+    }
+    f.reader.getMessageSourceDownload = async () => { throw new Error('private upstream body https://signed.example/?token=secret'); };
+    const error = await f.service.get_message_source_download(context, request).then(() => undefined, (thrown: unknown) => thrown);
+    expect(error).toMatchObject({ code: 'temporarily_unavailable' }); expect(String((error as Error).message)).not.toContain('secret');
     expect(f.operations.calls).toHaveLength(0);
 });
 

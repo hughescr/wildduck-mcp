@@ -34,6 +34,16 @@ test('create_attachment_upload is refused without the mail:draft permission befo
     const result = await invoke('create_attachment_upload', request);
     expect(result.isError).toBe(true); expect(result.content[0].text).toContain('needs the mail:draft permission'); expect(called).toBe(0);
 });
+test('get_message_source_download reaches the mail service with the verified account, and is refused without mail:read', async () => {
+    const { env, invoke, tokens } = await connected('mail:read'); const seen: { context: MailContext; input: unknown }[] = [];
+    env.runtime.mail.get_message_source_download = async (context, input) => { seen.push({ context, input }); return { metadata: { ...input, size: 9, sha256: 'd'.repeat(64), expiresAt: '2026-10-26T10:05:00.000Z' }, url: 'https://bucket.s3.amazonaws.com/downloads/v1/x?X-Amz-Signature=synthetic-source-secret' }; };
+    expect((await invoke('get_message_source_download', { mailboxId: 'b'.repeat(24), uid: 1, accountId: 'b'.repeat(24) })).isError).toBe(true); expect(seen).toHaveLength(0);
+    const result = await invoke('get_message_source_download', { mailboxId: 'b'.repeat(24), uid: 1 });
+    expect(result.isError).toBeUndefined(); expect(seen).toEqual([{ context: expect.objectContaining({ accountId: 'a'.repeat(24), accessToken: 'a'.repeat(40), connectionStatus: 'active' }), input: { mailboxId: 'b'.repeat(24), uid: 1 } }]);
+    expect(result.content[1]).toMatchObject({ type: 'resource_link', mimeType: 'message/rfc822', name: 'message-1.eml' }); expect(JSON.stringify(result).split('synthetic-source-secret')).toHaveLength(2); expect(JSON.stringify(result)).not.toContain(tokens.access_token);
+    const draftOnly = await connected('mail:draft'); let called = 0; draftOnly.env.runtime.mail.get_message_source_download = async () => { called++; throw new Error('must not be called'); };
+    const denied = await draftOnly.invoke('get_message_source_download', { mailboxId: 'b'.repeat(24), uid: 1 }); expect(denied.isError).toBe(true); expect(denied.content[0].text).toContain('needs the mail:read permission'); expect(called).toBe(0);
+});
 test('a draft that copies a stored attachment is refused without mail:read before the mail service is called', async () => {
     const { env, invoke } = await connected('mail:draft'); let called = 0; env.runtime.mail.create_draft = async () => { called++; throw new Error('must not be called'); };
     const result = await invoke('create_draft', { operationId: '9ea75b7b-64fa-455e-b83b-37081fc1ec2a', subject: '', body: { text: '' }, attachments: [{ source: { mailboxId: 'b'.repeat(24), uid: 1, attachmentId: 'ATT1' } }] });

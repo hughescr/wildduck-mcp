@@ -30,6 +30,9 @@ export interface ReadMessageResult { readonly message: CanonicalReadMessage; rea
 export interface AttachmentDownload { readonly metadata: MailOutput<'read_attachment'>; readonly bytes: Uint8Array }
 /** Signed URL travels separately and is serialized only as resource_link.uri. */
 export interface AttachmentDownloadLink { readonly metadata: MailOutput<'get_attachment_download'>; readonly url: string }
+/** get_message_source_download's service result (messageSourceDownloadLinkSchema): metadata carries no
+ * summary, and the signed URL travels separately and is serialized only as resource_link.uri. */
+export interface MessageSourceDownloadLink { readonly metadata: Omit<MailOutput<'get_message_source_download'>, 'summary'>; readonly url: string }
 /** create_attachment_upload's service result (attachmentUploadLinkSchema). The presigned upload URL
  * travels separately and is serialized only as resource_link.uri; metadata carries no summary. */
 export interface AttachmentUploadLink { readonly metadata: Omit<MailOutput<'create_attachment_upload'>, 'summary'>; readonly url: string }
@@ -87,6 +90,8 @@ export interface MailBackendReader {
      * without a second backend GET or N+1 operation lookups on list pages. */
     readMessage(session: BackendMailSession, input: MessageKey): Promise<ReadMessageResult>;
     getAttachmentDownload(session: BackendMailSession, input: MailInput<'get_attachment_download'>): Promise<AttachmentDownloadLink>;
+    /** The complete stored source of one message, staged as a download; sha256 is of exactly the bytes the URL serves. */
+    getMessageSourceDownload(session: BackendMailSession, input: MailInput<'get_message_source_download'>): Promise<MessageSourceDownloadLink>;
     readAttachment(session: BackendMailSession, input: MailInput<'read_attachment'>): Promise<AttachmentDownload>;
 }
 export interface MessageSnapshot {
@@ -226,7 +231,7 @@ export interface MailOperationStore {
  * Public writes always pass this coordinator; no raw writer reaches MCP.
  * Drafts whose attachments use source also need mail:read. create_attachment_upload needs
  * mail:draft and is not a write tool: no operationId, no ledger, a new record per call. */
-export type MailResult<Name extends MailToolName> = Name extends 'read_attachment' ? AttachmentDownload : Name extends 'get_attachment_download' ? AttachmentDownloadLink : Name extends 'create_attachment_upload' ? AttachmentUploadLink : MailOutput<Name>;
+export type MailResult<Name extends MailToolName> = Name extends 'read_attachment' ? AttachmentDownload : Name extends 'get_attachment_download' ? AttachmentDownloadLink : Name extends 'get_message_source_download' ? MessageSourceDownloadLink : Name extends 'create_attachment_upload' ? AttachmentUploadLink : MailOutput<Name>;
 export type MailService = { [Name in MailToolName]: (context: MailContext, input: Name extends 'search_messages' ? MailInputRaw<Name> : MailInput<Name>) => Promise<MailResult<Name>> };
 export type BoundMailService = { [Name in MailToolName]: (input: MailInput<Name>) => Promise<MailResult<Name>> };
 export type MailWriteCoordinator = Pick<MailService, MailWriteTool>;

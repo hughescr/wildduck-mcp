@@ -5,6 +5,7 @@ import libmime from 'libmime';
 import { pipeline } from 'node:stream/promises';
 import { Splitter, Streamer } from '@zone-eu/mailsplit';
 import { createMailBackend, type SearchDiagnostic, type DraftVerificationDiagnostic, type MailBackendOptions } from '../src/mail/backend';
+import { type AttachmentDownloadSource, type DownloadSource } from '../src/mail/downloads';
 import { withRequestBudget } from '../src/request-budget';
 import { createMailService } from '../src/mail/service';
 import { MailError, MAIL_OPERATION_METADATA_KEY, type DraftMailSession, type DraftContent, type DraftPatch, type MailFailureCode, type MailOperationMarker, type AuthoredSourceDescriptor } from '../src/mail/contracts';
@@ -14,6 +15,8 @@ import { createMime } from '../src/mail/mime';
 import { authoredParts, authoredText } from './mime-text';
 import { decodedAddresses, partViews } from './mime-fields';
 import { memoryOperations } from './wildduck-fake';
+/** get_attachment_download always stages a streamed attachment source. */
+const attachmentSource = (source: DownloadSource): AttachmentDownloadSource => { if (!('open' in source)) { throw new Error('expected an attachment source'); } return source; };
 const accountId = 'a'.repeat(24); const mailboxId = 'b'.repeat(24); const token = 'c'.repeat(40);
 const clientIdHash = 'h'.repeat(43); const session: DraftMailSession = { accountId, accessToken: token, clientIdHash }; const target = { mailboxId, uid: 12 };
 const content: DraftContent = { to: [], cc: [], bcc: [{ address: 'bcc@example.com' }], subject: 'A draft', body: { text: 'Body' }, attachments: [] };
@@ -1252,7 +1255,7 @@ test('ordinary creation uses the owned primary or selected alias domain without 
 });
 test('staged download streams only the validated attachment and returns binary-free bounded metadata', async () => {
     const calls: { url: string; init: RequestInit }[] = []; let staged = 0; let bytes = 0;
-    const backend = createMailBackend({ fetch: (async (url, init) => { calls.push({ url: String(url), init: init ?? {} }); return calls.length === 1 ? Response.json(message({ attachments: [{ id: 'ATT1', hash: 'e'.repeat(64), transferEncoding: 'binary', filename: 'file.bin', contentType: 'application/octet-stream', size: 3 }] })) : new Response(new Uint8Array([0,1,255]), { headers: { 'content-length': '3' } }); }) as typeof fetch, downloadStager: { stage: async source => { staged++; const opened = await source.open(new AbortController().signal); expect(opened.expectedSize).toBe(3); const reader = opened.body.getReader(); while (true) { const part = await reader.read(); if (part.done) { break; } bytes += part.value.byteLength; } return { url: 'https://bucket.s3.amazonaws.com/downloads/opaque?signature=temporary', size: bytes, expiresAt: '2026-10-26T10:00:00.000Z' }; } } });
+    const backend = createMailBackend({ fetch: (async (url, init) => { calls.push({ url: String(url), init: init ?? {} }); return calls.length === 1 ? Response.json(message({ attachments: [{ id: 'ATT1', hash: 'e'.repeat(64), transferEncoding: 'binary', filename: 'file.bin', contentType: 'application/octet-stream', size: 3 }] })) : new Response(new Uint8Array([0,1,255]), { headers: { 'content-length': '3' } }); }) as typeof fetch, downloadStager: { stage: async source => { staged++; const opened = await attachmentSource(source).open(new AbortController().signal); expect(opened.expectedSize).toBe(3); const reader = opened.body.getReader(); while (true) { const part = await reader.read(); if (part.done) { break; } bytes += part.value.byteLength; } return { url: 'https://bucket.s3.amazonaws.com/downloads/opaque?signature=temporary', size: bytes, expiresAt: '2026-10-26T10:00:00.000Z' }; } } });
     const result = await backend.getAttachmentDownload(session, { ...target, attachmentId: 'ATT1' }); expect(staged).toBe(1); expect(bytes).toBe(3); expect(result.metadata.size).toBe(3); expect(result.metadata.attachmentId).toBe('ATT1'); expect(result).not.toHaveProperty('blob'); expect(result).not.toHaveProperty('bytes'); expect(calls).toHaveLength(2); expect(calls[0]?.url).toEndWith('?markAsSeen=false&replaceCidLinks=false'); expect(calls[1]?.url).toEndWith('/attachments/ATT1'); expect(calls.every(call => call.init.method === 'GET' && new Headers(call.init.headers).get('X-Access-Token') === token)).toBe(true);
 });
 test('staged download rejects absent or oversized metadata before fetching bytes and fails closed on mismatch', async () => {
@@ -1260,13 +1263,13 @@ test('staged download rejects absent or oversized metadata before fetching bytes
         let calls = 0; const backend = createMailBackend({ fetch: (async (_url: string | URL | Request) => { calls++; return Response.json(message({ attachments })); }) as typeof fetch, downloadStager: { stage: async () => { throw new Error('must not stage'); } } });
         await errorCode(backend.getAttachmentDownload(session, { ...target, attachmentId: 'ATT1' }), attachments.length ? 'too_large' : 'not_found'); expect(calls).toBe(1);
     }
-    let calls = 0; const backend = createMailBackend({ fetch: (async (_url: string | URL | Request) => ++calls === 1 ? Response.json(message({ attachments: [{ id: 'ATT1', hash: 'e'.repeat(64), transferEncoding: 'binary', contentType: 'text/plain', size: 3 }] })) : new Response('abc', { headers: { 'content-length': '3' } })) as typeof fetch, downloadStager: { stage: async source => { const opened = await source.open(new AbortController().signal); await opened.body.cancel(); return { url: 'https://bucket.s3.amazonaws.com/file', size: 2, expiresAt: '2026-10-26T10:00:00.000Z' }; } } });
+    let calls = 0; const backend = createMailBackend({ fetch: (async (_url: string | URL | Request) => ++calls === 1 ? Response.json(message({ attachments: [{ id: 'ATT1', hash: 'e'.repeat(64), transferEncoding: 'binary', contentType: 'text/plain', size: 3 }] })) : new Response('abc', { headers: { 'content-length': '3' } })) as typeof fetch, downloadStager: { stage: async source => { const opened = await attachmentSource(source).open(new AbortController().signal); await opened.body.cancel(); return { url: 'https://bucket.s3.amazonaws.com/file', size: 2, expiresAt: '2026-10-26T10:00:00.000Z' }; } } });
     await errorCode(backend.getAttachmentDownload(session, { ...target, attachmentId: 'ATT1' }), 'verification_failed');
 });
 
 test('conflicting exact attachment lengths fail before staging and cancel the body', async () => {
     let calls = 0; let stages = 0; let cancelled = false;
-    const backend = createMailBackend({ fetch: (async (_url: string | URL | Request) => ++calls === 1 ? Response.json(message({ attachments: [{ id: 'ATT1', hash: 'e'.repeat(64), transferEncoding: 'binary', contentType: 'text/plain', size: 3 }] })) : new Response(new ReadableStream({ cancel() { cancelled = true; } }), { headers: { 'content-length': '4' } })) as typeof fetch, downloadStager: { stage: async source => { stages++; await source.open(new AbortController().signal); throw new Error('must not complete staging'); } } });
+    const backend = createMailBackend({ fetch: (async (_url: string | URL | Request) => ++calls === 1 ? Response.json(message({ attachments: [{ id: 'ATT1', hash: 'e'.repeat(64), transferEncoding: 'binary', contentType: 'text/plain', size: 3 }] })) : new Response(new ReadableStream({ cancel() { cancelled = true; } }), { headers: { 'content-length': '4' } })) as typeof fetch, downloadStager: { stage: async source => { stages++; await attachmentSource(source).open(new AbortController().signal); throw new Error('must not complete staging'); } } });
     await errorCode(backend.getAttachmentDownload(session, { ...target, attachmentId: 'ATT1' }), 'verification_failed'); expect(stages).toBe(1); expect(cancelled).toBe(true);
 });
 
@@ -1279,7 +1282,7 @@ test('cached attachment links revalidate message access and reuse identity acros
         return Response.json(message({ seen: metadataReads > 1, flags: metadataReads > 1 ? ['\\Seen'] : [], attachments: [{ id: 'ATT1', hash: 'e'.repeat(64), transferEncoding: 'binary', contentType: 'text/plain', filename: 'same.txt', size: 3 }] }));
     }) as typeof fetch, downloadStager: { stage: async source => {
         stages++; identities.push(source.cacheIdentity); let size = cached.get(source.cacheIdentity);
-        if (size === undefined) { const opened = await source.open(new AbortController().signal); const bytes = await new Response(opened.body).arrayBuffer(); size = bytes.byteLength; cached.set(source.cacheIdentity, size); }
+        if (size === undefined) { const opened = await attachmentSource(source).open(new AbortController().signal); const bytes = await new Response(opened.body).arrayBuffer(); size = bytes.byteLength; cached.set(source.cacheIdentity, size); }
         return { url: 'https://bucket.s3.amazonaws.com/downloads/' + source.cacheIdentity + '?signature=' + stages, size, expiresAt: new Date(Date.now() + 300000).toISOString() };
     } } });
     const first = await backend.getAttachmentDownload(session, { ...target, attachmentId: 'ATT1' });
@@ -1311,7 +1314,7 @@ test('missing or invalid immutable hashes fail before cache lookup or upstream b
 test('lazy cache miss fetch preserves sanitized attachment status errors and supplied retry hints', async () => {
     for (const [status, code, expected] of [[403, 'InvalidToken', 'reconnect_required'], [403, 'AccessDenied', 'forbidden'], [404, 'MessageNotFound', 'not_found'], [429, 'RateLimited', 'temporarily_unavailable']] as const) {
         let requests = 0;
-        const backend = createMailBackend({ fetch: (async (_url: string | URL | Request) => ++requests === 1 ? Response.json(message({ attachments: [{ id: 'ATT1', hash: 'e'.repeat(64), transferEncoding: 'binary', contentType: 'text/plain', size: 3 }] })) : Response.json({ code, error: 'private upstream response' }, { status, headers: { 'Retry-After': '20' } })) as typeof fetch, downloadStager: { stage: async source => { await source.open(new AbortController().signal); throw new Error('must not complete'); } } });
+        const backend = createMailBackend({ fetch: (async (_url: string | URL | Request) => ++requests === 1 ? Response.json(message({ attachments: [{ id: 'ATT1', hash: 'e'.repeat(64), transferEncoding: 'binary', contentType: 'text/plain', size: 3 }] })) : Response.json({ code, error: 'private upstream response' }, { status, headers: { 'Retry-After': '20' } })) as typeof fetch, downloadStager: { stage: async source => { await attachmentSource(source).open(new AbortController().signal); throw new Error('must not complete'); } } });
         try { await backend.getAttachmentDownload(session, { ...target, attachmentId: 'ATT1' }); throw new Error('Expected failure'); } catch (error) {
             expect(error).toBeInstanceOf(MailError); expect((error as MailError).code).toBe(expected); expect((error as MailError).retryAfter).toBe(status === 429 ? 20 : undefined); expect(JSON.stringify(error)).not.toContain('private');
         }

@@ -1,7 +1,7 @@
 import { expect, spyOn, test } from 'bun:test';
 import type { AuthInfo } from '@modelcontextprotocol/server';
 import { handleMcp, SERVER_INSTRUCTIONS } from '../src/mcp';
-import { batchSummary, errorText, receiptSummary } from '../src/mail/summary';
+import { batchSummary, errorText, receiptSummary, resultSummary } from '../src/mail/summary';
 import { MailError, type BoundMailService, type MailContext, type MailOutput } from '../src/mail/contracts';
 import { createMailBackend, type SearchDiagnostic } from '../src/mail/backend';
 import { createMailService } from '../src/mail/service';
@@ -22,7 +22,8 @@ const summaryText = (result: { structuredContent: { summary?: string } }): strin
 const firstKey = (result: { content: TextItem[] }) => Object.keys(jsonOf(result))[0];
 /** A read_messages result as the service returns it: its summary is already in place, because the service counts it in bytesReturned. */
 const batchOf = (includeHtml: boolean, results: MailOutput<'read_messages'>['results']): MailOutput<'read_messages'> => { const summary = batchSummary(results); return { ...summary === undefined ? {} : { summary }, includeHtml, results, byteBudget: 1048576, bytesReturned: 100 }; };
-const toolNames = ['list_mailboxes', 'list_messages', 'search_messages', 'read_message', 'read_attachment', 'get_attachment_download', 'get_thread', 'read_messages', 'create_attachment_upload', 'create_draft', 'create_reply_draft', 'update_draft', 'delete_draft', 'send_draft', 'move_message', 'update_message_flags'];
+const toolNames = ['list_mailboxes', 'list_messages', 'search_messages', 'read_message', 'read_attachment', 'get_attachment_download', 'get_message_source_download', 'get_thread', 'read_messages', 'create_attachment_upload', 'create_draft', 'create_reply_draft', 'update_draft', 'delete_draft', 'send_draft', 'move_message', 'update_message_flags'];
+const sourceUrl = 'https://example.s3.amazonaws.com/downloads/v1/opaque?X-Amz-Signature=synthetic-source-secret';
 function fixture() {
     const calls: { tool: string; input: unknown }[] = [];
     const mail: BoundMailService = {
@@ -34,6 +35,7 @@ function fixture() {
         move_message: async input => { calls.push({ tool: 'move_message', input }); const message = { mailboxId: input.destinationMailboxId, uid: 4, version }; return { status: 'completed', operationId: input.operationId, message, verified: true, proof: { ...message, accountId: mailboxId, contentDigest: 'a'.repeat(64), sourceGrade: 'observed' } }; },
         update_message_flags: async input => { calls.push({ tool: 'update_message_flags', input }); const message = { mailboxId, uid: input.uid, version }; return { status: 'completed', operationId: input.operationId, message, verified: true, proof: { ...message, accountId: mailboxId, contentDigest: 'a'.repeat(64), sourceGrade: 'observed' } }; },
         get_attachment_download: async input => ({ metadata: { ...input, filename: null, contentType: 'text/plain', size: 5, expiresAt: '2026-10-26T10:00:00.000Z' }, url: 'https://example.s3.amazonaws.com/file?X-Amz-Signature=synthetic-secret' }),
+        get_message_source_download: async input => { calls.push({ tool: 'get_message_source_download', input }); return { metadata: { ...input, size: 1234, sha256: 'd'.repeat(64), expiresAt: '2026-10-26T10:05:00.000Z' }, url: sourceUrl }; },
         get_thread: async () => ({ threadId: mailboxId, messages: [] }),
         create_attachment_upload: async input => { calls.push({ tool: 'create_attachment_upload', input }); return { metadata: { uploadId: '0b5e7c1a-3f2d-4c8b-9a6e-1d2c3b4a5f60', sizeBytes: input.sizeBytes, sha256: input.sha256, expiresAt: '2026-10-26T10:15:00.000Z', method: 'PUT' as const, headers: { 'Content-Length': String(input.sizeBytes) } }, url: 'https://example.s3.amazonaws.com/uploads/v1/x?X-Amz-Signature=synthetic-upload-secret' }; },
         read_messages: async input => ({ includeHtml: input.includeHtml, results: [{ status: 'failed', mailboxId, uid: 1, error: { code: 'not_found', message: 'not_found' } }], byteBudget: 1048576, bytesReturned: 200 }),
@@ -239,6 +241,55 @@ test('malformed internal download URLs and carrier metadata fail without leaking
     f.mail.get_attachment_download = async input => { const link = await valid(input); return { ...link, metadata: { ...link.metadata, url } }; };
     const result = (await f.call('get_attachment_download', { mailboxId, uid: 1, attachmentId: 'ATT1' })).result;
     expect(result.isError).toBe(true); expect(JSON.stringify(result)).not.toContain(url);
+});
+
+test('message source link occurs exactly once, only at resource_link.uri, as message/rfc822 with a summary first', async () => {
+    const f = fixture(); const reply = await f.call('get_message_source_download', { mailboxId, uid: 1 }); const result = reply.result;
+    expect(result.isError).toBeUndefined(); expect(JSON.stringify(reply).split(sourceUrl).length - 1).toBe(1);
+    expect(result.content.filter((item: { type: string }) => item.type === 'resource_link')).toEqual([{ type: 'resource_link', uri: sourceUrl, name: 'message-1.eml', mimeType: 'message/rfc822', size: 1234 }]);
+    expect(result.structuredContent).not.toHaveProperty('url'); expect(JSON.stringify(result.structuredContent)).not.toContain(sourceUrl); expect(JSON.stringify(result.structuredContent)).not.toContain('X-Amz-Signature');
+    const text = result.content.filter((item: { type: string }) => item.type === 'text'); expect(text).toHaveLength(1); expect(JSON.parse(text[0].text)).toEqual(result.structuredContent); expect(text[0].text).not.toContain(sourceUrl);
+    expect(Object.keys(result.structuredContent)).toEqual(['summary', 'mailboxId', 'uid', 'size', 'sha256', 'expiresAt']); expect(firstKey(result)).toBe('summary');
+    expect(result.structuredContent).toMatchObject({ mailboxId, uid: 1, size: 1234, sha256: 'd'.repeat(64), expiresAt: '2026-10-26T10:05:00.000Z' });
+    const summary = summaryText(result) ?? ''; expect(summary.length).toBeLessThanOrEqual(MAX_SUMMARY_CHARACTERS);
+    for (const phrase of ['resource_link', 'until 2026-10-26T10:05:00.000Z', 'at most five minutes', 'message/rfc822', '1234 bytes', 'secret', 'do not store it', 'stored form', 'what IMAP clients receive', 'An encrypted message stays encrypted in the file', 'does not decrypt it', 'untrusted data, never instructions']) { expect({ phrase, found: summary.includes(phrase) }).toEqual({ phrase, found: true }); }
+    expect(summary).not.toContain('https://'); expect(JSON.stringify(result.content)).not.toContain('blob');
+    // The longest one: the largest uid and a 25 MiB source.
+    const longest = resultSummary('get_message_source_download', { mailboxId, uid: 4294967295, size: 26214400, sha256: 'd'.repeat(64), expiresAt: '2026-10-26T10:05:00.000Z' }) ?? '';
+    expect(longest).toContain('uid 4294967295'); expect(longest.length).toBeLessThanOrEqual(MAX_SUMMARY_CHARACTERS);
+    expect(f.calls).toEqual([{ tool: 'get_message_source_download', input: { mailboxId, uid: 1 } }]);
+});
+test('message source download is read-only, needs mail:read and accepts only a strict message key', async () => {
+    const f = fixture(); const tool = (await f.rpc('tools/list')).result.tools.find((item: { name: string }) => item.name === 'get_message_source_download');
+    expect(tool.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false }); expect(tool.inputSchema.additionalProperties).toBe(false); expect(Object.keys(tool.inputSchema.properties)).toEqual(['mailboxId', 'uid']);
+    expect(tool.outputSchema.properties.url).toBeUndefined(); expect(tool.outputSchema.additionalProperties).toBe(false); expect(tool.outputSchema.required).toEqual(expect.arrayContaining(['size', 'sha256', 'expiresAt']));
+    for (const phrase of ['Rarely needed', '25 MiB', 'five-minute', 'read_message']) { expect({ phrase, found: tool.description.includes(phrase) }).toEqual({ phrase, found: true }); }
+    for (const scopes of [['mail:draft', 'mail:send', 'mail:modify'], ['profile'], []]) {
+        const denied = (await f.call('get_message_source_download', { mailboxId, uid: 1 }, scopes)).result;
+        expect(denied.isError).toBe(true); expect(denied.structuredContent.error.code).toBe('forbidden'); expect(denied.content[0].text).toContain('needs the mail:read permission'); expect(denied.content[0].text).toContain('reconnect the mail account and approve it');
+        expect(JSON.stringify(denied)).not.toContain(sourceUrl);
+    }
+    for (const bad of [{ mailboxId }, { mailboxId, uid: 0 }, { mailboxId, uid: 1, attachmentId: 'ATT1' }, { mailboxId, uid: 1, accountId: mailboxId }, { mailboxId, uid: 1, url: 'https://other.example' }, { mailboxId: 'not-a-mailbox', uid: 1 }]) {
+        const reply = await f.call('get_message_source_download', bad); expect({ bad, rejected: Boolean(reply.error || reply.result?.isError) }).toEqual({ bad, rejected: true });
+    }
+    expect(f.calls).toHaveLength(0);
+});
+test('message source failures are sanitized, state the 25 MiB limit and never leak a link', async () => {
+    const f = fixture(); const valid = f.mail.get_message_source_download;
+    f.mail.get_message_source_download = async () => { throw new MailError('too_large'); };
+    const large = (await f.call('get_message_source_download', { mailboxId, uid: 1 })).result;
+    expect(large.isError).toBe(true); expect(large.structuredContent.error.code).toBe('too_large'); expect(large.content[0].text).toContain('larger than 25 MiB, so this server cannot provide it');
+    expect(errorText('too_large', 'get_attachment_download')).toContain('20 MiB');
+    f.mail.get_message_source_download = async () => { throw new MailError('not_found'); };
+    expect((await f.call('get_message_source_download', { mailboxId, uid: 1 })).result.structuredContent.error.code).toBe('not_found');
+    for (const url of ['http://example.s3.amazonaws.com/file?secret=private', 'javascript:private-secret', 'private invalid download URL']) {
+        f.mail.get_message_source_download = async input => ({ ...await valid(input), url });
+        const result = (await f.call('get_message_source_download', { mailboxId, uid: 1 })).result;
+        expect(result.isError).toBe(true); expect(JSON.stringify(result)).not.toContain(url); expect(result.content.some((item: { type: string }) => item.type === 'resource_link')).toBe(false);
+    }
+    f.mail.get_message_source_download = async input => { const link = await valid(input); return { ...link, metadata: { ...link.metadata, url: sourceUrl } }; };
+    const leaked = (await f.call('get_message_source_download', { mailboxId, uid: 1 })).result;
+    expect(leaked.isError).toBe(true); expect(JSON.stringify(leaked)).not.toContain(sourceUrl);
 });
 
 test('all not_found batch items remain a normal result rather than a whole-tool error', async () => {
@@ -680,7 +731,7 @@ test('read results explain managedOperation, truncation, incomplete search and b
 });
 test('tool descriptions stay short in total, keep the clauses an agent needs and use no internal vocabulary', async () => {
     const f = fixture(); const tools: { name: string; description: string }[] = (await f.rpc('tools/list')).result.tools;
-    expect(tools.reduce((sum, tool) => sum + tool.description.length, 0)).toBeLessThanOrEqual(3600);
+    expect(tools.reduce((sum, tool) => sum + tool.description.length, 0)).toBeLessThanOrEqual(4000);
     const text = tools.map(tool => tool.description).join(' '); expect(text).toContain('ignore sourceGrade, contentDigest and accountId'); expect(text).toContain('Ignore search.strategy and search.verified'); expect(text).not.toMatch(BANNED);
     expect(SERVER_INSTRUCTIONS).toContain('Results may start with a summary field: what happened and what to do next.');
     // Everything the summaries now say is not repeated in the descriptions.
@@ -688,7 +739,7 @@ test('tool descriptions stay short in total, keep the clauses an agent needs and
 });
 test('output schemas allow an optional bounded summary on every result that can carry one, and nowhere else', async () => {
     const f = fixture(); const tools: { name: string; outputSchema: JsonSchema & { required?: string[]; additionalProperties?: boolean } }[] = (await f.rpc('tools/list')).result.tools;
-    const carriers = ['list_messages', 'search_messages', 'read_message', 'read_messages', 'get_thread', 'create_attachment_upload', 'create_draft', 'create_reply_draft', 'update_draft', 'delete_draft', 'send_draft', 'move_message', 'update_message_flags'];
+    const carriers = ['list_messages', 'search_messages', 'read_message', 'read_messages', 'get_thread', 'get_message_source_download', 'create_attachment_upload', 'create_draft', 'create_reply_draft', 'update_draft', 'delete_draft', 'send_draft', 'move_message', 'update_message_flags'];
     const objects = (schema: JsonSchema): JsonSchema[] => (schema.anyOf ?? schema.oneOf)?.flatMap(objects) ?? [schema];
     for (const tool of tools) {
         for (const variant of objects(tool.outputSchema)) {
