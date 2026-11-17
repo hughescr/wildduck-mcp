@@ -1,6 +1,6 @@
 import MarkdownIt from 'markdown-it';
 import { decodeHTML, decodeHTMLStrict } from 'entities';
-import { DomHandler, DomUtils, Parser } from 'htmlparser2';
+import { DomHandler, ElementType, Parser } from 'htmlparser2';
 import { MailError } from './contracts';
 import type { MimeBody } from './mime';
 
@@ -602,9 +602,12 @@ class TextSink {
     }
 }
 
-interface WalkContext { depth: number; pre?: boolean; code?: boolean; decodeText?: boolean; skipInitialLf?: boolean; inTable?: boolean; nestedTable?: () => void }
+interface WalkContext { depth: number; pre?: boolean; code?: boolean; skipInitialLf?: boolean; inTable?: boolean; nestedTable?: () => void }
+// domutils 4 no longer re-exports domhandler's node guards; ElementType (re-exported by htmlparser2) is the same test.
+const isElement = (node: HtmlNode): node is HtmlElement => ElementType.isTag(node);
+const isTextNode = (node: HtmlNode): node is Extract<HtmlNode, { type: typeof ElementType.Text }> => node.type === ElementType.Text;
 function visible(node: HtmlNode): node is HtmlElement {
-    return DomUtils.isTag(node) && !SKIP.has(node.name) && !hiddenElement(node);
+    return isElement(node) && !SKIP.has(node.name) && !hiddenElement(node);
 }
 function capture(nodes: HtmlNode[], context: WalkContext, inlineEdges = false): string {
     const sink = new TextSink(inlineEdges);
@@ -632,7 +635,7 @@ function tableText(element: HtmlElement, sink: TextSink, context: WalkContext): 
     const collect = (nodes: HtmlNode[], depth: number, row?: string[]): void => {
         if (depth > MAX_DOM_DEPTH) { invalid(); }
         for (const node of nodes) {
-            if (DomUtils.isText(node)) { const stray = capture([node], { depth }); if (stray.trim()) { add(stray, row); } continue; }
+            if (isTextNode(node)) { const stray = capture([node], { depth }); if (stray.trim()) { add(stray, row); } continue; }
             if (!visible(node)) { continue; }
             if (node.name === 'tr') {
                 const cells: string[] = []; rows.push(cells);
@@ -680,11 +683,11 @@ function tableText(element: HtmlElement, sink: TextSink, context: WalkContext): 
 function walk(nodes: HtmlNode[], sink: TextSink, context: WalkContext): void {
     if (context.depth > MAX_DOM_DEPTH) { invalid(); }
     for (const [nodeIndex, node] of nodes.entries()) {
-        // htmlparser2 leaves textarea RCDATA references undecoded (unlike title).
-        // Decode once; never turn decoded '<' into nodes. HTML ignores exactly
+        // htmlparser2 12 decodes textarea RCDATA references itself (like title), so
+        // text nodes are already decoded exactly once; never decode them again. HTML ignores exactly
         // one initial LF after pre/textarea, not one after their first child tag.
-        if (DomUtils.isText(node)) {
-            let text = context.decodeText ? decodeHTML(node.data) : node.data;
+        if (isTextNode(node)) {
+            let text = node.data;
             if (nodeIndex === 0 && context.skipInitialLf) { text = text.replace(/^(?:\r\n?|\n)/, ''); }
             sink.write(text, context.pre); continue;
         }
@@ -743,7 +746,7 @@ function walk(nodes: HtmlNode[], sink: TextSink, context: WalkContext): void {
         } else {
             const breaks = BLOCK.has(tag) || tag === 'pre' ? 2 : LINE_BLOCK.has(tag) ? 1 : 0;
             if (breaks) { sink.break(breaks); }
-            walk(node.children, sink, { ...childContext, pre: context.pre === true || tag === 'pre', code: context.code === true || tag === 'code', decodeText: tag === 'textarea', skipInitialLf: tag === 'pre' || tag === 'textarea' });
+            walk(node.children, sink, { ...childContext, pre: context.pre === true || tag === 'pre', code: context.code === true || tag === 'code', skipInitialLf: tag === 'pre' || tag === 'textarea' });
             if (breaks) { sink.break(breaks); }
         }
     }

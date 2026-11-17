@@ -15,28 +15,28 @@
     "bun": ">=1.4.4"
   },
   "dependencies": {
-    "@aws-sdk/client-dynamodb": "^3.1157.0",
-    "@aws-sdk/client-s3": "^3.1157.0",
-    "@aws-sdk/client-ssm": "^3.1156.0",
-    "@aws-sdk/lib-dynamodb": "^3.1157.0",
-    "@aws-sdk/s3-request-presigner": "^3.1157.0",
-    "@better-auth/cimd": "^1.7.13",
+    "@aws-sdk/client-dynamodb": "^3.1169.0",
+    "@aws-sdk/client-s3": "^3.1169.0",
+    "@aws-sdk/client-ssm": "^3.1169.0",
+    "@aws-sdk/lib-dynamodb": "^3.1169.0",
+    "@aws-sdk/s3-request-presigner": "^3.1169.0",
+    "@better-auth/cimd": "^1.7.23",
     "@hapi/address": "5.1.1",
     "@hono/aws-lambda": "^1.0.1",
     "@modelcontextprotocol/server": "^2.4.0",
-    "@zone-eu/mailsplit": "5.4.20",
-    "entities": "4.5.0",
-    "hono": "^4.13.14",
-    "htmlparser2": "10.1.0",
-    "libmime": "5.6.3",
+    "@zone-eu/mailsplit": "5.4.30",
+    "entities": "9.0.0",
+    "hono": "^4.13.18",
+    "htmlparser2": "12.0.0",
+    "libmime": "5.6.4",
     "markdown-it": "15.0.3",
-    "nodemailer": "10.1.4",
+    "nodemailer": "10.5.0",
     "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/bun": "^1.4.4",
-    "oxlint": "^1.89.0",
-    "serverless": "^4.45.0"
+    "oxlint": "^1.93.0",
+    "serverless": "^4.46.0"
   },
   "scripts": {
     "dev": "bun --hot src/dev.ts",

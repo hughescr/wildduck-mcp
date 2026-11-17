@@ -271,7 +271,11 @@ function envelope(root: Part): MimeEnvelope {
     return Object.freeze(result);
 }
 async function split(raw: Buffer): Promise<Map<number, MimeNode>> {
-    const splitter = new Splitter({ ignoreEmbedded: true, maxHeadSize: MIME_LIMITS.headerBytes });
+    // mailsplit >= 5.4.25 charges every header line at least 64 bytes against maxHeadSize, so it is
+    // a cost bound, not a byte count: the largest schema-valid draft (about 175 KB of folded headers)
+    // costs ~195 KB. headersAt() enforces the real byte limit (MIME_LIMITS.headerBytes); this only
+    // has to stay a finite memory bound that never rejects what that policy accepts for our own output.
+    const splitter = new Splitter({ ignoreEmbedded: true, maxHeadSize: MIME_LIMITS.headerBytes * 2 });
     const joiner = new Joiner();
     const nodes = new Map<number, MimeNode>();
     let offset = 0, outputOffset = 0;

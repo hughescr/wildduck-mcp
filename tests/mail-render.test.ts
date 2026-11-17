@@ -698,9 +698,10 @@ describe('single-parse and amplification regressions', () => {
         expect(isolated({ html: `<noscript>${'&lt;div&gt;'.repeat(100)}x${'&lt;/div&gt;'.repeat(100)}</noscript>` }).text).toBe('<div>'.repeat(100) + 'x' + '</div>'.repeat(100));
         expect(renderBody({ html: '<textarea>&lt;x&gt;&amp;lt;y&amp;gt;</textarea>' }).text).toBe('<x>&lt;y&gt;');
         expect(renderBody({ html: '<xmp>&lt;x&gt;<b>literal</b></xmp>' }).text).toBe('&lt;x&gt;<b>literal</b>');
-        // plaintext is parsed by htmlparser2 as ordinary text-bearing markup;
-        // decoded references remain text, including an apparent dangerous table.
-        expect(isolated({ html: `<plaintext>${payload}</plaintext>` }).text).toBe('<table><tr><td colspan=200000>x</td><td>y</td></tr></table>');
+        // htmlparser2 12 treats plaintext as a raw-text element like xmp, as WHATWG does: it never
+        // closes, so the rest of the input (the end tag included) is literal text and references
+        // stay undecoded. Nothing becomes a node, so the apparent dangerous table stays inert text.
+        expect(isolated({ html: `<plaintext>${payload}</plaintext>` }).text).toBe(`${payload}</plaintext>`);
         expect(isolated({ html: `<textarea>${payload}</textarea>` }).text).toBe('<table><tr><td colspan=200000>x</td><td>y</td></tr></table>');
     });
     test('multiline padding attacks emit compact unpadded rows, in HTML and Markdown', () => {
