@@ -33,6 +33,12 @@ const RESOLVE_MAX_MS = 30_000;
 /** Concurrent metadata reads and byte fetches while resolving: a few overlap latency, more would only
  * hold more bytes in memory at once. */
 const RESOLVE_CONCURRENCY = 3;
+/** Sent-copy lookup (findSentCopy): at most SENT_LOOKUP_MAX_PAGES pages of SENT_LOOKUP_PAGE_SIZE, newest first, after the one mailbox listing
+ * and before the one optional message read for the queue id. A send that is 15 minutes old is near the top of Sent, so a miss within these
+ * bounds is not searched further. */
+const SENT_LOOKUP_PAGE_SIZE = 50;
+const SENT_LOOKUP_MAX_PAGES = 3;
+const MARKER_FIELDS = ['accountId', 'clientIdHash', 'operationId', 'payloadDigest', 'tool'] as const;
 const CLIENT_ID_HASH = /^[A-Za-z0-9_-]{43}$/u;
 // The schema's own validators for a final file name and media type, applied to the values a
 // source attachment supplies: the rules are those of a caller's value, not a second copy of them.
@@ -75,6 +81,7 @@ function sessionValid(session: BackendMailSession): void {
     if (!session || typeof session.accountId !== 'string' || !ACCOUNT.test(session.accountId) || typeof session.accessToken !== 'string' || !TOKEN.test(session.accessToken)) { throw new MailError('invalid_input'); }
 }
 function targetValid(target: MessageKey): void { if (!target || !messageKeySchema.safeParse({ mailboxId: target.mailboxId, uid: target.uid }).success) { throw new MailError('invalid_input'); } }
+function queueIdOf(value: unknown): string | undefined { return typeof value === 'string' && value && value.length <= 256 && /^\S+$/u.test(value) ? value : undefined; }
 function strings(value: unknown): string[] {
     if (!Array.isArray(value) || value.some(item => typeof item !== 'string')) { return fail(); }
     return value as string[];
@@ -663,8 +670,10 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         const { bytes } = await this.transport(session, `/mailboxes/${input.mailboxId}/messages/${input.uid}/attachments/${input.attachmentId}`, 'GET', undefined, MAX_ATTACHMENT_BYTES, 'attachment');
         return { metadata: { ...input, filename: found.filename, contentType: found.contentType, size: bytes.length, resourceUri: `wildduck://${session.accountId}/${input.mailboxId}/${input.uid}/${input.attachmentId}` }, bytes };
     }
-    async resolveDraftMailbox(session: BackendMailSession): Promise<Mailbox> {
-        const boxes = (await this.mailboxListing(session, false)).mailboxes.filter(box => box.specialUse === '\\Drafts');
+    async resolveDraftMailbox(session: BackendMailSession): Promise<Mailbox> { return this.resolveSpecialUse(session, '\\Drafts'); }
+    /** The one mailbox with this special use: none is not_found, several are temporarily_unavailable (never guess). */
+    private async resolveSpecialUse(session: BackendMailSession, specialUse: '\\Drafts' | '\\Sent'): Promise<Mailbox> {
+        const boxes = (await this.mailboxListing(session, false)).mailboxes.filter(box => box.specialUse === specialUse);
         if (boxes.length !== 1) { throw new MailError(boxes.length === 0 ? 'not_found' : 'temporarily_unavailable'); }
         return boxes[0] ?? fail();
     }
@@ -971,11 +980,66 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         sessionValid(session); targetValid(target);
         const result = await this.request(session, `/mailboxes/${target.mailboxId}/messages/${target.uid}/submit`, 'POST', {}, META_BYTES, { unapplied: SUBMIT_UNQUEUED });
         // A success without a usable queueId proves nothing (plugins get a mutable envelope, so the id is not independent of hooks): it stays unset, never notApplied.
-        const queueId = result['queueId'];
-        if (typeof queueId !== 'string' || !queueId || queueId.length > 256 || !/^\S+$/u.test(queueId)) { return fail(); }
+        const queueId = queueIdOf(result['queueId']) ?? fail();
         const sent = result['message'];
         if (sent !== undefined && (!object(sent) || !ACCOUNT.test(String(sent['mailbox'])) || typeof sent['id'] !== 'number' || !Number.isSafeInteger(sent['id']) || sent['id'] < 1 || sent['id'] > 4294967295)) { throw new MailError('verification_failed'); }
         return { queueId, ...(object(sent) ? { sent: { mailboxId: id(sent['mailbox']), uid: uid(sent['id']) } } : {}) };
+    }
+    async draftPresent(session: BackendMailSession, target: MessageKey): Promise<boolean> {
+        sessionValid(session); targetValid(target);
+        try {
+            // markAsSeen=false: a read-only GET. The same path as rawMessage, without its shape checks (only identity matters here).
+            const raw = await this.request(session, `/mailboxes/${target.mailboxId}/messages/${target.uid}?markAsSeen=false&replaceCidLinks=false`, 'GET', undefined, MESSAGE_BYTES);
+            if (id(raw['user']) !== session.accountId || id(raw['mailbox']) !== target.mailboxId || uid(raw['id']) !== target.uid) { return fail(); }
+            return true;
+        } catch (error) {
+            // transport() keeps a 404's body code (lib/api/messages.js:2481-2485, MessageNotFound): any other 404 or failure proves nothing.
+            if (error instanceof MailError && error.code === 'not_found' && error.upstreamCode === 'MessageNotFound') { return false; }
+            throw error;
+        }
+    }
+    /** Discriminator: the Sent copy must NOT be a draft. Verified in the WildDuck fork (read-only):
+     * (a) submit moves the draft to \\Sent with updates {draft:false, seen:true, outbound:[queueId]} (lib/api/messages.js:4404-4417), and moveAsync applies
+     * an update key it is given: draft:false clears message.draft and the \\Draft flag (lib/message-handler.js:1204, 1225-1237);
+     * (b) a move without a draft update keeps both: the API PUT moveTo passes only the request's own values, and `draft` has no default
+     * (lib/api/messages.js:1580-1584, 2984), IMAP MOVE passes no updates at all (lib/handlers/on-move.js:26-40), and the copy keeps its metaData marker
+     * (message-handler.js:1204-1257 touches only the keys present). So a manually moved draft is still a draft and never matches.
+     * `outbound` is not usable: the listing and search projections omit it (lib/api/messages.js:288-312) and a single GET reports it only while queue
+     * entries exist (:2660-2679). The listing's `draft` field is exposed (:305), so one page read decides. */
+    async findSentCopy(session: BackendMailSession, marker: MailOperationMarker, hint?: { readonly threadId?: string }): Promise<{ message: MessageKey; queueId?: string } | undefined> {
+        sessionValid(session); const wanted = mailOperationMarkerSchema.safeParse(marker); const thread = hint?.threadId;
+        if (!wanted.success || wanted.data.accountId !== session.accountId || thread !== undefined && !ACCOUNT.test(thread)) { throw new MailError('invalid_input'); }
+        const sent = (await this.resolveSpecialUse(session, '\\Sent')).mailboxId; let next: string | undefined;
+        for (let pages = 0; pages < SENT_LOOKUP_MAX_PAGES; pages++) {
+            const query = new URLSearchParams({ order: 'desc', limit: String(SENT_LOOKUP_PAGE_SIZE), metaData: 'true', ...(thread === undefined ? {} : { thread, includeTotal: 'false' }) });
+            if (next !== undefined) { query.set('next', next); }
+            let raw: Json;
+            if (thread === undefined) { raw = await this.request(session, `/mailboxes/${sent}/messages?${query}`, 'GET'); } else {
+                raw = json((await this.transport(session, '/search?' + query, 'GET', undefined, META_BYTES, 'json', { category: 'network' })).bytes);
+                if (raw['success'] !== true || raw['error'] !== undefined || raw['code'] !== undefined) { return fail(); }
+            }
+            if (!Array.isArray(raw['results']) || raw['results'].length > SENT_LOOKUP_PAGE_SIZE) { return fail(); }
+            for (const item of raw['results'] as unknown[]) {
+                if (!object(item)) { return fail(); }
+                if (id(item['mailbox']) !== sent) { continue; } // a thread search spans mailboxes
+                // The full private marker, never projected or exposed; an unparsable or absent one is simply not ours.
+                const stored = object(item['metaData']) ? mailOperationMarkerSchema.safeParse(item['metaData'][MAIL_OPERATION_METADATA_KEY]) : undefined;
+                if (!stored?.success || !MARKER_FIELDS.every(field => stored.data[field] === wanted.data[field])) { continue; }
+                if (bool(item['draft']) || item['flags'] !== undefined && strings(item['flags']).some(flag => canonicalFlag(flag) === '\\Draft')) { continue; }
+                const message = { mailboxId: sent, uid: uid(item['id']) }; const queueId = await this.sentQueueId(session, message);
+                return { message, ...(queueId === undefined ? {} : { queueId }) };
+            }
+            next = cursor(raw['nextCursor']); if (next === undefined) { break; }
+        }
+        return undefined;
+    }
+    /** The queue id WildDuck still reports for a stored message (lib/api/messages.js:2660-2679: exactly one entry, as submit stores one), else
+     * undefined; a failed read also leaves it unset, since the match is already established. */
+    private async sentQueueId(session: BackendMailSession, message: MessageKey): Promise<string | undefined> {
+        try {
+            const queued = (await this.request(session, `/mailboxes/${message.mailboxId}/messages/${message.uid}?markAsSeen=false&replaceCidLinks=false`, 'GET', undefined, MESSAGE_BYTES))['outbound'];
+            return Array.isArray(queued) && queued.length === 1 && object(queued[0]) ? queueIdOf(queued[0]['queueId']) : undefined;
+        } catch (error) { if (error instanceof MailError) { return undefined; } throw error; }
     }
     private async verifyMutation(session: BackendMailSession, snapshot: MessageSnapshot, target: MessageKey, before: Buffer, expectedMetadata: Json, expectedFlags?: string[], expectedLabels?: string[], source?: AuthoredSourceDescriptor): Promise<VerifiedMessageMutation> {
         const state = this.state(session, snapshot);

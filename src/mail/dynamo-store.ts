@@ -3,11 +3,13 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, TransactWriteCommand, type TransactWriteCommandInput } from '@aws-sdk/lib-dynamodb';
 import { z } from 'zod';
 import { conditionalConflict, DEFAULT_THROTTLE_TIMEOUT_MS, DynamoRetrier, retryEnv, type DynamoBudget, type DynamoRetryEnv, type DynamoSender } from '../dynamo-retry';
-import { MailError, type ConfirmedReceipt, type DraftGuardKey, type DraftGuardRecord, type FailedReceipt, type MailOperationRecord, type MailOperationStore, type MailReceipt, type OperationClaim, type OperationKey, type ReservationResult, type UnknownReceipt, type WriteIntent } from './contracts';
+import { MailError, type ConfirmedReceipt, type DraftGuardKey, type DraftGuardRecord, type FailedReceipt, type MailOperationRecord, type MailOperationStore, type MailReceipt, type MessageKey, type OperationClaim, type OperationKey, type ReservationResult, type ResolvedReceipt, type UnknownReceipt, type WriteIntent } from './contracts';
 import { mailOutputSchemas, messageKeySchema, operationIdSchema, versionSchema } from './schemas';
 
-/** timeoutMs bounds an unthrottled operation; throttleTimeoutMs (default and maximum 10 s) is the total once DynamoDB has throttled it. */
-export interface DynamoMailStoreOptions { tableName: string; client?: DynamoSender; timeoutMs?: number; throttleTimeoutMs?: number; retry?: Partial<DynamoRetryEnv> }
+/** How long an item lives after it was last written: every Put sets the table's TTL attribute expiresAt this far ahead. */
+export const RECORD_TTL_SECONDS = 90 * 24 * 60 * 60;
+/** timeoutMs bounds an unthrottled operation; throttleTimeoutMs (default and maximum 10 s) is the total once DynamoDB has throttled it; now is the clock in ms. */
+export interface DynamoMailStoreOptions { tableName: string; client?: DynamoSender; timeoutMs?: number; throttleTimeoutMs?: number; retry?: Partial<DynamoRetryEnv>; now?: () => number }
 const safe = z.string().regex(/^[A-Za-z0-9_-]{1,128}$/u);
 const owner = z.string().regex(/^[A-Za-z0-9_-]{16,128}$/u);
 const revision = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER - 1);
@@ -22,9 +24,9 @@ const operationSchema = z.union([
     z.strictObject({ ...operationBase, state: z.enum(['reserved', 'dispatched']) }),
     z.strictObject({ ...operationBase, state: z.literal('settled'), receipt: z.unknown() }),
 ]);
-const guardSchema = z.strictObject({ key: targetKey, operation: operationKey, ownerToken: owner, revision, state: z.enum(['reserved', 'dispatched', 'retired', 'queued', 'outcome_unknown']) });
-/** An item is its record plus, optionally, a numeric expiresAt (read and ignored); any other attribute is rejected. */
-const itemSchema = <Record extends z.ZodType>(record: Record) => z.strictObject({ record, expiresAt: z.number().optional() });
+export const guardSchema = z.strictObject({ key: targetKey, operation: operationKey, ownerToken: owner, revision, state: z.enum(['reserved', 'dispatched', 'retired', 'queued', 'outcome_unknown']) });
+/** An item is its record plus, optionally, a numeric expiresAt (written by every Put, never used when reading); any other attribute is rejected. */
+export const itemSchema = <Record extends z.ZodType>(record: Record) => z.strictObject({ record, expiresAt: z.number().optional() });
 const equal = (a: unknown, b: unknown): boolean => {
     if (a === b) { return true; }
     if (a === null || b === null || typeof a !== 'object' || typeof b !== 'object' || Array.isArray(a) || Array.isArray(b)) { return false; }
@@ -73,24 +75,28 @@ function receiptFor(intent: WriteIntent, value: unknown): MailReceipt {
     }
     return receipt as MailReceipt;
 }
-function operation(value: unknown, expected: OperationKey): MailOperationRecord {
+export function operation(value: unknown, expected: OperationKey): MailOperationRecord {
     const data = parse(operationSchema, value);
     if (!equal(data.key, expected) || !equal(data.key, { accountId: data.intent.accountId, clientIdHash: data.intent.clientIdHash, operationId: data.intent.operationId })) { throw unavailable(); }
     if (data.state === 'settled') { return { ...data, receipt: receiptFor(data.intent, data.receipt) }; }
     return data;
 }
-function opKey(value: OperationKey): { pk: string; sk: string } {
+export function opKey(value: OperationKey): { pk: string; sk: string } {
     const data = parse(operationKey, value);
     return { pk: `wildduck-mcp#mail-operation#${data.accountId}#${data.clientIdHash}#${data.operationId}`, sk: 'STATE' };
 }
-function guardKey(value: DraftGuardKey): { pk: string; sk: string } {
+export function guardKey(value: DraftGuardKey): { pk: string; sk: string } {
     const data = parse(targetKey, value);
     return { pk: `wildduck-mcp#mail-guard#${data.accountId}#${data.mailboxId}#${data.uid}`, sk: 'STATE' };
 }
-/** Existing pk/sk table, fixed provisioned capacity. Receipts and fences have no TTL. */
+/** The guarded message of a targeted write; a create has none. */
+const targetOf = (intent: WriteIntent): MessageKey | undefined => 'target' in intent ? intent.target : undefined;
+/** Existing pk/sk table, fixed provisioned capacity. Items expire RECORD_TTL_SECONDS after their last write (table TTL on expiresAt). */
 export class DynamoMailOperationStore implements MailOperationStore {
     private readonly retrier: DynamoRetrier;
+    private readonly now: () => number;
     constructor(private readonly options: DynamoMailStoreOptions) {
+        this.now = options.now ?? Date.now;
         if (!/^[A-Za-z0-9_.-]{3,255}$/u.test(options.tableName)) { throw new Error('Invalid mail table name'); }
         const timeoutMs = options.timeoutMs ?? 5000;
         if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 5000) { throw new Error('Invalid mail store timeout'); }
@@ -113,22 +119,28 @@ export class DynamoMailOperationStore implements MailOperationStore {
             return record;
         } catch { throw unavailable(); }
     }
-    async getOperation(key: OperationKey): Promise<MailOperationRecord | undefined> { return this.getStoredOperation(key, this.deadline()); }
+    /** Whole epoch seconds, rounded up so a reservedAt never makes a hold look older than it is (an age check never fires
+     * early); one value is taken per public operation so every item it writes agrees. */
+    private seconds(): number { return Math.ceil(this.now() / 1000); }
+    async getOperation(key: OperationKey): Promise<MailOperationRecord | undefined> { return (await this.readOperation(key, this.deadline()))?.record; }
     private async transact(items: NonNullable<TransactWriteCommandInput['TransactItems']>, deadline: DynamoBudget): Promise<boolean> {
         // Built once: every retry inside send() re-sends this same command, hence the same ClientRequestToken.
         try { await this.send(new TransactWriteCommand({ ClientRequestToken: randomUUID(), TransactItems: items }), deadline); return true; }
         catch (error) { if (conditionalConflict(error, items.length)) { return false; } throw unavailable(); }
     }
-    private absentPut(key: { pk: string; sk: string }, value: unknown): NonNullable<TransactWriteCommandInput['TransactItems']>[number] {
-        return { Put: { TableName: this.options.tableName, Item: { ...key, record: value }, ConditionExpression: 'attribute_not_exists(#pk)', ExpressionAttributeNames: { '#pk': 'pk' } } };
+    private absentPut(key: { pk: string; sk: string }, value: unknown, expiresAt: number): NonNullable<TransactWriteCommandInput['TransactItems']>[number] {
+        return { Put: { TableName: this.options.tableName, Item: { ...key, record: value, expiresAt }, ConditionExpression: 'attribute_not_exists(#pk)', ExpressionAttributeNames: { '#pk': 'pk' } } };
     }
-    private async getStoredOperation(key: OperationKey, deadline: DynamoBudget): Promise<MailOperationRecord | undefined> {
+    /** The record as stored (raw, for a compare-and-set) and as read (receipt spelling normalised). */
+    private async readOperation(key: OperationKey, deadline: DynamoBudget): Promise<{ stored: unknown; record: MailOperationRecord } | undefined> {
         const value = await this.read(opKey(key), deadline);
         if (value === undefined) { return undefined; }
         const wrapper = parse(itemSchema(z.unknown()), value);
-        return operation(wrapper.record, key);
+        return { stored: wrapper.record, record: operation(wrapper.record, key) };
     }
-    private async getGuard(key: DraftGuardKey, deadline: DynamoBudget): Promise<DraftGuardRecord | undefined> {
+    private async getStoredOperation(key: OperationKey, deadline: DynamoBudget): Promise<MailOperationRecord | undefined> { return (await this.readOperation(key, deadline))?.record; }
+    async getGuard(key: DraftGuardKey): Promise<DraftGuardRecord | undefined> { return this.readGuard(key, this.deadline()); }
+    private async readGuard(key: DraftGuardKey, deadline: DynamoBudget): Promise<DraftGuardRecord | undefined> {
         const value = await this.read(guardKey(key), deadline);
         if (value === undefined) { return undefined; }
         const wrapper = parse(itemSchema(guardSchema), value);
@@ -139,23 +151,54 @@ export class DynamoMailOperationStore implements MailOperationStore {
         const deadline = this.deadline(); const intent = parse(intentSchema, raw); parse(owner, ownerToken);
         const key: OperationKey = { accountId: intent.accountId, clientIdHash: intent.clientIdHash, operationId: intent.operationId };
         // No read first: the service has just read this key, and a record created since fails the absent-put below and is read then.
-        const record: MailOperationRecord = { key, intent, ownerToken, revision: 0, state: 'reserved' };
-        const items = [this.absentPut(opKey(key), record)];
-        if (intent.tool !== 'create_draft' && intent.tool !== 'create_reply_draft') {
-            const target: DraftGuardKey = { accountId: key.accountId, ...intent.target };
+        const seconds = this.seconds(); const expiresAt = seconds + RECORD_TTL_SECONDS;
+        const record: MailOperationRecord = { key, intent, ownerToken, revision: 0, state: 'reserved', reservedAt: seconds };
+        const items = [this.absentPut(opKey(key), record, expiresAt)];
+        const guarded = targetOf(intent);
+        if (guarded) {
+            const target: DraftGuardKey = { accountId: key.accountId, ...guarded };
             const guard: DraftGuardRecord = { key: target, operation: key, ownerToken, revision: 0, state: 'reserved' };
-            items.push(this.absentPut(guardKey(target), guard));
+            items.push(this.absentPut(guardKey(target), guard, expiresAt));
         }
         if (await this.transact(items, deadline)) { return { kind: 'acquired', claim: { key, ownerToken, revision: 0, state: 'reserved' } }; }
         // Only a proven conditional cancellation can be resolved as a conflict.
         const winner = await this.getStoredOperation(key, deadline);
         if (winner) { return equal(winner.intent, intent) ? { kind: 'replay', record: winner } : { kind: 'conflict', reason: 'operation_conflict' }; }
-        if (intent.tool !== 'create_draft' && intent.tool !== 'create_reply_draft' && await this.getGuard({ accountId: key.accountId, ...intent.target }, deadline)) { return { kind: 'conflict', reason: 'draft_fenced' }; }
+        const blocker = guarded && await this.readGuard({ accountId: key.accountId, ...guarded }, deadline);
+        if (blocker) { return { kind: 'conflict', reason: 'draft_fenced', blocker }; }
         throw unavailable();
     }
-    /** Writes pk, sk and record only: an expiresAt attribute on the item read is dropped by this Put. */
-    private checkedPut(key: { pk: string; sk: string }, before: unknown, after: unknown): NonNullable<TransactWriteCommandInput['TransactItems']>[number] {
-        return { Put: { TableName: this.options.tableName, Item: { ...key, record: after }, ConditionExpression: '#record = :before', ExpressionAttributeNames: { '#record': 'record' }, ExpressionAttributeValues: { ':before': before } } };
+    /** Writes pk, sk, record and expiresAt: the item's TTL restarts at every write. */
+    private checkedPut(key: { pk: string; sk: string }, before: unknown, after: unknown, expiresAt: number): NonNullable<TransactWriteCommandInput['TransactItems']>[number] {
+        return { Put: { TableName: this.options.tableName, Item: { ...key, record: after, expiresAt }, ConditionExpression: '#record = :before', ExpressionAttributeNames: { '#record': 'record' }, ExpressionAttributeValues: { ':before': before } } };
+    }
+    /** Deletes the guard only while it still equals the value that was read. */
+    private guardDelete(guard: DraftGuardRecord): NonNullable<TransactWriteCommandInput['TransactItems']>[number] {
+        return { Delete: { TableName: this.options.tableName, Key: guardKey(guard.key), ConditionExpression: '#record = :before', ExpressionAttributeNames: { '#record': 'record' }, ExpressionAttributeValues: { ':before': guard } } };
+    }
+    /** Ends a hold the service has decided is over; the operation record is not touched. */
+    async releaseGuard(raw: DraftGuardRecord): Promise<boolean> {
+        const deadline = this.deadline(); const guard = parse(guardSchema, raw);
+        return this.transact([this.guardDelete(guard)], deadline);
+    }
+    /** Settles a dispatched or outcome_unknown record as failed or queued (and deletes its guard) iff it is still exactly the value now stored. */
+    async resolveUnknown(record: MailOperationRecord, receipt: ResolvedReceipt, rawGuard?: DraftGuardRecord): Promise<void> {
+        const deadline = this.deadline(); const key = parse(operationKey, record.key);
+        const unknown = (value: MailOperationRecord) => value.state === 'dispatched' || (value.state === 'settled' && value.receipt.status === 'outcome_unknown');
+        if (!unknown(record) || (receipt.status !== 'failed' && receipt.status !== 'queued')) { throw unavailable(); }
+        const current = await this.readOperation(key, deadline);
+        if (!current || !unknown(current.record) || current.record.state !== record.state || current.record.revision !== record.revision || current.record.ownerToken !== record.ownerToken) { throw unavailable(); }
+        const settled = receiptFor(current.record.intent, receipt);
+        const after = { ...current.record, revision: current.record.revision + 1, state: 'settled' as const, receipt: storedReceipt(settled) };
+        operation(after, key);
+        // The condition is the value as stored (receipt spelling operation_id), not the normalised one read from it.
+        const items = [this.checkedPut(opKey(key), current.stored, after, this.seconds() + RECORD_TTL_SECONDS)];
+        if (rawGuard) {
+            const guard = parse(guardSchema, rawGuard); const target = targetOf(current.record.intent);
+            if (!target || !equal(guard.operation, key) || !equal(guard.key, { accountId: key.accountId, ...target })) { throw unavailable(); }
+            items.push(this.guardDelete(guard));
+        }
+        if (!await this.transact(items, deadline)) { throw unavailable(); }
     }
     private async transition(claim: OperationClaim, expected: 'reserved' | 'dispatched', result: 'dispatched' | MailReceipt): Promise<OperationClaim<'dispatched'> | undefined> {
         const deadline = this.deadline(); parse(claimSchema, claim);
@@ -168,17 +211,17 @@ export class DynamoMailOperationStore implements MailOperationStore {
         const after = receipt ? { ...before, revision: nextRevision, state: 'settled' as const, receipt: storedReceipt(receipt) } : { ...before, revision: nextRevision, state: 'dispatched' as const };
         // Revalidate the complete stored value before any write.
         operation(after, claim.key);
-        const items = [this.checkedPut(opKey(claim.key), before, after)];
-        if (before.intent.tool !== 'create_draft' && before.intent.tool !== 'create_reply_draft') {
-            const target = { accountId: before.key.accountId, ...before.intent.target };
-            const guard = await this.getGuard(target, deadline);
+        const expiresAt = this.seconds() + RECORD_TTL_SECONDS;
+        const items = [this.checkedPut(opKey(claim.key), before, after, expiresAt)];
+        const guarded = targetOf(before.intent);
+        if (guarded) {
+            const target = { accountId: before.key.accountId, ...guarded };
+            const guard = await this.readGuard(target, deadline);
             if (!guard || !equal(guard.operation, before.key) || guard.ownerToken !== before.ownerToken || guard.revision !== before.revision || guard.state !== expected) { throw unavailable(); }
-            if (receipt?.status === 'failed' || (before.intent.tool === 'update_message_flags' && receipt?.status === 'completed')) {
-                items.push({ Delete: { TableName: this.options.tableName, Key: guardKey(target), ConditionExpression: '#record = :before', ExpressionAttributeNames: { '#record': 'record' }, ExpressionAttributeValues: { ':before': guard } } });
-            } else {
-                const state = !receipt ? 'dispatched' : receipt.status === 'queued' ? 'queued' : receipt.status === 'outcome_unknown' ? 'outcome_unknown' : 'retired';
-                items.push(this.checkedPut(guardKey(target), guard, { ...guard, revision: nextRevision, state }));
-            }
+            // The hold ends with the receipt, except an unknown outcome and a draft update whose two copies are both alive.
+            const bothAlive = before.intent.tool === 'update_draft' && receipt?.status === 'partial' && (receipt.reason === 'original_deletion_failed' || receipt.reason === 'original_deletion_unconfirmed');
+            if (receipt && receipt.status !== 'outcome_unknown' && !bothAlive) { items.push(this.guardDelete(guard)); }
+            else { items.push(this.checkedPut(guardKey(target), guard, { ...guard, revision: nextRevision, state: !receipt ? 'dispatched' : receipt.status === 'outcome_unknown' ? 'outcome_unknown' : 'retired' }, expiresAt)); }
         }
         if (!await this.transact(items, deadline)) { throw unavailable(); }
         return receipt ? undefined : { key: before.key, ownerToken: before.ownerToken, revision: nextRevision, state: 'dispatched' };

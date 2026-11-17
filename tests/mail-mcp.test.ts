@@ -548,8 +548,12 @@ test('in_progress and outcome_unknown texts forbid a new operationId, and expect
             const text = receiptSummary(name, result as never) ?? ''; expect({ name, status, ok: noNewId.test(text) }).toEqual({ name, status, ok: true }); statusTexts.push(text);
         }
     }
-    expect(statusTexts.filter(text => text.startsWith('In progress:')).every(text => text.includes('stop retrying'))).toBe(true);
+    expect(statusTexts.filter(text => text.startsWith('In progress:')).every(text => text.includes('after about 5 minutes it reports a final result'))).toBe(true);
     expect(statusTexts.filter(text => text.startsWith('Outcome unknown:')).every(text => text.includes('never repeats the change'))).toBe(true);
+    // A send waits 15 minutes for its settled answer; any other change frees its message after about 5.
+    const unknownOf = (name: (typeof mailWriteToolSchema.options)[number]) => receiptSummary(name, { status: 'outcome_unknown', operationId, reason: 'dispatch_uncertain' }) ?? '';
+    expect(unknownOf('send_draft')).toContain('Do not send it again'); expect(unknownOf('send_draft')).toContain('after 15 minutes it checks the mail server and reports the settled answer: sent, or not sent');
+    for (const name of mailWriteToolSchema.options.filter(tool => tool !== 'send_draft')) { expect(unknownOf(name)).toContain('After about 5 minutes the message can be changed again with a new operationId'); expect(unknownOf(name)).not.toContain('15 minutes'); }
     expect(statusTexts.join(' ')).not.toMatch(/still being processed|retrying returns this same status/u);
     const descriptions = (status: string) => tools.flatMap(tool => [...schemaNodes(tool.outputSchema)].filter(([, node]) => node.description?.startsWith(`${status}:`)).map(([, node]) => node.description ?? ''));
     for (const status of ['in_progress', 'outcome_unknown']) { const found = descriptions(status); expect(found.length).toBeGreaterThan(0); for (const text of found) { expect({ text, ok: noNewId.test(text) }).toEqual({ text, ok: true }); } }
@@ -611,7 +615,7 @@ test('client-visible prose avoids internal vocabulary', async () => {
     { const summary = summaryText((await f.call('read_message', { mailboxId, uid: 1 })).result) ?? ''; texts.push(summary); summaries.push(summary); }
     texts.push((await f.call('list_mailboxes', {}, [])).result.content[0].text);
     // The new result sentences must really be among the texts checked, not replaced by an error text.
-    for (const phrase of ['Draft created and verified', 'Reply draft created', 'Draft replaced by a new copy', 'permanently deleted', 'Draft sent: accepted', 'Message moved', 'Flags changed', 'use uid 9, version', 'managedOperation.verification is verified', 'This server cannot change this message', 'not_checked in lists', 'Of 2 messages']) {
+    for (const phrase of ['Draft created and verified', 'Reply draft created', 'Draft replaced by a new copy', 'permanently deleted', 'Draft sent: accepted', 'Message moved', 'Flags changed', 'use uid 9, version', 'managedOperation.verification is verified', 'This message cannot be edited or sent here', 'not_checked in lists', 'Of 2 messages']) {
         expect({ phrase, found: texts.some(text => text.includes(phrase)) }).toEqual({ phrase, found: true });
     }
     // Every summary fits the output schema's limit.
@@ -646,7 +650,7 @@ test('a queued send without a queueId still gets its summary, and a failed send 
     expect(receiptSummary('send_draft', { status: 'queued', operationId } as never)).toContain('Draft sent: accepted by the mail server for delivery');
     for (const reason of ['temporarily_unavailable', 'no_recipients'] as const) {
         const summary = receiptSummary('send_draft', { status: 'failed', operationId, reason }) ?? '';
-        expect(summary).toContain('The mail was not sent. '); expect(summary).toContain('If a new send of the same draft is refused, the draft must be created again.'); expect(summary).not.toMatch(/nothing was changed/iu); expect(summary).not.toMatch(BANNED);
+        expect(summary).toContain('The mail was not sent. '); expect(summary).toContain('If a new send of this same draft is refused with verification_failed, this draft can no longer be sent: to send the mail, create the draft again and send the new one (the old draft can be deleted).'); expect(summary).not.toMatch(/nothing was changed/iu); expect(summary).not.toMatch(BANNED);
     }
     expect(receiptSummary('move_message', { status: 'failed', operationId, reason: 'temporarily_unavailable' })).toContain('The requested change was not applied; to try again, use a new operationId.');
     const none = receiptSummary('send_draft', { status: 'failed', operationId, reason: 'no_recipients' }) ?? '';
@@ -661,7 +665,7 @@ test('every non-success write result of every write tool carries its explanation
         { status: 'partial', operationId, candidate: { mailboxId, uid: 3 }, candidateVerified: false, reason: 'candidate_verification_failed', originalDeletion: 'not_attempted' },
         ...[['original_deletion_failed', 'failed'], ['original_deletion_unconfirmed', 'unconfirmed'], ['original_version_changed', 'not_attempted'], ['original_verification_failed', 'not_attempted']].map(([reason, originalDeletion]) => ({ status: 'partial', operationId, candidate, candidateVerified: true, proof: confirmed(candidate, 'mcp_authored'), reason, originalDeletion })),
     ];
-    const advice = { upstream_timeout: 'The requested change was not applied', version_conflict: 'Read it again', operation_conflict: 'Use a new operationId', draft_fenced: 'find the message and its current uid', in_progress: 'stop retrying', dispatch_uncertain: 'Do not repeat the change under a new operationId', candidate_verification_failed: 'cannot edit or send it', original_deletion_failed: `use uid 9, version ${versions.replaced}`, original_deletion_unconfirmed: `use uid 9, version ${versions.replaced}`, original_version_changed: 'both were kept', original_verification_failed: 'both were kept' } as const;
+    const advice = { upstream_timeout: 'The requested change was not applied', version_conflict: 'Read it again', operation_conflict: 'Use a new operationId', draft_fenced: 'Retry the identical request in a few minutes', in_progress: 'after about 5 minutes it reports a final result', dispatch_uncertain: 'Do not repeat the change under a new operationId', candidate_verification_failed: 'cannot edit or send it', original_deletion_failed: `use uid 9, version ${versions.replaced}`, original_deletion_unconfirmed: `use uid 9, version ${versions.replaced}`, original_version_changed: 'both were kept', original_verification_failed: 'both were kept' } as const;
     for (const name of mailWriteToolSchema.options) {
         for (const result of results) {
             // Only drafts that are created or replaced can end partly done, and only update_draft can leave the old copy behind.
@@ -678,7 +682,7 @@ test('every non-success write result of every write tool carries its explanation
             // A failed send says the mail was not sent, never that nothing was changed: the refused attempt may already have rewritten the draft.
             const key = 'reason' in result ? result.reason : result.status; const sendFailure = name === 'send_draft' && result.status === 'failed';
             expect({ label, advice: summary.includes(advice[key as keyof typeof advice].replace('The requested change was not applied', sendFailure ? 'The mail was not sent' : 'The requested change was not applied')) }).toEqual({ label, advice: true });
-            if (sendFailure) { expect({ label, claimsUntouched: /nothing was changed/iu.test(summary), recreate: summary.includes('the draft must be created again') }).toEqual({ label, claimsUntouched: false, recreate: true }); }
+            if (sendFailure) { expect({ label, claimsUntouched: /nothing was changed/iu.test(summary), recreate: summary.includes('create the draft again and send the new one') }).toEqual({ label, claimsUntouched: false, recreate: true }); }
         }
     }
 });
@@ -739,7 +743,7 @@ test('read results explain managedOperation, truncation, incomplete search and b
     const verified = (await f.call('read_message', { mailboxId, uid: 1 })).result; expect(summaryText(verified)).toContain('If it is a draft created here and no other mail client has changed it since, it can be edited or sent here.'); expect(firstKey(verified)).toBe('summary'); expect(verified.isError).toBeUndefined();
     for (const verification of ['pending', 'outcome_unknown', 'unverified'] as const) {
         f.mail.read_message = async input => ({ ...await read(input), managedOperation: { operationId, verification } });
-        expect(summaryText((await f.call('read_message', { mailboxId, uid: 1 })).result)).toContain(`This server cannot change this message (managedOperation.verification is ${verification})`);
+        expect(summaryText((await f.call('read_message', { mailboxId, uid: 1 })).result)).toContain(`This message cannot be edited or sent here (managedOperation.verification is ${verification})`);
     }
     f.mail.read_message = read; const plain = (await f.call('read_message', { mailboxId, uid: 1 })).result; expect(summaryText(plain)).toBeUndefined(); expect(plain.structuredContent).not.toHaveProperty('summary');
     const listed = { ...await read({ mailboxId, uid: 1, includeHtml: true }), managedOperation: { operationId, verification: 'not_checked' as const } };

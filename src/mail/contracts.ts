@@ -173,6 +173,14 @@ export interface MailBackendWriter {
     stampSendMarker(session: BackendMailSession, snapshot: MessageSnapshot, marker: MailOperationMarker, source: AuthoredSourceDescriptor): Promise<MessageRef>;
     /** Queue acceptance, never delivery. Return Sent key only from actual response. */
     submitDraft(session: BackendMailSession, target: MessageKey): Promise<{ queueId: string; sent?: MessageKey }>;
+    /** Read-only exact GET (markAsSeen=false) of one mailbox/UID, to settle an unknown send once findSentCopy found no Sent copy. true: the message exists there. false: ONLY a
+     * definite 404 with body code MessageNotFound. Every other failure throws (timeout, 5xx, auth, a 404 without that code): nothing may be concluded from it. */
+    draftPresent(session: BackendMailSession, target: MessageKey): Promise<boolean>;
+    /** Read-only, bounded lookup (a few GETs, never retried) of the Sent copy of a send: the message in the \\Sent mailbox whose private marker equals
+     * `marker` in every field and which is not flagged as a draft. hint.threadId searches that thread, else the newest Sent messages are listed.
+     * A miss returns undefined and proves nothing (the lookup is bounded and Sent can have changed). queueId is set only if WildDuck still reports
+     * one for that message (it drops the entry once the queue is empty); it is never invented. */
+    findSentCopy(session: BackendMailSession, marker: MailOperationMarker, hint?: { readonly threadId?: string }): Promise<{ message: MessageKey; queueId?: string } | undefined>;
     /** Move+marker and verify new mapping/content/flags. Carry authored grade only
      * when trusted descriptor matches both pre/post source SHA; otherwise observed. */
     moveMessage(session: BackendMailSession, snapshot: MessageSnapshot, destinationMailboxId: string, marker: MailOperationMarker, source?: AuthoredSourceDescriptor): Promise<VerifiedMessageMutation>;
@@ -190,14 +198,17 @@ export type WriteIntent = OperationKey & { readonly payloadDigest: string } & (
 export interface OperationClaim<State extends 'reserved' | 'dispatched' = 'reserved' | 'dispatched'> {
     readonly key: OperationKey; readonly ownerToken: string; readonly revision: number; readonly state: State;
 }
-/** reservedAt: epoch seconds, read when present and carried unchanged through every transition; this version never writes it. */
+/** reservedAt: epoch seconds (the clock rounded up, so an age is never overstated), set at reserve and carried unchanged through
+ * every transition; records written by older versions have none. A guard's ownerToken and revision always equal its owner's. */
 interface OperationRecordBase { readonly key: OperationKey; readonly ownerToken: string; readonly revision: number; readonly intent: WriteIntent; readonly reservedAt?: number | undefined }
 export type MailOperationRecord = OperationRecordBase & (
     | { readonly state: 'reserved' | 'dispatched' }
     | { readonly state: 'settled'; readonly receipt: MailReceipt }
 );
 /** Historical name; the shared guard covers ALL messages, not only drafts.
- * Keys omit client/connection so no new operation/client bypasses an uncertain fence. */
+ * Keys omit client/connection so no other operation or client can write to a message while its guard exists. A guard
+ * exists only for the length of its hold: it is deleted when the hold ends, at settlement or by the service (holdAction).
+ * 'queued' is only ever read (rows written by older versions); this version never writes it. */
 export interface DraftGuardKey extends MessageKey { readonly accountId: string }
 export interface DraftGuardRecord {
     readonly key: DraftGuardKey; readonly operation: OperationKey; readonly ownerToken: string; readonly revision: number;
@@ -206,12 +217,17 @@ export interface DraftGuardRecord {
 export type ReservationResult =
     | { readonly kind: 'acquired'; readonly claim: OperationClaim<'reserved'> }
     | { readonly kind: 'replay'; readonly record: MailOperationRecord }
-    | { readonly kind: 'conflict'; readonly reason: 'operation_conflict' | 'draft_fenced' };
+    | { readonly kind: 'conflict'; readonly reason: 'operation_conflict' }
+    | { readonly kind: 'conflict'; readonly reason: 'draft_fenced'; readonly blocker: DraftGuardRecord };
+/** A receipt that settles an unknown outcome: the send was seen in Sent, or nothing was sent. */
+export type ResolvedReceipt = FailedReceipt | Extract<ConfirmedReceipt, { readonly status: 'queued' }>;
 /** Separate adapter over existing table; auth AtomicStore union is unchanged.
- * Strong reads, owner+revision CAS, atomic associated guard checks. Readers accept
- * an optional expiresAt on an item and reservedAt in a record; this version writes
- * neither, so nothing expires. NO reclaim based on elapsed time for
- * pending/unknown/queued/retired states.
+ * Strong reads, owner+revision CAS, atomic associated guard checks. Every item written carries
+ * an expiresAt (the table's TTL attribute, now + RECORD_TTL_SECONDS, refreshed at each transition) and every
+ * operation record a reservedAt; reads ignore expiresAt, and items written by older versions lack both.
+ * The guard exists exactly while its hold lasts: it is deleted in the transaction that settles the operation,
+ * and stays only for an uncertain outcome (outcome_unknown) or an update_draft partial with both copies alive
+ * (retired); the service ends those holds with releaseGuard/resolveUnknown, else the guard expires.
  * Store only digests and minimal references/proofs/queue receipts: never bodies,
  * subjects, addresses, tokens, custom flag/label names or complete inputs.
  * Match receipt to tool/operation ID. Ambiguous DB outcomes throw sanitized
@@ -219,27 +235,37 @@ export type ReservationResult =
 export interface MailOperationStore {
     getOperation(key: OperationKey): Promise<MailOperationRecord | undefined>;
     /** Reserve operation + target guard atomically; create has no target yet.
-     * Identical retries replay stored status without network; changed inputs conflict. */
+     * Identical retries replay stored status without network; changed inputs conflict.
+     * A held guard conflicts as draft_fenced and returns the guard row that was read. */
     reserve(intent: WriteIntent, ownerToken: string): Promise<ReservationResult>;
+    /** The guard row on this message, read as reserve reads it (strong read, same checks); undefined when there is none. */
+    getGuard(key: DraftGuardKey): Promise<DraftGuardRecord | undefined>;
+    /** Delete exactly this guard row if it still equals the given value; true when deleted, false when it changed or is
+     * gone. Touches no operation record: ends a hold whose outcome stays unknown, or whose record is missing. */
+    releaseGuard(guard: DraftGuardRecord): Promise<boolean>;
+    /** Settle a 'dispatched' record, or a settled one whose receipt is outcome_unknown, as failed or queued, and delete the
+     * given guard (which must be this operation's) in the same transaction; compare-and-set on the stored record, so a
+     * concurrent change throws temporarily_unavailable with nothing written. Any other source state is refused. */
+    resolveUnknown(record: MailOperationRecord, receipt: ResolvedReceipt, guard?: DraftGuardRecord): Promise<void>;
     /** Confirm this transition BEFORE any irreversible call, including marker PUT. */
     markDispatched(claim: OperationClaim<'reserved'>): Promise<OperationClaim<'dispatched'>>;
     /** Durable failed receipt and guard release together, only before dispatch (from 'reserved').
      * After dispatch (from 'dispatched') the sibling is failDispatched. */
     failPreflight(claim: OperationClaim<'reserved'>, receipt: FailedReceipt): Promise<void>;
-    /** Atomic receipt+guard transition. Verified flag completion RELEASES same-UID
-     * guard. Move/delete/update retire source; send queues/permanently fences it.
-     * Post-dispatch update partial conservatively retires original guard.
+    /** Atomic receipt+guard transition: the guard is DELETED in the same transaction for every receipt, except an
+     * update_draft partial whose original deletion failed or is unconfirmed, where both copies are alive and the
+     * guard stays on the original as 'retired'.
      * Verified partial candidate activates only for deletion_failed/unconfirmed
      * after a fresh original-version check; original_version_changed and
      * original_verification_failed NEVER activate.
-     * Unverified/unknown/stale candidates remain fenced. Exact activation proof binds
+     * Unverified/unknown/stale candidates are never editable or sendable here. Exact activation proof binds
      * account/mailbox/UID; later flag changes do not invalidate historical identity.
      * SourceGrade authored starts only at create/update exact candidate byte proof;
      * move/flags carry it only with trusted prior proof + unchanged raw SHA.
      * Send's actual receipt.sent key activates only as observed, never authored.
      * Flags receipt stays minimal; replay neither refetches nor echoes current sets. */
     complete(claim: OperationClaim<'dispatched'>, receipt: ConfirmedReceipt): Promise<void>;
-    /** Any unproved post-dispatch outcome permanently fences the target (this version never reclaims it by age). */
+    /** Any unproved post-dispatch outcome keeps the guard (state outcome_unknown) until the service ends the hold or it expires. */
     markOutcomeUnknown(claim: OperationClaim<'dispatched'>, receipt: UnknownReceipt): Promise<void>;
     /** Durable failed receipt and guard release together, from 'dispatched'. Only for a failure PROVEN to have changed
      * nothing (MailError.notApplied) or for a call whose dispatch mark failed before any WildDuck request; anything
@@ -253,6 +279,11 @@ export interface MailOperationStore {
  * Public writes always pass this coordinator; no raw writer reaches MCP.
  * After dispatch a write settles 'failed' (guard released) only when the backend proved the requested
  * change did not take effect (MailError.notApplied); every unproved failure is 'outcome_unknown'.
+ * No hold waits for an operator: the next request that meets one (a same-ID retry or a guard hit) ends it once aged
+ * (service.ts holdAction): 5 minutes, or 15 for an uncertain send, which is then settled from what WildDuck shows (Sent first);
+ * an uncertain send written by an older version (no reservedAt) is never checked and holds until its items expire.
+ * A message whose marker no longer vouches for anything (record expired, an aged unknown outcome other than a send, or,
+ * for delete_draft only, a failure, an inactive copy, or the draft a queued send left in Drafts) is written as mail this server did not write: never editable or sendable.
  * A call whose dispatch mark failed made no WildDuck request: it reports 'failed' or 'in_progress', never 'outcome_unknown'.
  * Verification reads retry once, the completion write retries once, mutating WildDuck requests never.
  * Drafts whose attachments use source also need mail:read. create_attachment_upload needs

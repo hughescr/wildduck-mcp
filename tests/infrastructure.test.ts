@@ -20,7 +20,7 @@ test('deployment keeps the agreed tiny footprint without hidden indexes or scali
     const table = configuration.resources.Resources['CredentialTable'];
     expect(table?.Properties['ProvisionedThroughput']).toEqual({ ReadCapacityUnits: 1, WriteCapacityUnits: 1 });
     expect(table?.Properties['BillingMode']).toBe('PROVISIONED');
-    // Upload records and auth records rely on this attribute name for free expiry.
+    // Free expiry: auth records, upload records, and mail operation records and guards (90 days after their last write) all rely on this attribute name.
     expect(table?.Properties['TimeToLiveSpecification']).toEqual({ AttributeName: 'expiresAt', Enabled: true });
     expect(table?.Properties['GlobalSecondaryIndexes']).toBeUndefined();
     expect(table?.Properties['LocalSecondaryIndexes']).toBeUndefined();
