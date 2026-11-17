@@ -50,9 +50,15 @@ function resultReceipt(value: unknown): unknown {
     const { [STORED_OPERATION_ID]: operationId, ...rest } = value as Record<string, unknown>;
     return { ...rest, operationId };
 }
+/** A summary is never stored data, so a stray one, of any shape, is dropped before validation; only that key is removed. */
+function withoutSummary(value: unknown): unknown {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) { return value; }
+    const { summary: _summary, ...rest } = value as Record<string, unknown>;
+    return rest;
+}
 function receiptFor(intent: WriteIntent, value: unknown): MailReceipt {
     // Schema validation preserves the supplied grade; absent/invalid grades are never inferred.
-    const receipt = parse(mailOutputSchemas[intent.tool], resultReceipt(value));
+    const receipt = parse(mailOutputSchemas[intent.tool], resultReceipt(withoutSummary(value)));
     if (!['completed', 'partial', 'queued', 'failed', 'outcome_unknown'].includes(receipt.status) || receipt.operationId !== intent.operationId) { throw unavailable(); }
     if (intent.tool === 'delete_draft' && receipt.status === 'completed' && 'deleted' in receipt && !equal(receipt.deleted, intent.target)) { throw unavailable(); }
     if ('proof' in receipt && receipt.proof.accountId !== intent.accountId) { throw unavailable(); }
@@ -62,9 +68,7 @@ function receiptFor(intent: WriteIntent, value: unknown): MailReceipt {
         const candidate = receipt.status === 'completed' && 'draft' in receipt ? receipt.draft : receipt.status === 'partial' && 'candidate' in receipt ? receipt.candidate : undefined;
         if (candidate && candidate.mailboxId === intent.target.mailboxId && candidate.uid === intent.target.uid) { throw unavailable(); }
     }
-    // A stored record never carries a summary; drop one that is present so a receipt read back is the stored shape.
-    const { summary: _summary, ...stored } = receipt;
-    return stored as MailReceipt;
+    return receipt as MailReceipt;
 }
 function operation(value: unknown, expected: OperationKey): MailOperationRecord {
     const data = parse(operationSchema, value);

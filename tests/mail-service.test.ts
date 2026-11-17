@@ -12,8 +12,14 @@ const target = { uid: 7, expectedVersion: version, operationId };
 const content = { to: [{ address: 'to@example.com' }], cc: [], bcc: [], subject: 'private subject', body: { markdown: 'private **body**' }, attachments: [] };
 const keyOf = (key: OperationKey) => JSON.stringify([key.accountId, key.clientIdHash, key.operationId]);
 const guardOf = (intent: WriteIntent) => intent.tool === 'create_draft' || intent.tool === 'create_reply_draft' ? undefined : JSON.stringify([intent.accountId, intent.target.mailboxId, intent.target.uid]);
+/** What the real store keeps: a summary is never stored. The fixture notes any that reaches it, so a service that passes one on is caught. */
+const stored = <Receipt extends object>(receipt: Receipt, offered: string[]): Receipt => {
+    if ('summary' in receipt) { offered.push(JSON.stringify((receipt as { summary: unknown }).summary)); }
+    const { summary: _summary, ...rest } = receipt as Receipt & { summary?: unknown };
+    return rest as Receipt;
+};
 class Store implements MailOperationStore {
-    records = new Map<string, MailOperationRecord>(); guards = new Map<string, string>(); calls: string[] = [];
+    records = new Map<string, MailOperationRecord>(); guards = new Map<string, string>(); calls: string[] = []; summariesOffered: string[] = [];
     completeFault: 'none' | 'before' | 'after' = 'none'; markFault: 'none' | 'before' | 'after' = 'none'; unknownFault = false; preflightFault = false;
     async getOperation(key: OperationKey): Promise<MailOperationRecord | undefined> { this.calls.push('get'); const record = this.records.get(keyOf(key)); return record && structuredClone(record); }
     async reserve(intent: WriteIntent, ownerToken: string): Promise<ReservationResult> {
@@ -38,18 +44,18 @@ class Store implements MailOperationStore {
     }
     async failPreflight(claim: OperationClaim<'reserved'>, receipt: FailedReceipt): Promise<void> {
         this.calls.push('fail'); if (this.preflightFault) { throw new Error('secret failed release'); }
-        const record = this.checked(claim); this.records.set(keyOf(claim.key), { ...record, revision: record.revision + 1, state: 'settled', receipt });
+        const record = this.checked(claim); this.records.set(keyOf(claim.key), { ...record, revision: record.revision + 1, state: 'settled', receipt: stored(receipt, this.summariesOffered) });
         const guard = guardOf(record.intent); if (guard) { this.guards.delete(guard); }
     }
     async complete(claim: OperationClaim<'dispatched'>, receipt: ConfirmedReceipt): Promise<void> {
         this.calls.push('complete'); if (this.completeFault === 'before') { throw new Error('secret completion failure'); }
-        const record = this.checked(claim); this.records.set(keyOf(claim.key), { ...record, revision: record.revision + 1, state: 'settled', receipt });
+        const record = this.checked(claim); this.records.set(keyOf(claim.key), { ...record, revision: record.revision + 1, state: 'settled', receipt: stored(receipt, this.summariesOffered) });
         if (record.intent.tool === 'update_message_flags') { const guard = guardOf(record.intent); if (guard) { this.guards.delete(guard); } }
         if (this.completeFault === 'after') { throw new Error('secret committed completion failure'); }
     }
     async markOutcomeUnknown(claim: OperationClaim<'dispatched'>, receipt: UnknownReceipt): Promise<void> {
         this.calls.push('unknown'); if (this.unknownFault) { throw new Error('secret unknown failure'); }
-        const record = this.checked(claim); this.records.set(keyOf(claim.key), { ...record, revision: record.revision + 1, state: 'settled', receipt });
+        const record = this.checked(claim); this.records.set(keyOf(claim.key), { ...record, revision: record.revision + 1, state: 'settled', receipt: stored(receipt, this.summariesOffered) });
     }
 }
 function fixture(authored = true) {
@@ -477,7 +483,7 @@ test('batch serialized budget includes metadata, envelope and reserved failure s
     const f = fixture(false); const original = f.reader.readMessage;
     f.reader.readMessage = async (bound, key) => ({ message: { ...(await original(bound, key)).message, ...key, text: 'x'.repeat(128 * 1024), html: ['x'.repeat(256 * 1024)] } });
     const result = await f.service.read_messages(context, { includeHtml: true, messages: Array.from({ length: 10 }, (_, index) => ({ mailboxId, uid: index + 1 })) });
-    expect(result.results.filter(item => item.status === 'ok')).toHaveLength(2); expect(result.results.filter(item => item.status === 'failed').every(item => item.status === 'failed' && item.error.code === 'too_large' && item.error.message.includes('Read it alone with read_message'))).toBe(true); expect(JSON.stringify(result)).not.toContain('"summary"'); expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(1048576); expect(result.bytesReturned).toBe(Buffer.byteLength(JSON.stringify(result)));
+    expect(result.results.filter(item => item.status === 'ok')).toHaveLength(2); expect(result.results.filter(item => item.status === 'failed').every(item => item.status === 'failed' && item.error.code === 'too_large' && item.error.message.includes('Read it alone with read_message'))).toBe(true); expect(Object.keys(result)[0]).toBe('summary'); expect(result.summary).toBe('Of 10 messages, 8 could not be read (see the error in each failed item).'); expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThanOrEqual(1048576); expect(result.bytesReturned).toBe(Buffer.byteLength(JSON.stringify(result)));
 });
 
 test('reply draft uses distinct durable create intent, skips preparation on replay, and requires both read and draft', async () => {
@@ -568,4 +574,18 @@ test('an identical retry of a send settled by 0.6.x replays its outcome; a chang
     f.operations.records.set(keyOf(createKey), { key: createKey, intent: { ...createKey, tool: 'create_draft', payloadDigest: digest('0.6.x create payload') }, ownerToken: 'owner-0-6', revision: 1, state: 'dispatched' });
     expect(await f.service.create_draft(context, { ...content, operationId: createKey.operationId })).toEqual({ status: 'conflict', operationId: createKey.operationId, reason: 'operation_conflict' });
     expect(posts(f)).toHaveLength(0); expect(f.operations.calls).not.toContain('dispatch');
+});
+test('the in-memory store keeps no summary, and notes any the service offers it', async () => {
+    // The fixture works as the real store does: a summary is dropped on write, and its being offered at all is recorded.
+    const probe = fixture(); const claimed = await probe.operations.reserve({ accountId, clientIdHash: digest(context.clientId), operationId: 'probe_operation_001', tool: 'create_draft', payloadDigest: digest('probe') }, 'owner');
+    if (claimed.kind !== 'acquired') { throw new Error('expected a claim'); }
+    const failed: FailedReceipt & { summary: string } = { status: 'failed', operationId: 'probe_operation_001', reason: 'not_found', summary: 'Not done.' };
+    await probe.operations.failPreflight(claimed.claim, failed);
+    expect(probe.operations.summariesOffered).toEqual(['"Not done."']); expect(JSON.stringify([...probe.operations.records.values()])).not.toContain('summary');
+    // The service itself never passes one: every kind of write outcome leaves the list empty.
+    const settled = fixture(); await settled.service.send_draft(context, target); await settled.service.create_draft(context, { ...content, operationId: 'summary_create_001' });
+    await settled.service.update_message_flags(context, { uid: 7, mailboxId, expectedVersion: version, operationId: 'summary_flags_001', flagged: true });
+    const failing = fixture(); failing.behavior.preparationError = true; await failing.service.create_draft(context, { ...content, operationId: 'summary_failed_001' });
+    const unknown = fixture(); unknown.behavior.postError = true; await unknown.service.send_draft(context, target);
+    for (const f of [settled, failing, unknown]) { expect(f.operations.summariesOffered).toEqual([]); expect(JSON.stringify([...f.operations.records.values()])).not.toContain('"summary":'); expect(f.operations.records.size).toBeGreaterThan(0); }
 });

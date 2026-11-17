@@ -1,7 +1,7 @@
 import { remainingRequestTimeMs, withRequestBudget } from '../request-budget';
 import { digest, randomId } from '../auth/crypto';
 import { MailError, type CanonicalReadMessage, type ActivationProof, type AuthoredSourceDescriptor, type SourceGrade, type AttachmentDownloadLink, type AttachmentDownload, type BackendMailSession, type ConfirmedReceipt, type FailedReceipt, type MailBackendReader, type MailBackendWriter, type MailContext, type MailInput, type MailOperationMarker, type MailOperationRecord, type MailOperationStore, type MailOutput, type MailService, type MailToolName, type MailWriteTool, type MessageKey, type MessageRef, type MessageSnapshot, type OperationClaim, type OperationKey, type PreparedDraft, type UnknownReceipt, type WriteIntent } from './contracts';
-import { errorText } from './summary';
+import { batchSummary, errorText } from './summary';
 import { activationProofSchema, draftContentSchema, failureReasonSchema, mailboxSchema, mailInputSchemas, mailOperationMarkerSchema, mailOutputSchemas, canonicalReadMessageOutputSchema, attachmentDownloadLinkSchema, messageKeySchema, messageRefSchema, MAX_BATCH_BYTES, BATCH_CONCURRENCY } from './schemas';
 
 interface Dependencies { reader: MailBackendReader; writer: MailBackendWriter; operations: MailOperationStore }
@@ -129,7 +129,7 @@ export function createMailService({ reader, writer, operations }: Dependencies):
                     const data = parsed as MailInput<'get_thread'>; const inherited = remainingRequestTimeMs(); const deadline = performance.now() + Math.min(inherited ?? 47000, 47000);
                     result = await withRequestBudget(() => Math.max(0, deadline - performance.now()), async () => {
                         const page = output('get_thread', await reader.getThread(bound, data));
-                        return data.includeBodies && page.messages.length > 0 ? { ...page, bodies: await batch(context, { includeHtml: true, messages: page.messages.map(({ mailboxId, uid }) => ({ mailboxId, uid })) }) } : page;
+                        return data.includeBodies && page.messages.length > 0 ? { ...page, bodies: await batch(context, { includeHtml: true, messages: page.messages.map(({ mailboxId, uid }) => ({ mailboxId, uid })) }, false) } : page;
                     }); break;
                 }
                 case 'search_messages': result = await reader.searchMessages(bound, parsed as MailInput<'search_messages'>); break;
@@ -142,16 +142,22 @@ export function createMailService({ reader, writer, operations }: Dependencies):
             return output(tool, result);
         } catch (error) { throw sanitized(error); }
     }
-    async function batch(context: MailContext, raw: MailInput<'read_messages'>): Promise<MailOutput<'read_messages'>> {
+    /** The read_messages result: byteBudget and bytesReturned describe the exact JSON returned, summary included.
+     * Nested in get_thread (standalone false) it has no summary and counts only itself; the thread's own summary sits outside it. */
+    async function batch(context: MailContext, raw: MailInput<'read_messages'>, standalone: boolean): Promise<MailOutput<'read_messages'>> {
         const bound = session(context, 'mail:read'); const parsed = input('read_messages', raw);
         type Item = MailOutput<'read_messages'>['results'][number];
         const inherited = remainingRequestTimeMs(); const deadline = performance.now() + Math.min(inherited ?? 32000, 32000);
         return withRequestBudget(() => Math.max(0, deadline - performance.now()), async () => {
         const results: Item[] = []; let next = 0;
         const failure = (key: MessageKey, error: unknown): Item => { const safe = sanitized(error); return { status: 'failed', ...key, error: { code: safe.code, message: errorText(safe.code, 'read_messages'), ...(safe.retryAfter === undefined ? {} : { retryAfter: safe.retryAfter }) } }; };
-        const envelope = (items: Item[]) => ({ includeHtml: parsed.includeHtml, results: items, byteBudget: MAX_BATCH_BYTES as typeof MAX_BATCH_BYTES, bytesReturned: MAX_BATCH_BYTES });
+        // The summary is first, as in the JSON the client receives, and is worked out from the items it describes.
+        const envelope = (items: Item[], bytesReturned: number) => { const summary = standalone ? batchSummary(items) : undefined; return { ...summary === undefined ? {} : { summary }, includeHtml: parsed.includeHtml, results: items, byteBudget: MAX_BATCH_BYTES as typeof MAX_BATCH_BYTES, bytesReturned }; };
+        const size = (value: object) => Buffer.byteLength(JSON.stringify(value));
         // Reserve every failure slot and the envelope before dispatch. Replace slots in
         // input order so asynchronous completion cannot change which message fits.
+        // Each proposal is measured whole, with the summary of exactly its items and the
+        // widest bytesReturned (seven digits), so the state kept always fits and the final result does too.
         const reserved = parsed.messages.map(key => failure(key, new MailError('too_large')));
         for (let start = 0; start < parsed.messages.length; start += BATCH_CONCURRENCY) {
             const keys = parsed.messages.slice(start, start + BATCH_CONCURRENCY);
@@ -166,13 +172,14 @@ export function createMailService({ reader, writer, operations }: Dependencies):
             for (const candidate of group) {
                 const fallback = reserved[next]; if (!fallback) { throw temporary(); }
                 const proposed = [...results, candidate, ...reserved.slice(next + 1)];
-                results.push(Buffer.byteLength(JSON.stringify(envelope(proposed))) <= MAX_BATCH_BYTES ? candidate : fallback); next++;
+                results.push(size(envelope(proposed, MAX_BATCH_BYTES)) <= MAX_BATCH_BYTES ? candidate : fallback); next++;
             }
         }
-        const result = { includeHtml: parsed.includeHtml, results, byteBudget: MAX_BATCH_BYTES as typeof MAX_BATCH_BYTES, bytesReturned: 0 };
+        const result = output('read_messages', envelope(results, 0));
         // Fixed point includes the decimal accounting field itself.
-        for (let i = 0; i < 4; i++) { result.bytesReturned = Buffer.byteLength(JSON.stringify(result)); }
-        return output('read_messages', result);
+        for (let i = 0; i < 4; i++) { result.bytesReturned = size(result); }
+        if (size(result) !== result.bytesReturned || result.bytesReturned > MAX_BATCH_BYTES) { throw temporary(); }
+        return result;
         });
     }
     async function downloadLink(context: MailContext, raw: MailInput<'get_attachment_download'>): Promise<AttachmentDownloadLink> {
@@ -332,7 +339,7 @@ export function createMailService({ reader, writer, operations }: Dependencies):
         read_attachment: attachment,
         get_attachment_download: downloadLink,
         get_thread: (context, raw) => read('get_thread', context, raw),
-        read_messages: batch,
+        read_messages: (context, raw) => batch(context, raw, true),
         create_reply_draft: (context, raw) => write('create_reply_draft', context, raw) as Promise<MailOutput<'create_reply_draft'>>,
         create_draft: (context, raw) => write('create_draft', context, raw) as Promise<MailOutput<'create_draft'>>,
         update_draft: (context, raw) => write('update_draft', context, raw) as Promise<MailOutput<'update_draft'>>,

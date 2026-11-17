@@ -84,8 +84,9 @@ export function receiptSummary(name: MailWriteTool, result: MailOutput<MailWrite
     }
 }
 type BatchResults = MailOutput<'read_messages'>['results'];
-/** Counts of failed and cut-short items in a batch of reads, as a sentence; undefined when all are complete. */
-function batchNote(results: BatchResults): string | undefined {
+/** Counts of failed and cut-short items in a batch of reads, as a sentence; undefined when all are complete.
+ * The mail service measures this sentence into the 1 MiB read_messages result, so it is worked out there. */
+export function batchSummary(results: BatchResults): string | undefined {
     const failed = results.filter(item => item.status === 'failed').length;
     const cut = results.filter(item => item.status === 'ok' && (item.message.textTruncated || 'htmlTruncated' in item.message && item.message.htmlTruncated)).length;
     const parts = [...failed ? [`${failed} could not be read (see the error in each failed item)`] : [], ...cut ? [`${cut} ${cut === 1 ? 'is' : 'are'} cut short (textTruncated or htmlTruncated is true), so do not treat ${cut === 1 ? 'it' : 'them'} as complete`] : []];
@@ -98,7 +99,7 @@ export function readSummary(name: MailToolName, result: MailOutput<MailToolName>
         const cut = [...result.textTruncated ? ['text (textTruncated)'] : [], ...'htmlTruncated' in result && result.htmlTruncated ? ['HTML (htmlTruncated)'] : []];
         if (cut.length) { notes.push(`Incomplete read: the ${cut.join(' and ')} is or may be cut short. Do not treat it as the complete message.`); }
         const verification = 'managedOperation' in result ? result.managedOperation?.verification : undefined;
-        if (verification === 'verified') { notes.push('This message was created or last changed through this server and that change is confirmed (managedOperation.verification is verified): a draft you created here can be edited or sent here.'); }
+        if (verification === 'verified') { notes.push('This message was created or last changed through this server and that change is confirmed (managedOperation.verification is verified). If it is a draft created here and no other mail client has changed it since, it can be edited or sent here.'); }
         else if (verification !== undefined) { notes.push(`This server cannot change this message (managedOperation.verification is ${verification}): its last change made here is unfinished, uncertain or could not be confirmed.`); }
     }
     if ((name === 'list_messages' || name === 'search_messages' || name === 'get_thread') && 'messages' in result) {
@@ -106,12 +107,15 @@ export function readSummary(name: MailToolName, result: MailOutput<MailToolName>
         if (unchecked) { notes.push(`${unchecked} of these messages ${unchecked === 1 ? 'was' : 'were'} created or changed through this server; managedOperation.verification is not_checked in lists, so read the message to find out whether it can be edited or sent here.`); }
     }
     if (name === 'search_messages' && 'search' in result && !result.search.complete) { notes.push('Fast search returned only confirmed matches and may have missed some. To find every match, repeat the same search from the first page with searchMode: "exhaustive" (slower).'); }
-    const batch = name === 'read_messages' && 'results' in result ? result.results : name === 'get_thread' && 'bodies' in result ? result.bodies?.results : undefined;
-    const batchSummary = batch && batchNote(batch);
-    if (batchSummary) { notes.push(batchSummary); }
+    // read_messages is not handled here: the service supplies its summary, because it counts toward the result's 1 MiB.
+    const bodies = name === 'get_thread' && 'bodies' in result ? result.bodies?.results : undefined;
+    const bodiesSummary = bodies && batchSummary(bodies);
+    if (bodiesSummary) { notes.push(bodiesSummary); }
     return notes.length ? notes.join(' ') : undefined;
 }
-/** The summary field of a tool result, or undefined when the result needs no explanation. */
+/** The summary field of a tool result, or undefined when the result needs no explanation.
+ * Only read_messages arrives with its summary already in place (measured into its byte count); every other tool's is worked out here. */
 export function resultSummary(name: MailToolName, result: MailOutput<MailToolName>): string | undefined {
+    if (name === 'read_messages') { return 'summary' in result ? result.summary : undefined; }
     return isWriteTool(name) ? receiptSummary(name, result as MailOutput<MailWriteTool>) : readSummary(name, result);
 }

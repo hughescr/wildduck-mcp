@@ -380,6 +380,41 @@ describe('receipts stored by 0.6.x', () => {
         const replay = await f.store.reserve(odd, owner); expect(replay.kind).toBe('replay'); if (replay.kind === 'replay' && replay.record.state === 'settled') { expect(replay.record.receipt).not.toHaveProperty('summary'); }
         expect([...f.client.records.entries()]).toEqual(before);
     });
+    test('a stray stored summary of any shape never blocks the message: it reads, replays and takes later changes', async () => {
+        const context: MailContext = { accountId: key().accountId, accessToken: 'c'.repeat(40), clientId: 'client-one', scopes: ['mail:read', 'mail:draft', 'mail:send', 'mail:modify'], connectionStatus: 'active' };
+        const clientIdHash = hashOf(context.clientId);
+        const strays: [string, unknown][] = [['too long', 'x'.repeat(701)], ['empty', ''], ['null', null], ['number', 42]];
+        for (const [index, [label, stray]] of strays.entries()) {
+            const f = fixture();
+            // Replay: a delete receipt that carries a stray summary replays its stored outcome, with a freshly worked-out summary.
+            const operationId = `operation-stray-${index}-delete`; const uid = 30 + index;
+            const forDelete: WriteIntent = { accountId: context.accountId, clientIdHash, operationId, tool: 'delete_draft', payloadDigest: hashOf(JSON.stringify({ accountId: context.accountId, input: { expected_version: digest, uid }, tool: 'delete_draft' })), target: { mailboxId, uid }, expectedVersion: digest };
+            const pk = operationPk(forDelete); const receipt = { status: 'completed', operation_id: operationId, deleted: { mailboxId, uid }, summary: stray };
+            f.client.records.set(pk, { pk, sk: 'STATE', record: { key: { accountId: forDelete.accountId, clientIdHash: forDelete.clientIdHash, operationId }, intent: forDelete, ownerToken: owner, revision: 2, state: 'settled', receipt } });
+            const service = createMailService({ reader: {} as never, writer: {} as never, operations: f.store });
+            const mail = { delete_draft: (input: never) => service.delete_draft(context, input) } as unknown as BoundMailService;
+            const authInfo: AuthInfo = { token: 'synthetic-oauth-token', clientId: 'verified-client', scopes: context.scopes as string[], resource: new URL('https://service.example/mcp') };
+            const before = structuredClone([...f.client.records.entries()]);
+            const response = await handleMcp(new Request('https://service.example/mcp', { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'mcp-protocol-version': '2025-11-25' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'delete_draft', arguments: { uid, expectedVersion: digest, operationId } } }) }), authInfo, mail);
+            const reply = (await response.json() as { result: { isError?: boolean; structuredContent: Record<string, unknown> } }).result;
+            expect({ label, isError: reply.isError }).toEqual({ label, isError: undefined });
+            expect({ label, keys: Object.keys(reply.structuredContent), deleted: reply.structuredContent['deleted'] }).toEqual({ label, keys: ['summary', 'status', 'operationId', 'deleted'], deleted: { mailboxId, uid } });
+            expect(String(reply.structuredContent['summary'])).toStartWith(`Draft uid ${uid} permanently deleted`);
+            expect([...f.client.records.entries()]).toEqual(before);
+            // Reads and later changes: a flags change recorded by this store, then given a stray summary by something else.
+            const flags: Exclude<WriteIntent, { tool: 'create_draft' | 'create_reply_draft' }> = { ...intent(`operation-stray-${index}-flags`, 'update_message_flags'), target: { mailboxId, uid: 11 } };
+            await f.store.complete(await f.store.markDispatched(await claim(f.store, flags)), { status: 'completed', operationId: flags.operationId, ...verifiedMessage(11) });
+            ((f.client.records.get(operationPk(flags)) as { record: { receipt: Record<string, unknown> } }).record.receipt)['summary'] = stray;
+            const marker = { accountId: flags.accountId, clientIdHash: flags.clientIdHash, operationId: flags.operationId, payloadDigest: flags.payloadDigest, tool: flags.tool };
+            const message = { mailboxId, uid: 11, version: digest, subject: 'subject', snippet: null, threadId: null, from: [], to: [], date: null, receivedAt: null, flags: { seen: false, flagged: false, draft: false, answered: false, deleted: false, forwarded: false }, imapFlags: [], labels: [], hasAttachments: false, replyTo: [], cc: [], bcc: [], messageId: null, references: [], text: 'text', textTruncated: false, html: [], htmlTruncated: false, htmlRepresentation: 'wildduck_normalized', attachments: [] };
+            const reading = createMailService({ reader: { readMessage: async () => ({ message, marker }) } as never, writer: {} as never, operations: f.store });
+            const read = await reading.read_message(context, { mailboxId, uid: 11, includeHtml: false });
+            expect({ label, verification: read.managedOperation?.verification }).toEqual({ label, verification: 'verified' });
+            const record = await f.store.getOperation(key(flags.operationId)); if (record?.state !== 'settled') { throw new Error('expected settled record'); }
+            expect({ label, receipt: record.receipt }).toEqual({ label, receipt: { status: 'completed', operationId: flags.operationId, ...verifiedMessage(11) } }); expect(record.receipt).not.toHaveProperty('summary');
+            expect((await f.store.reserve({ ...flags, operationId: `operation-stray-${index}-next` }, owner)).kind).toBe('acquired');
+        }
+    });
     test('receipts stored by 0.6.x and 0.7.2 replay through the MCP handler with a summary that is added to the output only', async () => {
         const f = fixture(); const context: MailContext = { accountId: key().accountId, accessToken: 'c'.repeat(40), clientId: 'client-one', scopes: ['mail:read', 'mail:draft', 'mail:send', 'mail:modify'], connectionStatus: 'active' };
         const clientIdHash = hashOf(context.clientId); const draftsTarget = { mailboxId, uid: 12 };

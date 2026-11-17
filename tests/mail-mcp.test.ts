@@ -1,8 +1,8 @@
 import { expect, spyOn, test } from 'bun:test';
 import type { AuthInfo } from '@modelcontextprotocol/server';
 import { handleMcp, SERVER_INSTRUCTIONS } from '../src/mcp';
-import { errorText, receiptSummary } from '../src/mail/summary';
-import { MailError, type BoundMailService } from '../src/mail/contracts';
+import { batchSummary, errorText, receiptSummary } from '../src/mail/summary';
+import { MailError, type BoundMailService, type MailContext, type MailOutput } from '../src/mail/contracts';
 import { createMailBackend, type SearchDiagnostic } from '../src/mail/backend';
 import { createMailService } from '../src/mail/service';
 import type { MailOperationStore } from '../src/mail/contracts';
@@ -20,6 +20,8 @@ const jsonOf = (result: { content: TextItem[] }) => JSON.parse(result.content[0]
 const summaryText = (result: { structuredContent: { summary?: string } }): string | undefined => result.structuredContent.summary;
 /** The first key of the JSON text, which is where the summary has to be. */
 const firstKey = (result: { content: TextItem[] }) => Object.keys(jsonOf(result))[0];
+/** A read_messages result as the service returns it: its summary is already in place, because the service counts it in bytesReturned. */
+const batchOf = (includeHtml: boolean, results: MailOutput<'read_messages'>['results']): MailOutput<'read_messages'> => { const summary = batchSummary(results); return { ...summary === undefined ? {} : { summary }, includeHtml, results, byteBudget: 1048576, bytesReturned: 100 }; };
 const toolNames = ['list_mailboxes', 'list_messages', 'search_messages', 'read_message', 'read_attachment', 'get_attachment_download', 'get_thread', 'read_messages', 'create_draft', 'create_reply_draft', 'update_draft', 'delete_draft', 'send_draft', 'move_message', 'update_message_flags'];
 function fixture() {
     const calls: { tool: string; input: unknown }[] = [];
@@ -521,7 +523,7 @@ test('client-visible prose avoids internal vocabulary', async () => {
     const listed = { ...await read({ mailboxId, uid: 1, includeHtml: true }), managedOperation: { operationId, verification: 'not_checked' as const } };
     f.mail.list_messages = async () => ({ messages: [summaryOf(listed, {}), summaryOf(listed, {})] }); { const summary = summaryText((await f.call('list_messages', { mailboxId })).result) ?? ''; texts.push(summary); summaries.push(summary); }
     const textOnly = await read({ mailboxId, uid: 1, includeHtml: false });
-    f.mail.read_messages = async input => ({ includeHtml: input.includeHtml, results: [{ status: 'ok', message: { ...textOnly, textTruncated: true } }, { status: 'failed', mailboxId, uid: 2, error: { code: 'not_found', message: errorText('not_found', 'read_messages') } }], byteBudget: 1048576, bytesReturned: 100 });
+    f.mail.read_messages = async input => batchOf(input.includeHtml, [{ status: 'ok', message: { ...textOnly, textTruncated: true } }, { status: 'failed', mailboxId, uid: 2, error: { code: 'not_found', message: errorText('not_found', 'read_messages') } }]);
     { const summary = summaryText((await f.call('read_messages', { messages: [{ mailboxId, uid: 1 }, { mailboxId, uid: 2 }], includeHtml: false })).result) ?? ''; texts.push(summary); summaries.push(summary); }
     f.mail.read_message = async input => ({ ...await read(input), textTruncated: true });
     { const summary = summaryText((await f.call('read_message', { mailboxId, uid: 1 })).result) ?? ''; texts.push(summary); summaries.push(summary); }
@@ -630,7 +632,7 @@ test('summaries are built from ids, versions, statuses and counts only, never fr
     const listed = { ...await read({ mailboxId, uid: 1, includeHtml: true }), subject: MARKER, from: [{ address: 'sender@example.com', name: MARKER }], managedOperation: { operationId, verification: 'not_checked' as const } };
     f.mail.list_messages = async () => ({ messages: [summaryOf(listed, {})] }); summaries.push(summaryText((await f.call('list_messages', { mailboxId })).result) ?? '');
     const marked = await read({ mailboxId, uid: 1, includeHtml: false });
-    f.mail.read_messages = async input => ({ includeHtml: input.includeHtml, results: [{ status: 'ok', message: { ...marked, subject: MARKER, text: MARKER, textTruncated: true } }, { status: 'failed', mailboxId, uid: 2, error: { code: 'not_found', message: errorText('not_found', 'read_messages') } }], byteBudget: 1048576, bytesReturned: 100 });
+    f.mail.read_messages = async input => batchOf(input.includeHtml, [{ status: 'ok', message: { ...marked, subject: MARKER, text: MARKER, textTruncated: true } }, { status: 'failed', mailboxId, uid: 2, error: { code: 'not_found', message: errorText('not_found', 'read_messages') } }]);
     summaries.push(summaryText((await f.call('read_messages', { messages: [{ mailboxId, uid: 1 }, { mailboxId, uid: 2 }], includeHtml: false })).result) ?? '');
     f.mail.delete_draft = async () => ({ status: 'failed', operationId, reason: 'not_found' }); summaries.push(summaryText((await f.call('delete_draft', { uid: 1, expectedVersion: version, operationId })).result) ?? '');
     expect(summaries.every(summary => summary.length > 0 && !summary.startsWith('{'))).toBe(true);
@@ -639,7 +641,7 @@ test('summaries are built from ids, versions, statuses and counts only, never fr
 test('read results explain managedOperation, truncation, incomplete search and batch outcomes in their summary', async () => {
     const f = fixture(); const read = f.mail.read_message;
     f.mail.read_message = async input => ({ ...await read(input), managedOperation: { operationId, verification: 'verified' as const } });
-    const verified = (await f.call('read_message', { mailboxId, uid: 1 })).result; expect(summaryText(verified)).toContain('can be edited or sent here'); expect(firstKey(verified)).toBe('summary'); expect(verified.isError).toBeUndefined();
+    const verified = (await f.call('read_message', { mailboxId, uid: 1 })).result; expect(summaryText(verified)).toContain('If it is a draft created here and no other mail client has changed it since, it can be edited or sent here.'); expect(firstKey(verified)).toBe('summary'); expect(verified.isError).toBeUndefined();
     for (const verification of ['pending', 'outcome_unknown', 'unverified'] as const) {
         f.mail.read_message = async input => ({ ...await read(input), managedOperation: { operationId, verification } });
         expect(summaryText((await f.call('read_message', { mailboxId, uid: 1 })).result)).toContain(`This server cannot change this message (managedOperation.verification is ${verification})`);
@@ -651,7 +653,7 @@ test('read results explain managedOperation, truncation, incomplete search and b
     f.mail.search_messages = async () => ({ messages: [], search: { mode: 'fast' as const, strategy: 'fulltext_prefilter' as const, complete: false as const, verified: true as const, retryWith: { searchMode: 'exhaustive' as const } } });
     const search = (await f.call('search_messages', { subject: 'x' })).result; expect(summaryText(search)).toContain('searchMode: "exhaustive"'); expect(firstKey(search)).toBe('summary'); expect(search.isError).toBeUndefined();
     const textOnly = await read({ mailboxId, uid: 1, includeHtml: false });
-    f.mail.read_messages = async input => ({ includeHtml: input.includeHtml, results: [{ status: 'ok', message: { ...textOnly, textTruncated: true } }, { status: 'failed', mailboxId, uid: 2, error: { code: 'not_found', message: errorText('not_found', 'read_messages') } }], byteBudget: 1048576, bytesReturned: 100 });
+    f.mail.read_messages = async input => batchOf(input.includeHtml, [{ status: 'ok', message: { ...textOnly, textTruncated: true } }, { status: 'failed', mailboxId, uid: 2, error: { code: 'not_found', message: errorText('not_found', 'read_messages') } }]);
     const batch = (await f.call('read_messages', { messages: [{ mailboxId, uid: 1 }, { mailboxId, uid: 2 }], includeHtml: false })).result;
     expect(summaryText(batch)).toBe('Of 2 messages, 1 could not be read (see the error in each failed item) and 1 is cut short (textTruncated or htmlTruncated is true), so do not treat it as complete.'); expect(batch.isError).toBeUndefined(); expect(firstKey(batch)).toBe('summary');
     // The explanation sits on the whole result: the items inside a batch carry none, and each failed item says in plain words why.
@@ -689,4 +691,71 @@ test('output schemas allow an optional bounded summary on every result that can 
     expect(mailOutputSchemas.delete_draft.safeParse({ status: 'completed', operationId, deleted: { mailboxId, uid: 1 }, summary: 'x'.repeat(MAX_SUMMARY_CHARACTERS) }).success).toBe(true);
     for (const bad of ['', 'x'.repeat(MAX_SUMMARY_CHARACTERS + 1), 7]) { expect(mailOutputSchemas.delete_draft.safeParse({ status: 'completed', operationId, deleted: { mailboxId, uid: 1 }, summary: bad }).success).toBe(false); }
     expect(mailOutputSchemas.delete_draft.safeParse({ status: 'completed', operationId, deleted: { mailboxId, uid: 1 }, extra: 1 }).success).toBe(false);
+});
+
+const BATCH_CAP = 1048576;
+const batchContext: MailContext = { accountId: 'a'.repeat(24), accessToken: 'c'.repeat(40), clientId: 'client-one', scopes: ['mail:read'], connectionStatus: 'active' };
+const listing = (uid: number) => ({ mailboxId, uid, subject: 'subject', snippet: null, threadId: null, from: [], to: [], date: null, receivedAt: null, flags: { seen: false, flagged: false, draft: false, answered: false, deleted: false, forwarded: false }, imapFlags: [], labels: [], hasAttachments: false });
+const stored = (uid: number, text: string, html: string[]) => ({ ...listing(uid), version, replyTo: [], cc: [], bcc: [], messageId: null, references: [], text, textTruncated: true, html, htmlTruncated: false, htmlRepresentation: 'wildduck_normalized' as const, attachments: [] });
+/** The real service and the real MCP handler over a reader whose messages are made by `shape`; undefined makes that message fail with not_found. */
+function batchFixture(shape: (uid: number) => ReturnType<typeof stored> | undefined, failure: 'not_found' | 'too_large' = 'not_found') {
+    const f = fixture();
+    const reader = {
+        readMessage: async (_bound: unknown, key: { uid: number }) => { const message = shape(key.uid); if (!message) { throw new MailError(failure); } return { message }; },
+        getThread: async () => ({ threadId: mailboxId, messages: [1, 2, 3].map(listing) }),
+    };
+    const service = createMailService({ reader: reader as never, writer: {} as never, operations: {} as never });
+    f.mail.read_messages = input => service.read_messages(batchContext, input); f.mail.get_thread = input => service.get_thread(batchContext, input);
+    return f;
+}
+/** The exact structured result is what is measured: its JSON, its text twin and bytesReturned all agree and stay within the cap. */
+function measured(result: { structuredContent: Record<string, unknown>; content: TextItem[] }): number {
+    const bytes = Buffer.byteLength(JSON.stringify(result.structuredContent));
+    expect(result.content[0]?.text).toBe(JSON.stringify(result.structuredContent)); expect(Object.keys(result.structuredContent)[0]).toBe('summary');
+    expect(result.structuredContent['bytesReturned']).toBe(bytes); expect(bytes).toBeLessThanOrEqual(BATCH_CAP);
+    return bytes;
+}
+const full = (uid: number) => stored(uid, 'x'.repeat(128 * 1024), ['y'.repeat(256 * 1024)]);
+const statuses = (result: { structuredContent: { results: { status: string; error?: { code: string } }[] } }) => result.structuredContent.results.map(item => item.status === 'ok' ? 'ok' : item.error?.code);
+test('read_messages bytesReturned is the size of the exact structured result, summary included', async () => {
+    const messages = (count: number) => Array.from({ length: count }, (_, index) => ({ mailboxId, uid: index + 1 }));
+    // Three messages at the size limits and one failure: two fit, the third is replaced by too_large, the fourth is not_found.
+    const three = batchFixture(uid => uid <= 3 ? full(uid) : undefined);
+    const mixed = (await three.call('read_messages', { messages: messages(4) })).result;
+    expect(statuses(mixed)).toEqual(['ok', 'ok', 'too_large', 'not_found']); measured(mixed);
+    expect(mixed.structuredContent.summary).toBe('Of 4 messages, 2 could not be read (see the error in each failed item) and 2 are cut short (textTruncated or htmlTruncated is true), so do not treat them as complete.');
+    // Ten failures.
+    const none = batchFixture(() => undefined); const failures = (await none.call('read_messages', { messages: messages(10) })).result;
+    expect(statuses(failures)).toEqual(Array(10).fill('not_found')); measured(failures);
+    // One success and nine failures.
+    const one = batchFixture(uid => uid === 1 ? stored(1, 'short', ['<p>short</p>']) : undefined); const single = (await one.call('read_messages', { messages: messages(10) })).result;
+    expect(statuses(single)).toEqual(['ok', ...Array(9).fill('not_found')]); measured(single);
+    // Ten full-size messages: the ones that do not fit become too_large, never an oversized result.
+    const big = batchFixture(full); const crowded = (await big.call('read_messages', { messages: messages(10) })).result;
+    expect(statuses(crowded)).toEqual(['ok', 'ok', ...Array(8).fill('too_large')]); measured(crowded);
+});
+test('read_messages decides whether the last message fits on the exact final size, including its summary', async () => {
+    const messages = [1, 2, 3, 4].map(uid => ({ mailboxId, uid }));
+    // The fourth message fails with the same error its reserved slot carries, so the sizes change only with the third message's HTML.
+    const withLast = (htmlBytes: number) => batchFixture(uid => uid <= 2 ? full(uid) : uid === 3 ? stored(3, 'x'.repeat(128 * 1024), ['y'.repeat(htmlBytes)]) : undefined, 'too_large');
+    const probe = measured((await withLast(0).call('read_messages', { messages })).result);
+    const room = BATCH_CAP - probe - 1; // one more byte for bytesReturned, which gains a digit as the result grows to 7
+    expect(room).toBeGreaterThan(0); expect(room).toBeLessThan(256 * 1024);
+    // The summary's bytes are part of the budget: one byte over and the message becomes too_large, at the limit it still fits.
+    for (const extra of [-200, -1, 0, 1, 2, 200]) {
+        const result = (await withLast(room + extra).call('read_messages', { messages })).result; const bytes = measured(result);
+        expect({ extra, status: statuses(result)[2] }).toEqual({ extra, status: extra <= 0 ? 'ok' : 'too_large' });
+        if (extra === 0) { expect(bytes).toBe(BATCH_CAP); }
+    }
+});
+test('get_thread bodies count themselves exactly, and the thread summary is outside them', async () => {
+    const f = batchFixture(uid => full(uid)); const result = (await f.call('get_thread', { threadId: mailboxId, includeBodies: true, limit: 3 })).result;
+    const bodies = result.structuredContent.bodies; expect(bodies).not.toHaveProperty('summary');
+    expect(bodies.bytesReturned).toBe(Buffer.byteLength(JSON.stringify(bodies))); expect(bodies.bytesReturned).toBeLessThanOrEqual(BATCH_CAP);
+    expect(bodies.results.map((item: { status: string; error?: { code: string } }) => item.status === 'ok' ? 'ok' : item.error?.code)).toEqual(['ok', 'ok', 'too_large']);
+    expect(Object.keys(result.structuredContent)[0]).toBe('summary'); expect(result.structuredContent.summary).toContain('Of 3 messages, 1 could not be read'); expect(jsonOf(result)).toEqual(result.structuredContent);
+    const tools = (await f.rpc('tools/list')).result.tools as { name: string; outputSchema: { properties: Record<string, { description?: string; properties?: Record<string, { description?: string }> }> } }[];
+    const counted = tools.find(tool => tool.name === 'read_messages')?.outputSchema.properties['bytesReturned']?.description; const nested = tools.find(tool => tool.name === 'get_thread')?.outputSchema.properties['bodies']?.properties?.['bytesReturned']?.description;
+    expect(counted).toBe('Exact size in bytes of this whole structured result as JSON, summary included; never more than byteBudget.');
+    expect(nested).toBe('Exact size in bytes of this bodies object as JSON. It does not count the rest of the get_thread result (messages, next, previous, summary).');
 });

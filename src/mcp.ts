@@ -11,7 +11,8 @@ const requiredScope = { list_mailboxes: 'mail:read', list_messages: 'mail:read',
 /** Codes whose thrown write error may follow a started reservation: retrying the same operationId is the safe path. */
 const transient: readonly MailFailureCode[] = ['temporarily_unavailable', 'upstream_timeout', 'verification_failed', 'source_integrity_unavailable'];
 /** The result with its summary as the first key, so it is the first thing read in the JSON; no summary key when there is nothing to say.
- * The summary is worked out here, when the response is produced, and is never part of what the server stores. */
+ * The summary is worked out here, when the response is produced, and is never part of what the server stores.
+ * The one exception is read_messages, whose summary the service works out and measures into the result's 1 MiB; this layer only moves it to the front, so it adds no bytes. */
 const withSummary = (result: object, summary: string | undefined): Record<string, unknown> => {
     const { summary: _own, ...rest } = result as Record<string, unknown>;
     return summary === undefined ? rest : { summary, ...rest };
@@ -22,7 +23,7 @@ const descriptions: Record<MailToolName, string> = {
     search_messages: 'Find messages by sender, recipient, subject, words, date or flags, in one mailbox or the whole account; give at least one filter. Returns summaries, newest first. If search.complete is false, a fast search may have missed matches: repeat it from the first page with searchMode exhaustive (search.retryWith). A page can be empty and still have next; keep paging until next is absent. Ignore search.strategy and search.verified.',
     read_message: 'Read one message (headers, text, HTML, flags, attachment list) without marking it read. Returns its version, to pass as expectedVersion when changing it. Use read_messages for several at once, get_thread for a conversation.',
     read_messages: 'Read up to 10 messages in one call, like read_message, in the order given, without marking them read. Each result succeeds or fails on its own (status ok, or failed with an error); the whole result is capped at 1 MiB.',
-    get_thread: 'List the messages of one conversation across all mailboxes, including Sent, oldest first, from a threadId or any of its messages. Returns summaries; set includeBodies to read them as well (bodies work as in read_messages).',
+    get_thread: 'List the messages of one conversation across all mailboxes, including Sent, oldest first, from a threadId or any of its messages. Returns summaries; set includeBodies to read them as well (bodies work as in read_messages; the 1 MiB cap counts the bodies object alone).',
     read_attachment: 'Return one attachment\'s content inline, up to 2 MiB, as an embedded resource. For larger files, or a link to hand to the user, use get_attachment_download.',
     get_attachment_download: 'Create a private download link for one attachment of up to 20 MiB, valid for at most five minutes. The link is only in the resource_link content item; treat it as a secret and do not store it. Use read_attachment to read a small file yourself.',
     create_draft: 'Create a new draft in the Drafts mailbox. To answer a message, use create_reply_draft instead: it fills in recipients, subject and threading. Returns the draft uid and version for update_draft or send_draft. In write results ignore sourceGrade, contentDigest and accountId.',
