@@ -1,6 +1,12 @@
 import { describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { createMime, inspectSource, preparePatch, verifyCandidate, MIME_LIMITS, MimeError, type MimeCreate } from '../src/mail/mime';
+import libmime from 'libmime';
+import Builder from 'nodemailer/lib/mime-node';
+import { encode as qpEncode, wrap as qpWrap } from 'nodemailer/lib/qp';
+import { createMime, inspectSource, preparePatch, verifyCandidate, textTransfer, MIME_LIMITS, MimeError, type MimeCreate } from '../src/mail/mime';
+import { draftContentSchema } from '../src/mail/schemas';
+import { authoredParts, authoredText, decodeTransfer } from './mime-text';
+import { xorshift } from './mime-fields';
 
 const digest = (data: Buffer | string) => createHash('sha256').update(data).digest('hex');
 const rootHeaders = 'From: Alias <alias@example.test>\r\nReply-To: Help <help@example.test>\r\nTo: Friends: Alice <alice@example.test>, Bob <bob@example.test>;\r\nCc: Carol <carol@example.test>\r\nBcc: Hidden <hidden@example.test>\r\nSubject: Old\r\nMessage-ID: <original@example.test>\r\nIn-Reply-To: <prior@example.test>\r\nReferences: <first@example.test>\r\n\t<prior@example.test>\r\nDate: Mon, 26 Oct 2026 12:00:00 +0000\r\nX-Custom:  Preserve\r\n\tthis spacing\r\nMIME-Version: 1.0\r\n';
@@ -337,11 +343,6 @@ describe('MIME address-parser security regressions', () => {
     });
 });
 
-/** Decode every text/plain or text/html part the library authored (base64, UTF-8). */
-function authoredText(raw: Buffer, type: 'text/plain' | 'text/html'): string[] {
-    const pattern = new RegExp(`Content-Type: ${type.replace('/', '\\/')}; charset=utf-8\\r\\nContent-Transfer-Encoding: base64\\r\\n\\r\\n([A-Za-z0-9+/=\\r\\n]*)`, 'gu');
-    return [...raw.toString('latin1').matchAll(pattern)].map(match => Buffer.from((match[1] ?? '').replaceAll('\r\n', ''), 'base64').toString('utf8'));
-}
 const bareBreak = /\r(?!\n)|(?<!\r)\n/u;
 
 describe('authored text parts use canonical CRLF line breaks', () => {
@@ -389,10 +390,21 @@ describe('authored text parts use canonical CRLF line breaks', () => {
         await expect(createMime({ ...fresh, body: { text: text + '\n', html: null } })).rejects.toBeInstanceOf(MimeError);
         await expect(createMime({ ...fresh, body: { text: 'x', html: htmlText + '\n' } })).rejects.toBeInstanceOf(MimeError);
     });
-    test('maximal LF-only body plus maximal attachments stays inside the MIME source limit', async () => {
+    test.each([
+        ['LF-only', '\n', '7bit'],
+        ['CJK (base64 worst case)', '你', 'base64'],
+        ['mostly ASCII Latin (quoted-printable)', 'é' + 'a'.repeat(20), 'quoted-printable'],
+        ['8-bit-free controls', '\u0001', 'base64'],
+    ] as const)('maximal %s bodies plus maximal attachments stay inside the MIME source limit', async (_name, unit, encoding) => {
         const attachment = Buffer.alloc(MIME_LIMITS.attachmentBytes, 0x0a);
-        const created = await createMime({ ...fresh, body: { text: '\n'.repeat(128 * 1024), html: '\n'.repeat(256 * 1024) }, attachments: [{ filename: 'big.bin', contentType: 'application/octet-stream', contentBase64: attachment.toString('base64'), disposition: 'attachment' }] });
+        const fill = (bytes: number) => unit.repeat(Math.floor(bytes / Buffer.byteLength(unit)));
+        const body = { text: fill(128 * 1024), html: fill(256 * 1024) };
+        const attachments = [{ filename: 'big.bin', contentType: 'application/octet-stream', contentBase64: attachment.toString('base64'), disposition: 'attachment' as const }];
+        const created = await createMime({ ...fresh, body, attachments });
         expect(created.raw.length).toBeLessThan(MIME_LIMITS.sourceBytes);
+        expect(authoredParts(created.raw).map(part => part.encoding)).toEqual([encoding, encoding]);
+        const patched = await preparePatch(await inspectSource(Buffer.from(rootHeaders + plain())), { body, attachments });
+        expect(patched.raw.length).toBeLessThan(MIME_LIMITS.sourceBytes);
     });
     test('attachments, including text attachments with bare LF or CR, keep their exact bytes', async () => {
         const bytes = Buffer.from('line one\nline two\rline three\r\nlast\n');
@@ -413,5 +425,247 @@ describe('authored text parts use canonical CRLF line breaks', () => {
         expect(patched.retainedAttachments).toEqual(source.attachments);
         expect(authoredText(patched.raw, 'text/plain')).toEqual(['new\r\nbody']);
         expect(authoredText(patched.raw, 'text/html')).toEqual(['<p>new\r\nbody</p>']);
+    });
+});
+
+/** RFC 5322 unfolding of an authored Subject field, and WildDuck's own view of it
+ * (imap-core parse-mime-tree.js joins folds with one space, message-handler.js trims), each
+ * RFC 2047 decoded. */
+const unfoldSubject = (header: Buffer) => header.toString('latin1').slice('Subject:'.length, -2);
+const subjectReadings = (header: Buffer) => [libmime.decodeWords(unfoldSubject(header).replaceAll('\r\n', '').trim()), libmime.decodeWords(unfoldSubject(header).replace(/\s*\r?\n\s*/gu, ' ').trim())];
+/** One root header field, with its folds. */
+const fieldOf = (raw: Buffer, name: string) => {
+    const headers = raw.subarray(0, raw.indexOf('\r\n\r\n') + 2).toString('latin1');
+    const match = new RegExp(`^${name}:.*\\r\\n(?:[ \\t].*\\r\\n)*`, 'mu').exec(headers);
+    return match ? Buffer.from(match[0], 'latin1') : undefined;
+};
+
+describe('authored Subject fields', () => {
+    // The library writes plain ASCII unencoded (a double quote makes it encode the whole value),
+    // and otherwise picks Q when Latin letters outnumber other characters, else B.
+    const cases: ReadonlyArray<readonly [string, string, 'plain' | 'Q' | 'B']> = [
+        ['short ASCII', 'Hello world', 'plain'],
+        ['ASCII filling a 76-character line', 'a'.repeat(67), 'plain'],
+        ['ASCII of 80 characters without a fold point', 'a'.repeat(71), 'plain'],
+        ['long ASCII with fold points', 'word '.repeat(400).trim(), 'plain'],
+        ['the longest accepted word', 'x'.repeat(900), 'plain'],
+        ['two longest words', 'x'.repeat(900) + ' ' + 'y'.repeat(900), 'plain'],
+        ['ASCII punctuation', "Re: Bob's update (v2) - 50% done; ok? a=b, c?=d [x] <y> _z_", 'plain'],
+        ['ASCII with a double quote', 'The "big" plan', 'Q'],
+        ['non-ASCII Latin', 'Résumé café, déjà vu', 'Q'],
+        ['long mostly-ASCII Latin', 'Café '.repeat(341).trim(), 'Q'],
+        ['CJK', '新しい件名です', 'B'],
+        ['emoji', '🌍🎉✓', 'B'],
+        ['mixed reply', 'Re: Résumé — 你好 🌍', 'B'],
+        ['2048 bytes of emoji', '🌍'.repeat(512), 'B'],
+        ['2046 bytes of CJK', '你'.repeat(682), 'B'],
+        ['long Latin', 'é'.repeat(1024), 'B'],
+    ];
+    test.each(cases)('%s', async (_name, subject, form) => {
+        // Every case is already in the schema's normalised form.
+        expect(draftContentSchema.parse({ subject, body: { text: 'x' } }).subject).toBe(subject);
+        const created = await createMime({ ...fresh, subject });
+        const header = fieldOf(created.raw, 'Subject');
+        if (header === undefined) { throw new Error('no Subject'); }
+        const text = header.toString('latin1');
+        const lines = text.slice(0, -2).split('\r\n');
+        expect(subjectReadings(header)).toEqual([subject, subject]);
+        if (form === 'plain') {
+            expect(text).not.toContain('=?');
+            for (const line of lines) { expect(line.length).toBeLessThanOrEqual(998); }
+        } else {
+            const words = text.slice(8, -2).trim().split(/\r\n | /u);
+            for (const word of words) { expect(word).toMatch(form === 'Q' ? /^=\?UTF-8\?Q\?[^?\s]*\?=$/u : /^=\?UTF-8\?B\?[A-Za-z0-9+/=]*\?=$/u); }
+            for (const line of lines) { expect(line.length).toBeLessThanOrEqual(76); }
+        }
+        // The same bytes are authored on create and patch, and pass the source gate.
+        const patched = await preparePatch(await inspectSource(rich()), { subject });
+        expect(fieldOf(patched.raw, 'Subject')?.equals(header)).toBe(true);
+        expect(bodyOf(patched.raw).equals(bodyOf(rich()))).toBe(true);
+    });
+    test('a plain English subject is written unencoded, as rspamd prefers', async () => {
+        expect(fieldOf((await createMime({ ...fresh, subject: 'Lunch on Friday?' })).raw, 'Subject')?.toString()).toBe('Subject: Lunch on Friday?\r\n');
+    });
+    test('a long subject with a double space at the library fold point round-trips after the schema normalises it', async () => {
+        const subject = 'a'.repeat(60) + '  ' + 'b'.repeat(20) + '  ' + 'c'.repeat(40);
+        // As given, the library folds before the double space and every reader unfolds it to one.
+        const library = new Builder(undefined, {}); library.setHeader('Subject', subject);
+        expect(library.buildHeaders()).toStartWith(`Subject: ${'a'.repeat(60)}\r\n  ${'b'.repeat(20)}`);
+        await expect(createMime({ ...fresh, subject })).rejects.toMatchObject({ code: 'invalid_mime_patch' });
+        const normalised = draftContentSchema.parse({ subject, body: { text: 'x' } }).subject;
+        expect(normalised).toBe('a'.repeat(60) + ' ' + 'b'.repeat(20) + ' ' + 'c'.repeat(40));
+        const header = fieldOf((await createMime({ ...fresh, subject: normalised })).raw, 'Subject');
+        expect(header && subjectReadings(header)).toEqual([normalised, normalised]);
+    });
+    test('an empty subject is omitted on create and removed by a patch', async () => {
+        expect(fieldOf((await createMime({ ...fresh, subject: '' })).raw, 'Subject')).toBeUndefined();
+        expect(fieldOf((await preparePatch(await inspectSource(rich()), { subject: '' })).raw, 'Subject')).toBeUndefined();
+    });
+    test('the MIME layer refuses what the schema refuses or normalises away', async () => {
+        for (const subject of ['a\r\nBcc: x@example.test', 'nul\0', 'z'.repeat(2049), 'é'.repeat(1025), ' padded', 'padded ', 'Price =?UTF-8?B?SGk=?= ok']) {
+            await expect(createMime({ ...fresh, subject })).rejects.toMatchObject({ code: 'invalid_mime_patch' });
+        }
+        // A word too long for one header line fails the header gate.
+        await expect(createMime({ ...fresh, subject: 'y'.repeat(2048) })).rejects.toBeInstanceOf(MimeError);
+    });
+});
+
+describe('authored text transfer encodings', () => {
+    const top = { topLevel: true, avoid: [] }, nested = { topLevel: false, avoid: [] };
+    const choices: ReadonlyArray<readonly [string, string, typeof top, '7bit' | 'quoted-printable' | 'base64']> = [
+        ['ASCII ending with a line break', 'Hello\r\nworld\r\n', top, '7bit'],
+        ['nested ASCII without a final break', 'Hello\r\nworld', nested, '7bit'],
+        ['top-level ASCII without a final break', 'Hello\r\nworld', top, 'quoted-printable'],
+        ['empty top-level body', '', top, '7bit'],
+        ['empty nested body', '', nested, '7bit'],
+        ['line of exactly 76 characters', 'a'.repeat(76) + '\r\n', top, '7bit'],
+        ['line of 77 characters', 'a'.repeat(77) + '\r\n', top, 'quoted-printable'],
+        ['top-level line of 76 characters without a final break', 'a'.repeat(76), top, 'quoted-printable'],
+        // No mbox or SMTP special case: dot-stuffing is transparent and "From " is ordinary text.
+        ['line starting with From', 'Hi\r\nFrom me\r\n', top, '7bit'],
+        ['lone dot line', 'Hi\r\n.\r\nBye', nested, '7bit'],
+        ['line starting with a dot', '.hidden\r\n', top, '7bit'],
+        ['From without a space', 'Fromage\r\n', top, '7bit'],
+        ['trailing space', 'Hi \r\nthere\r\n', top, 'quoted-printable'],
+        ['trailing tab', 'Hi\t\r\n', nested, 'quoted-printable'],
+        ['inner tab', 'a\tb\r\n', top, '7bit'],
+        ['control character', 'bell\u0007 rings\r\n', top, 'quoted-printable'],
+        ['NUL', 'a\0b\r\n', top, 'quoted-printable'],
+        ['equals sign', 'a = b\r\n', top, '7bit'],
+        ['mostly ASCII Latin text', 'Résumé attached; see the café notes for details\r\n', top, 'quoted-printable'],
+        ['dense Latin text, where base64 is smaller', 'Résumé café, déjà vu — naïve coöperation\r\n', top, 'base64'],
+        ['mostly ASCII with an emoji', 'Status: all good 🌍 thanks for asking\r\n', top, 'quoted-printable'],
+        ['CJK text', '新しい本文です。二行目です。'.repeat(10), top, 'base64'],
+        ['emoji text', '🌍🎉'.repeat(20), nested, 'base64'],
+    ];
+    test.each(choices)('%s', (_name, text, placement, encoding) => {
+        const content = Buffer.from(text);
+        const result = textTransfer(content, placement);
+        expect(result.encoding).toBe(encoding);
+        expect(decodeTransfer(result.encoding, result.body).equals(content)).toBe(true);
+        expect(textTransfer(Buffer.from(text), placement).body.equals(result.body)).toBe(true);
+        if (placement.topLevel && result.encoding !== 'base64') { expect(result.body.length === 0 || result.body.subarray(-2).toString() === '\r\n').toBe(true); }
+        // Quoted-printable is the library's encoding; only the top-level soft end is appended.
+        if (result.encoding === 'quoted-printable') {
+            const softEnd = placement.topLevel && !text.endsWith('\r\n');
+            expect(result.body.toString('latin1')).toBe(qpWrap(qpEncode(content), softEnd ? 75 : 76) + (softEnd ? '=\r\n' : ''));
+        }
+    });
+    test('a visible body never carries a delimiter line of a retained multipart', () => {
+        const avoid = [Buffer.from('--mixed-B')];
+        for (const text of ['x\r\n--mixed-B\r\ny\r\n', 'é\r\n--mixed-B--\r\n']) {
+            const content = Buffer.from(text);
+            expect(textTransfer(content, { topLevel: false, avoid: [] }).encoding).not.toBe('base64');
+            const avoided = textTransfer(content, { topLevel: false, avoid });
+            expect(avoided.encoding).toBe('base64');
+            expect(decodeTransfer('base64', avoided.body).equals(content)).toBe(true);
+        }
+    });
+    test('property: every selected encoding decodes exactly, stays within 76 columns, and a top-level part ends in CRLF', () => {
+        // Deterministic pseudo-random documents over the awkward pieces: every printable
+        // ASCII punctuation character, space, tab, CRLF, NUL, non-ASCII and astral text.
+        const punctuation = Array.from({ length: 95 }, (_unused, index) => String.fromCharCode(32 + index)).filter(char => /[!-/:-@[-`{-~]/u.test(char));
+        expect(punctuation).toHaveLength(32);
+        const pieces = ['a', 'Z', '0', ' ', '\t', 'F', 'From ', '.', '\r\n', '\r\n\r\n', 'é', '你', '🌍', '\0', 'x'.repeat(70), ' '.repeat(80), ...punctuation];
+        const next = xorshift(0x2545f491);
+        const documents = new Set<string>(), seen = new Set<string>();
+        for (let round = 0; round < 400; round++) {
+            let text = '';
+            for (let count = next() % 300; count > 0; count--) { text += pieces[next() % pieces.length]; }
+            documents.add(text);
+            const content = Buffer.from(text);
+            for (const topLevel of [false, true]) {
+                const { encoding, body } = textTransfer(content, { topLevel, avoid: [] });
+                seen.add(encoding);
+                expect(decodeTransfer(encoding, body).equals(content)).toBe(true);
+                expect(textTransfer(Buffer.from(text), { topLevel, avoid: [] }).body.equals(body)).toBe(true);
+                for (const line of body.toString('latin1').split('\r\n')) { expect(line.length).toBeLessThanOrEqual(76); }
+                if (topLevel && encoding !== 'base64' && content.length) { expect(body.subarray(-2).toString()).toBe('\r\n'); }
+            }
+        }
+        // Guards the generator itself: a degenerate PRNG would silently shrink coverage.
+        expect(documents.size).toBeGreaterThanOrEqual(390);
+        expect([...seen].sort()).toEqual(['7bit', 'base64', 'quoted-printable']);
+    });
+    test('the strict quoted-printable test decoder accepts only a CRLF-terminated soft break', () => {
+        const decode = (text: string) => decodeTransfer('quoted-printable', Buffer.from(text, 'latin1')).toString('latin1');
+        expect(decode('abc=\r\n')).toBe('abc');
+        expect(decode('abc=\r\ndef')).toBe('abcdef');
+        expect(decode('a=3D')).toBe('a=');
+        for (const dangling of ['abc=', '=', 'abc\r\ndef=', 'abc=\r\ndef=']) { expect(() => decode(dangling)).toThrow(); }
+        // Uppercase hexadecimal only, and two digits are required after "=".
+        for (const bad of ['=3d', 'a=3', 'a=3\r\nb', 'a=G0', 'a= 0', 'a=\rb']) { expect(() => decode(bad)).toThrow(); }
+    });
+    test('encoding is linear on the largest bodies', () => {
+        const started = performance.now();
+        for (const unit of ['é', 'a', '=', ' ', '🌍', 'é a b c d e ']) { textTransfer(Buffer.from(unit.repeat(Math.floor(256 * 1024 / Buffer.byteLength(unit)))), { topLevel: true, avoid: [] }); }
+        expect(performance.now() - started).toBeLessThan(5000);
+    });
+    test.each([
+        ['ASCII with a final break', 'Hello\nworld\n', '7bit'],
+        ['ASCII without a final break', 'Hello\nworld', 'quoted-printable'],
+        ['empty', '', '7bit'],
+        ['Latin', 'Résumé attached for review', 'quoted-printable'],
+        ['CJK', '新しい本文です。\n二行目です。', 'base64'],
+    ] as const)('single-part %s text ends the message with LF and decodes exactly', async (_name, text, encoding) => {
+        const created = await createMime({ ...fresh, body: { text, html: null } });
+        const patched = await preparePatch(await inspectSource(Buffer.from(rootHeaders + plain())), { body: { text, html: null } });
+        for (const candidate of [created, patched]) {
+            // WildDuck only appends CRLF to a message whose last byte is not LF.
+            expect(candidate.raw.at(-1)).toBe(10);
+            const [part] = authoredParts(candidate.raw);
+            expect(part?.encoding).toBe(encoding);
+            expect(part?.text).toBe(text.replaceAll('\n', '\r\n'));
+        }
+    });
+    test('nested parts decode exactly with and without a final break, including a formerly empty part', async () => {
+        for (const text of ['line one\nline two', 'line one\nline two\n', 'é\n', 'x']) {
+            const expected = text.replaceAll('\n', '\r\n');
+            const alternative = await createMime({ ...fresh, body: { text, html: `<p>${text}</p>` } });
+            expect(authoredText(alternative.raw, 'text/plain')).toEqual([expected]);
+            const inRich = await preparePatch(await inspectSource(rich()), { body: { text, html: null } });
+            expect(authoredText(inRich.raw, 'text/plain')).toEqual([expected]);
+            const empty = Buffer.from(rootHeaders + 'Content-Type: multipart/mixed; boundary="x"\r\n\r\n--x\r\n' + plain('') + '--x\r\n' + pdf() + '\r\n--x--\r\n');
+            const replaced = await preparePatch(await inspectSource(empty), { body: { text, html: null } });
+            expect(authoredText(replaced.raw, 'text/plain')).toEqual([expected]);
+            expect((await inspectSource(replaced.raw)).attachments).toHaveLength(1);
+            const wrapped = await preparePatch(await inspectSource(Buffer.from(rootHeaders + plain())), { body: { text, html: null }, attachments: [{ filename: 'a.bin', contentType: 'application/octet-stream', contentBase64: 'AA==', disposition: 'attachment' }] });
+            expect(authoredText(wrapped.raw, 'text/plain')).toEqual([expected]);
+        }
+    });
+    test('a replacement body containing a retained delimiter line falls back to base64', async () => {
+        const text = 'quoted\n--mixed-B\nnot a delimiter\n';
+        const patched = await preparePatch(await inspectSource(rich()), { body: { text, html: '<p>--related-B</p>' } });
+        expect(authoredParts(patched.raw).map(part => part.encoding)).toEqual(['base64', 'base64']);
+        expect(authoredText(patched.raw, 'text/plain')).toEqual([text.replaceAll('\n', '\r\n')]);
+        expect((await inspectSource(patched.raw)).attachments).toHaveLength(4);
+    });
+});
+
+describe('drafts authored by 0.6.x (base64 text parts, B-encoded subject)', () => {
+    const wrap = (text: string) => Buffer.from(text).toString('base64').match(/.{1,76}/gu)?.join('\r\n') ?? '';
+    const legacySubject = `Subject: =?UTF-8?B?${Buffer.from('Résumé — 你好').toString('base64')}?=\r\n`;
+    const legacyHeaders = rootHeaders.replace('Subject: Old\r\n', legacySubject);
+    const legacyPart = (type: string, text: string) => `Content-Type: ${type}; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n${wrap(text)}`;
+    const sources = {
+        single: Buffer.from(legacyHeaders + legacyPart('text/plain', 'Old plain\r\nbody') + '\r\n'),
+        alternative: Buffer.concat([Buffer.from(legacyHeaders), multi('alternative', '=_mcp_0123456789abcdef0123456789abcdef', [legacyPart('text/plain', 'Old plain'), legacyPart('text/html', '<p>Old</p>')])]),
+    };
+    test.each(Object.entries(sources))('%s source can be inspected, header-patched byte-identically and body-patched', async (_name, raw) => {
+        const inspected = await inspectSource(raw);
+        const headerOnly = await preparePatch(inspected, { to: [{ address: 'new@example.test' }] });
+        expect(bodyOf(headerOnly.raw).equals(bodyOf(raw))).toBe(true);
+        expect(headerOnly.raw.includes(Buffer.from(legacySubject))).toBe(true);
+        const renamed = await preparePatch(inspected, { subject: 'Plain new subject' });
+        expect(bodyOf(renamed.raw).equals(bodyOf(raw))).toBe(true);
+        expect(renamed.raw.toString()).toContain('Subject: Plain new subject\r\n');
+        const body = await preparePatch(inspected, { body: { text: 'New plain\nbody', html: '<p>New</p>' } });
+        expect(authoredParts(body.raw).map(part => [part.type, part.encoding, part.text])).toEqual([['text/plain', '7bit', 'New plain\r\nbody'], ['text/html', '7bit', '<p>New</p>']]);
+        expect(body.raw.includes(Buffer.from(legacySubject))).toBe(true);
+        expect(body.raw.at(-1)).toBe(10);
+        // The patched draft is itself a supported source for the next edit.
+        const again = await preparePatch(await inspectSource(body.raw), { body: { text: 'Third', html: null } });
+        expect(authoredText(again.raw, 'text/plain')).toEqual(['Third']);
+        for (const candidate of [headerOnly, renamed, body, again]) { verifyCandidate(candidate, Buffer.from(candidate.raw)); }
     });
 });

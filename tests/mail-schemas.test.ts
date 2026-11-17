@@ -107,6 +107,28 @@ test('body JSON Schema is an anyOf of three strict single-key objects, each desc
         expect(schema.anyOf[0]?.properties.markdown?.description).toContain('Preferred');
     }
 });
+test('subjects reject every C0 control and DEL up front with a clear message, and nothing else', () => {
+    const target = { uid: 1, expected_version: 'a'.repeat(43), operation_id: 'operation-id-0123456789' };
+    const messages = (result: { success: boolean; error?: { issues: { message: string }[] } }) => result.error?.issues.map(issue => issue.message) ?? [];
+    for (const subject of ['a\tb', 'a\u0001b', 'a\u007fb', 'a\u001fb', 'a\nb', 'a\rb', 'a\0b']) {
+        for (const result of [draftContentSchema.safeParse({ ...draft, subject }), mailInputSchemas.update_draft.safeParse({ ...target, subject })]) {
+            expect(result.success).toBe(false);
+            expect(messages(result)).toEqual(['Control characters are forbidden.']);
+        }
+    }
+    for (const subject of ['Plain', 'Résumé — 你好', '🌍 emoji 😀', 'double  space', ' leading and trailing ', '  ', '', 'a\u0080b\u009fc', 'a b']) {
+        expect(draftContentSchema.safeParse({ ...draft, subject }).success).toBe(true);
+        expect(mailInputSchemas.update_draft.safeParse({ ...target, subject }).success).toBe(true);
+    }
+    // Accepted subjects are normalised: edge whitespace trimmed, every internal whitespace run
+    // (Unicode spaces included) collapsed to one space; whitespace only becomes no subject.
+    for (const [subject, normalised] of [['double  space', 'double space'], [' leading and trailing ', 'leading and trailing'], ['  ', ''], ['a b', 'a b'], ['nbsp   run', 'nbsp run'], ['Plain', 'Plain'], ['a\u0080b\u009fc', 'a\u0080b\u009fc']] as const) {
+        expect(draftContentSchema.parse({ ...draft, subject }).subject).toBe(normalised);
+        expect(mailInputSchemas.update_draft.parse({ ...target, subject }).subject).toBe(normalised);
+    }
+    // The search filter is a query, not an authored header, so it keeps the shared header-text rule.
+    expect(mailInputSchemas.search_messages.safeParse({ subject: 'a\tb' }).success).toBe(true);
+});
 test('outbound headers reject injections and UTF-8 overflow while bodies preserve newlines', () => {
     for (const injection of ['hello\rX-Forged: yes', 'hello\nX-Forged: yes', 'hello\0suffix']) {
         expect(draftContentSchema.safeParse({ ...draft, subject: injection }).success).toBe(false);
@@ -124,7 +146,7 @@ test('attachment additions require canonical bounded base64, safe names/types an
     const parse = (attachments: unknown[]) => mailInputSchemas.create_draft.safeParse({ ...draft, operation_id, attachments });
     expect(parse([attachment]).success).toBe(true);
     for (const fields of [{ filename: '../file\nInjected' }, { filename: 'é'.repeat(128) }, { contentType: 'text/plain; charset=utf-8' }, { contentBase64: 'aGVsbG8' }, { contentBase64: 'aGVsbG8=\n' }, { contentBase64: 'Zh==' }, { disposition: 'inline' }, { url: 'https://example.invalid' }]) { expect(parse([{ ...attachment, ...fields }]).success).toBe(false); }
-    expect(parse([{ ...attachment, disposition: 'inline', cid: 'part@example.invalid' }]).success).toBe(true);
+    expect(parse([{ ...attachment, contentType: 'image/png', disposition: 'inline', cid: 'part@example.invalid' }]).success).toBe(true);
     expect(parse([{ ...attachment, cid: 'same' }, { ...attachment, cid: 'same' }]).success).toBe(false);
     const max = Buffer.alloc(MAX_ATTACHMENT_BYTES).toString('base64');
     expect(parse([{ ...attachment, contentBase64: max }]).success).toBe(true);
@@ -198,9 +220,15 @@ test('MailError accepts only sanitized codes without retaining raw causes or det
     expect(Object.keys(error).sort()).toEqual(['code', 'name']); expect(error.cause).toBeUndefined(); expect(JSON.stringify(error)).not.toContain('private');
 });
 
-test('recipient validation exactly matches pinned existing API predicate and never drops invalid entries', () => {
-    const addresses = ['a@example.invalid', 'a@example.c', 'é@example.invalid', 'a@éxample.invalid', 'a..b@example.invalid', 'a@b', 'x'.repeat(65) + '@example.invalid', 'a@' + 'x'.repeat(64) + '.invalid', 'a@example.invalid\r\nBcc: injected@example.invalid'];
-    for (const address of addresses) { expect(inputAddressSchema.safeParse({ address }).success).toBe(isEmailValid(address, { tlds: false } as unknown as Parameters<typeof isEmailValid>[1])); }
+test('recipient validation is the pinned existing API predicate intersected with ASCII addresses, and never drops invalid entries', () => {
+    const addresses = ['a@example.invalid', 'a@example.c', 'é@example.invalid', 'a@éxample.invalid', 'a@xn--xample-9ua.invalid', 'a..b@example.invalid', 'a@b', 'x'.repeat(65) + '@example.invalid', 'a@' + 'x'.repeat(64) + '.invalid', 'a@example.invalid\r\nBcc: injected@example.invalid'];
+    const ascii = /^[\x21-\x7e]+$/u;
+    for (const address of addresses) { expect(inputAddressSchema.safeParse({ address }).success).toBe(isEmailValid(address, { tlds: false } as unknown as Parameters<typeof isEmailValid>[1]) && ascii.test(address)); }
+    // An address the API predicate accepts but the MIME layer cannot write gets its own message.
+    for (const address of ['é@example.invalid', 'a@éxample.invalid', '日本@example.invalid']) {
+        expect(isEmailValid(address, { tlds: false } as unknown as Parameters<typeof isEmailValid>[1])).toBe(true);
+        expect(inputAddressSchema.safeParse({ address }).error?.issues.map(issue => issue.message)).toEqual(['Only ASCII email addresses are supported; write an internationalised domain in its xn-- form.']);
+    }
     const invalid = 'x'.repeat(65) + '@example.invalid';
     for (const field of ['to', 'cc', 'bcc', 'replyTo'] as const) {
         const recipients = [{ address: 'valid@example.invalid' }, { address: invalid }];

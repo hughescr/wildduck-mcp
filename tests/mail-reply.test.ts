@@ -1,6 +1,10 @@
 import { describe, expect, test } from 'bun:test';
+import libmime from 'libmime';
 import { deriveReply, type ReplyInput, type ReplyOriginal } from '../src/mail/reply';
-import { createMime, inspectSource, preparePatch, MimeError } from '../src/mail/mime';
+import { createMime, inspectSource, preparePatch, MimeError, type MimeAddress } from '../src/mail/mime';
+import { draftContentSchema, inputAddressSchema } from '../src/mail/schemas';
+import { authoredText } from './mime-text';
+import { decodedAddresses } from './mime-fields';
 
 const original: ReplyOriginal = {
     from: [{ address: 'author@example.test', name: 'Author' }], replyTo: [{ address: 'help@example.test', name: 'Help' }],
@@ -89,9 +93,8 @@ describe('reply derivation', () => {
         expect(reply.body.html).not.toMatch(/white-space|<pre|font-family/);
         expect(reply.body.text).toBe('My response\n\n>   name    count\n>   alpha   12\n> \n> \tindented & <literal>\n> ');
         const created = await createMime({ from: { address: 'me@example.test' }, ...reply });
-        const encoded = /Content-Type: text\/html; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n([A-Za-z0-9+/=\r\n]*)/u.exec(created.raw.toString('latin1'))?.[1];
-        expect(encoded).toBeDefined();
-        const storedHtml = Buffer.from(encoded ?? '', 'base64').toString('utf8');
+        const [storedHtml = ''] = authoredText(created.raw, 'text/html');
+        expect(authoredText(created.raw, 'text/html')).toHaveLength(1);
         expect(storedHtml).toBe(expected.replaceAll('\n', '\r\n'));
         // Explicit breaks do not depend on client white-space CSS support.
         expect(storedHtml.match(/<br>/g)).toHaveLength(4);
@@ -112,6 +115,22 @@ describe('reply derivation', () => {
         const literal = deriveReply({ ...input, quoteOriginal: true, original: { ...original, text: `&nbsp; <br> "double" 'single'` } });
         expect(literal.body.html).toEndWith(`${quoteOpen}&amp;nbsp; &lt;br&gt; &quot;double&quot; &#39;single&#39;</blockquote>`);
     });
+    test('the original subject is sanitised to what the schema accepts and the derived subject always authors', async () => {
+        for (const [subject, expected] of [
+            ['Tab\tseparated', 'Re: Tab separated'], ['control\u0001', 'Re: control'], ['a\u007fb', 'Re: a b'], ['x\0\u0001\u001fy', 'Re: x y'],
+            ['Injected\r\nBcc: bad@example.test', 'Re: Injected Bcc: bad@example.test'], ['re:\tThread', 're: Thread'], ['RE:\u0002', 'RE:'], ['', 'Re:'],
+            ['lone \ud800 surrogate', 'Re: lone � surrogate'], ['  spaced   out  ', 'Re: spaced out'], ['=?UTF-8?B?SGk=?= price', 'Re: = ?UTF-8?B?SGk= ?= price'], ['a=?b=?=?', 'Re: a= ?b= ?= ?'],
+            ['x'.repeat(2000), 'Re: ' + 'x'.repeat(900) + ' ' + 'x'.repeat(900) + ' ' + 'x'.repeat(200)], ['é'.repeat(1024), 'Re: ' + 'é'.repeat(1022)],
+        ] as const) {
+            const result = deriveReply({ ...input, original: { ...original, subject } });
+            expect(result.subject).toBe(expected);
+            // The schema accepts it unchanged, so a draft update with this subject would author the same bytes.
+            expect(draftContentSchema.parse({ subject: result.subject, body: { text: 'x' } }).subject).toBe(expected);
+            const created = await createMime({ from: { address: 'me@example.test' }, ...result });
+            const line = /^Subject:((?:.*\r\n[ \t])*.*)\r\n/mu.exec(created.raw.toString('latin1'))?.[1] ?? '';
+            expect(libmime.decodeWords(line.replaceAll(/\s*\r\n[ \t]/gu, ' ').trim())).toBe(expected);
+        }
+    });
     test('rejects malformed and injected inspected headers or derived recipients', () => {
         for (const messageId of [null, '', '<a@example.test>\r\nBcc: evil@example.test', '<a@example.test> <b@example.test>', '<a..b@example.test>', 'bare@example.test', '<a@exa mple.test>', '<a@example.test>\0']) {
             expect(() => deriveReply({ ...input, original: { ...original, messageId } })).toThrow(MimeError);
@@ -119,13 +138,35 @@ describe('reply derivation', () => {
         for (const id of ['<a@example.test>\nX-Evil: 1', 'not-an-id', '<a@example.test> <b@example.test>']) {
             expect(() => deriveReply({ ...input, original: { ...original, references: [id] } })).toThrow(MimeError);
         }
-        for (const subject of ['Injected\r\nBcc: bad@example.test', 'control\u0001']) {
-            expect(() => deriveReply({ ...input, original: { ...original, subject } })).toThrow(MimeError);
-        }
-        for (const recipient of [{ address: 'bad@example.test\r\nX: injected' }, { address: 'good@example.test', name: 'bad\nname' }, { address: 'not-an-email' }]) {
+        // Derived recipient addresses are never rewritten or dropped: one the MIME layer cannot write
+        // (including a non-ASCII address) fails the reply.
+        for (const recipient of [{ address: 'bad@example.test\r\nX: injected' }, { address: 'not-an-email' }, { address: 'jürgen@example.test' }, { address: 'a@bücher.example' }]) {
             expect(() => deriveReply({ ...input, recipients: { to: [recipient], cc: [] } })).toThrow(MimeError);
             expect(() => deriveReply({ ...input, original: { ...original, replyTo: [recipient] } })).toThrow(MimeError);
         }
+        // Explicit caller recipients are never rewritten: an unencodable display name fails.
+        expect(() => deriveReply({ ...input, recipients: { to: [{ address: 'good@example.test', name: 'bad\nname' }], cc: [] } })).toThrow(MimeError);
+    });
+    test('display names derived from the original are sanitised to what the schema accepts instead of failing the reply', async () => {
+        const names = ['bad\nname', 'tab\t\tsplit', 'lone \ud800 surrogate', 'é'.repeat(200), 'Smith, "J" (=?x?)', ' padded ', '日本語', '=?UTF-8?B?SGk=?=', 'a'.repeat(319) + ' b', '\u0001\u0002'];
+        for (const name of names) {
+            const derived = deriveReply({ ...input, mode: 'reply_all', original: { ...original, replyTo: [{ address: 'help@example.test', name }], to: [{ address: 'other@example.test', name }], cc: [{ address: 'copy@example.test', name }] } });
+            for (const recipient of [...derived.to, ...derived.cc]) {
+                // Exactly what the schema would produce from it, so it authors and reads back.
+                const reparsed: MimeAddress = inputAddressSchema.parse(recipient);
+                expect(reparsed).toEqual(recipient);
+            }
+            const created = await createMime({ from: { address: 'me@example.test' }, ...derived });
+            expect(decodedAddresses(created.raw, 'To')).toEqual(derived.to.map(entry => ({ address: entry.address, name: entry.name ?? '' })));
+        }
+        const read = (name: string) => deriveReply({ ...input, original: { ...original, replyTo: [{ address: 'help@example.test', name }] } }).to[0];
+        expect(read('Smith, "J" (=?x?)')?.name).toBe('Smith, "J" (= ?x?)');
+        expect(read('bad\r\n\tname')?.name).toBe('bad name');
+        expect(read(' padded ')?.name).toBe('padded');
+        expect(read('é'.repeat(200))?.name).toBe('é'.repeat(160));
+        expect(read('a'.repeat(319) + ' b')?.name).toBe('a'.repeat(319));
+        // A name that sanitises to nothing means no name.
+        expect(read('\u0001\u0002')).toEqual({ address: 'help@example.test' });
     });
     test('rejects too many or oversized references without silently breaking threading', () => {
         const references = Array.from({ length: 100 }, (_, index) => `<ref-${index}@example.test>`);
@@ -150,8 +191,7 @@ describe('reply derivation', () => {
         expect((await inspectSource(patched.raw)).attachments).toHaveLength(1);
     });
     test('quoted replies reach the stored MIME with CRLF-only text and HTML, whatever line endings were supplied', async () => {
-        const decode = (raw: Buffer, type: string) => [...raw.toString('latin1').matchAll(new RegExp(`Content-Type: ${type.replace('/', '\\/')}; charset=utf-8\\r\\nContent-Transfer-Encoding: base64\\r\\n\\r\\n([A-Za-z0-9+/=\\r\\n]*)`, 'gu'))]
-            .map(match => Buffer.from((match[1] ?? '').replaceAll('\r\n', ''), 'base64').toString('utf8'));
+        const decode = authoredText;
         const mixedOriginal = { ...original, text: 'first\r\nsecond\nthird\rfourth' };
         for (const body of [{ text: 'My\nresponse', html: '<p>My\nresponse</p>' }, { text: 'My\r\nresponse', html: '<p>My\rresponse</p>' }]) {
             const reply = deriveReply({ ...input, original: mixedOriginal, body, quoteOriginal: true });

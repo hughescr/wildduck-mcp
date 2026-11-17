@@ -4,14 +4,20 @@ import { pipeline } from 'node:stream/promises';
 import { Splitter, Joiner, type MimeNode, type SplitterChunk } from '@zone-eu/mailsplit';
 import AddressParser from 'nodemailer/lib/addressparser';
 import Builder from 'nodemailer/lib/mime-node';
-import { parseHeaderValue, encodeWord } from 'nodemailer/lib/mime-funcs';
+import { parseHeaderValue } from 'nodemailer/lib/mime-funcs';
+import { encode as qpEncode, wrap as qpWrap } from 'nodemailer/lib/qp';
+import libmime from 'libmime';
 
 /** Bounded supported subset: CRLF MIME headers/delimiters; UTF-8/ASCII text;
  * one plain, HTML, or direct plain+HTML alternative inside ordinary related/mixed
  * wrappers. Other sibling leaves are opaque attachments (including calendar and
  * message/rfc822). Unsupported structure/semantics fail closed before upload.
  * Request-local only. Never persist/log source, candidates, or inspection handles. */
-export const MIME_LIMITS = Object.freeze({ sourceBytes: 4 * 1024 * 1024, attachmentBytes: 2 * 1024 * 1024, headerBytes: 64 * 1024, totalHeaderBytes: 256 * 1024, nodes: 128, depth: 12 });
+// The header limits admit every schema-valid draft as the library writes it (measured): 151
+// mailboxes (From, 50 Reply-To, 100 recipients) with 320-byte names that Q-encode at their
+// largest and 254-character addresses fill about 179 KB of root headers, and 100 attachments
+// with 255-byte names, types and CIDs about 217 KB of part headers.
+export const MIME_LIMITS = Object.freeze({ sourceBytes: 4 * 1024 * 1024, attachmentBytes: 2 * 1024 * 1024, headerBytes: 192 * 1024, totalHeaderBytes: 448 * 1024, nodes: 128, depth: 12 });
 export class MimeError extends Error {
     constructor(public readonly code: 'unsupported_mime' | 'invalid_mime_patch' | 'mime_limit' | 'mime_verification_failed') { super(code); this.name = 'MimeError'; }
 }
@@ -49,7 +55,43 @@ function headerControls(value: string, folding = false): boolean {
 }
 const TOKEN = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/u;
 const MEDIA = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+\/[A-Za-z0-9!#$%&'*+.^_`|~-]+$/u;
-const EMAIL = /^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/u;
+/** The ASCII addresses this layer writes and reads: dot-atom local part, ASCII domain. */
+export const EMAIL = /^[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?$/u;
+/** Bounds and syntax of caller-supplied fields, shared with the public schemas (schemas.ts) so
+ * a schema can accept nothing this layer rejects: every byte bound counts UTF-8; a Content-ID
+ * is the dot-atom/atext set (plus "@") that inspectSource also reads. */
+export const AUTHORED_LIMITS = Object.freeze({ addressBytes: 320, nameBytes: 320, subjectBytes: 2048, filenameBytes: 255, contentTypeBytes: 255, cidBytes: 255 });
+export const CONTENT_ID = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~@-]+$/u;
+/** type/subtype of an attachment: no parameters, and the types this layer has no safe
+ * single-part representation for are excluded (multipart needs a boundary; only message/rfc822
+ * has an identity-encoded implementation). */
+export const ATTACHMENT_MEDIA = /^(?!multipart\/)(?!message\/(?!rfc822$))[A-Za-z0-9!#$%&'*+.^_`|~-]+\/[A-Za-z0-9!#$%&'*+.^_`|~-]+$/iu;
+/** A text/plain or text/html part inside multipart/related is read back as the body, so an
+ * inline one is ambiguous. */
+export const AMBIGUOUS_INLINE = /^text\/(?:plain|html)$/iu;
+/** True when an HTML tag has an attribute value that starts with an attachment:ATTn URL, the
+ * WildDuck JSON API's reference syntax. A raw upload resolves nothing, so such an image or
+ * link would stay broken; prose that merely mentions "attachment:ATT1" is ordinary text.
+ * One linear pass: tag by tag, no backtracking pattern. */
+export function hasAttachmentReference(html: string): boolean {
+    for (let open = html.indexOf('<'); open >= 0;) {
+        const close = html.indexOf('>', open + 1);
+        const end = close < 0 ? html.length : close;
+        for (let equals = html.indexOf('=', open + 1); equals >= 0 && equals < end; equals = html.indexOf('=', equals + 1)) {
+            let at = equals + 1;
+            while (at < end && /\s/u.test(html[at] ?? '')) { at++; }
+            if (html[at] === '"' || html[at] === "'") { at++; while (at < end && /\s/u.test(html[at] ?? '')) { at++; } }
+            if (/^attachment:ATT[0-9]/iu.test(html.slice(at, at + 15))) { return true; }
+        }
+        open = close < 0 ? -1 : html.indexOf('<', close + 1);
+    }
+    return false;
+}
+/** message/rfc822 uses identity encodings, so its bytes must be CRLF-canonical already. */
+export function hasBareLineFeed(bytes: Uint8Array): boolean {
+    for (let i = 0; i < bytes.length; i++) { if (bytes[i] === 10 && (i === 0 || bytes[i - 1] !== 13)) { return true; } }
+    return false;
+}
 // Deliberately bounded dot-atom subset of RFC message-id; no comments, folding or recovery.
 const MESSAGE_ID = /^<[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*@[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?>$/u;
 export function validateMessageId(value: string): void {
@@ -83,7 +125,9 @@ function headersAt(raw: Buffer, start: number, end: number): { headers: Header[]
             const previous = headers.at(-1);
             requireMime(previous);
             previous.raw = raw.subarray(offset - previous.raw.length, offset + length);
-            previous.value += ' ' + line.trim();
+            // One space per fold, as WildDuck unfolds; trimmed, since the library starts a long
+            // first word on a continuation line ("Subject:" CRLF " word").
+            previous.value = (previous.value + ' ' + line.trim()).trim();
         } else {
             const colon = line.indexOf(':');
             requireMime(colon > 0 && TOKEN.test(line.slice(0, colon)));
@@ -272,7 +316,9 @@ export async function inspectSource(input: Uint8Array, attachmentBindings: reado
         part.type = contentType.value; part.params = contentType.params;
         const dispositionValue = get(part, 'content-disposition');
         if (dispositionValue) {requireMime(['inline', 'attachment'].includes(structured(dispositionValue).value));}
-        requireMime(!/^(?:multipart\/(?:signed|encrypted)|application\/(?:x-)?(?:pkcs7|pgp))/u.test(part.type));
+        // Signed and encrypted trees cannot be patched. A PGP key or S/MIME signature file
+        // attached to an ordinary message is an opaque leaf; as the body it fails the text check.
+        requireMime(!/^multipart\/(?:signed|encrypted)/u.test(part.type));
         const cid = get(part, 'content-id');
         if (cid) {
             requireMime(/^<[A-Za-z0-9.!#$%&'*+/=?^_`{|}~@-]+>$/u.test(cid));
@@ -377,26 +423,40 @@ function builder(): Builder { return new Builder(undefined, { keepBcc: true, dis
 export function validateMimeAddresses(list: readonly MimeAddress[]): void {
     requireMime(Array.isArray(list) && list.length <= 100, 'invalid_mime_patch');
     for (const address of list) {
-        safeText(address.address, 320); requireMime(EMAIL.test(address.address) && !address.address.includes('..'), 'invalid_mime_patch');
-        if (address.name !== undefined) { safeText(address.name, 320); requireMime(!/=\?[^?]+\?[bq]\?/iu.test(address.name), 'invalid_mime_patch'); }
+        safeText(address.address, AUTHORED_LIMITS.addressBytes); requireMime(EMAIL.test(address.address) && !address.address.includes('..'), 'invalid_mime_patch');
+        if (address.name !== undefined) { safeText(address.name, AUTHORED_LIMITS.nameBytes); }
     }
 }
+/** The library lowers the domain of the ASCII addresses this layer admits and changes nothing else. */
+const lowerDomain = (address: string) => address.slice(0, address.lastIndexOf('@') + 1) + address.slice(address.lastIndexOf('@') + 1).toLowerCase();
+/** Read-back safety net, not an encoder: a Subject or address header the library wrote must
+ * decode, as WildDuck and mail clients read it (unfolded, then nodemailer's address parser and
+ * libmime's RFC 2047 decoder), to exactly the requested value. No header for an empty value. */
+function readsBack(header: Header | undefined, value: string | MimeAddress | readonly MimeAddress[]): boolean {
+    if (typeof value === 'string') { return value ? libmime.decodeWords(header?.value ?? '') === value : header === undefined; }
+    const list: readonly MimeAddress[] = Array.isArray(value) ? value : [value as MimeAddress];
+    if (list.length === 0) { return header === undefined; }
+    const read = AddressParser(header?.value ?? '');
+    return read.length === list.length && read.every((entry, index) => entry.address === lowerDomain(list[index]?.address ?? '') && libmime.decodeWords(entry.name ?? '') === (list[index]?.name ?? ''));
+}
+const CHECKED_HEADERS = new Set(['subject', 'from', 'reply-to', 'to', 'cc', 'bcc']);
 function generatedHeaders(values: Record<string, string | MimeAddress | readonly MimeAddress[]>): Map<string, Buffer | null> {
     const node = builder();
     for (const [key, value] of Object.entries(values)) {
-        if (typeof value === 'string') {safeText(value, 2048);}
+        if (typeof value === 'string') {safeText(value, AUTHORED_LIMITS.subjectBytes);}
         else {
             const list = Array.isArray(value) ? value : [value as MimeAddress];
             validateMimeAddresses(list);
         }
-        node.setHeader(key, typeof value === 'string' ? key === 'Subject' && value ? encodeWord(value, 'B', 52) : value : Array.isArray(value) ? [...value] : value as MimeAddress);
+        node.setHeader(key, typeof value === 'string' ? value : Array.isArray(value) ? [...value] : value as MimeAddress);
     }
     // Read only requested fields from the library's safe builder. Its generated Date,
     // Message-ID, MIME-Version, and Content-Type must never replace source headers.
     const bytes = Buffer.from(node.buildHeaders() + '\r\n\r\n');
     const parsed = headersAt(bytes, 0, bytes.length).headers;
-    return new Map(Object.keys(values).map(key => {
+    return new Map(Object.entries(values).map(([key, value]) => {
         const header = parsed.find(item => item.key === key.toLowerCase());
+        if (CHECKED_HEADERS.has(key.toLowerCase())) { requireMime(readsBack(header, value), 'invalid_mime_patch'); }
         return [key.toLowerCase(), header?.raw ?? null];
     }));
 }
@@ -422,13 +482,59 @@ function newBoundary(chunks: readonly Buffer[]): string {
 }
 interface Entity { headers: Buffer; body: Buffer; type: string }
 function serialize(entity: Entity): Buffer { return Buffer.concat([entity.headers, entity.body]); }
+const CRLF = Buffer.from('\r\n');
+const endsWithCrlf = (bytes: Buffer) => bytes.length >= 2 && bytes[bytes.length - 2] === 13 && bytes[bytes.length - 1] === 10;
+/** Where an authored text part sits. A top-level part ends the message, and WildDuck
+ * appends CRLF to a message whose last byte is not LF (imap-core parse-mime-tree.js),
+ * so such a part must end with CRLF itself; a nested part's final line break belongs
+ * to the next delimiter. `avoid` lists delimiter lines of enclosing retained
+ * multiparts that a visible (7bit or quoted-printable) body must not contain. */
+export interface TextPlacement { readonly topLevel: boolean; readonly avoid: readonly Buffer[] }
+/** 7bit only for CRLF-canonical printable ASCII (plus tab) whose lines are at most
+ * 76 characters, without trailing whitespace that a relay could strip. */
+function sevenBitSafe(content: Buffer): boolean {
+    for (let start = 0; start < content.length;) {
+        let end = content.indexOf(CRLF, start);
+        const next = end < 0 ? content.length : end + 2;
+        if (end < 0) { end = content.length; }
+        if (end - start > 76) { return false; }
+        for (let i = start; i < end; i++) {
+            const byte = content[i] ?? 0;
+            if ((byte < 32 && byte !== 9) || byte > 126) { return false; }
+        }
+        const last = content[end - 1];
+        if (end > start && (last === 32 || last === 9)) { return false; }
+        start = next;
+    }
+    return true;
+}
+const SOFT_BREAK = Buffer.from('=\r\n');
+/** Choose the transfer encoding of one CRLF-canonical UTF-8 text body: 7bit when
+ * safe, else the library's quoted-printable when no larger than base64, else base64. */
+export function textTransfer(content: Buffer, placement: TextPlacement): { encoding: '7bit' | 'quoted-printable' | 'base64'; body: Buffer } {
+    const visible = (body: Buffer) => placement.avoid.every(marker => !body.includes(marker));
+    const complete = content.length === 0 || endsWithCrlf(content);
+    if ((complete || !placement.topLevel) && sevenBitSafe(content) && visible(content)) { return { encoding: '7bit', body: content }; }
+    // Compare stored sizes: a top-level base64 body also gets its final CRLF appended.
+    const base64Characters = Math.ceil(content.length / 3) * 4;
+    const base64Bytes = base64Characters + 2 * Math.max(Math.ceil(base64Characters / 76) - 1, 0) + (placement.topLevel && base64Characters > 0 ? 2 : 0);
+    // A top-level part ends the message, and a message must end in LF (see TextPlacement), so
+    // text without a final line break ends with a soft line break "=" CRLF, which decodes to
+    // nothing. Wrapping at 75 leaves the last line room for that "=" within 76 columns.
+    const softEnd = placement.topLevel && !complete;
+    const wrapped = Buffer.from(qpWrap(qpEncode(content), softEnd ? 75 : 76), 'latin1');
+    const qp = softEnd ? Buffer.concat([wrapped, SOFT_BREAK]) : wrapped;
+    if (qp.length <= base64Bytes && visible(qp)) { return { encoding: 'quoted-printable', body: qp }; }
+    return { encoding: 'base64', body: encoded(content) };
+}
 /** Single choke point for every authored text/plain and text/html part (create,
  * reply with or without quote, and update body patches all pass through here).
  * RFC 2046 section 4.1.1 makes CRLF the canonical line break of text/* before
  * transfer encoding, so LF, CR, CRLF and mixed input all decode as CRLF. Size
  * limits were already enforced on the caller's string by validateMimeBody. */
-function textEntity(type: 'text/plain' | 'text/html', text: string): Entity {
-    return { headers: Buffer.from(`Content-Type: ${type}; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n`), body: encoded(Buffer.from(text.replace(/\r\n|\r|\n/gu, '\r\n'))), type };
+function textEntity(type: 'text/plain' | 'text/html', text: string, placement: TextPlacement): Entity {
+    const { encoding, body } = textTransfer(Buffer.from(text.replace(/\r\n|\r|\n/gu, '\r\n')), placement);
+    return { headers: Buffer.from(`Content-Type: ${type}; charset=utf-8\r\nContent-Transfer-Encoding: ${encoding}\r\n\r\n`), body, type };
 }
 function multipart(type: 'multipart/alternative' | 'multipart/mixed' | 'multipart/related', children: readonly Buffer[]): Entity {
     requireMime(children.length > 0);
@@ -441,13 +547,19 @@ function multipart(type: 'multipart/alternative' | 'multipart/mixed' | 'multipar
 export function validateMimeBody(body: MimeBody): void {
     requireMime(body && typeof body.text === 'string' && (body.html === null || typeof body.html === 'string'), 'invalid_mime_patch');
     requireMime(body.text.isWellFormed() && Buffer.byteLength(body.text) <= 128 * 1024, 'invalid_mime_patch');
-    requireMime(body.html === null || (body.html.isWellFormed() && Buffer.byteLength(body.html) <= 256 * 1024 && !/attachment:ATT[0-9]+/iu.test(body.html)), 'invalid_mime_patch');
+    requireMime(body.html === null || (body.html.isWellFormed() && Buffer.byteLength(body.html) <= 256 * 1024 && !hasAttachmentReference(body.html)), 'invalid_mime_patch');
 }
-function bodyEntity(body: MimeBody): Entity {
+/** `topLevel`: the body will be the whole message, unwrapped by any multipart. */
+function bodyEntity(body: MimeBody, topLevel: boolean, avoid: readonly Buffer[] = []): Entity {
     validateMimeBody(body);
-    const plain = textEntity('text/plain', body.text);
-    return body.html === null ? plain : multipart('multipart/alternative', [serialize(plain), serialize(textEntity('text/html', body.html))]);
+    const nested: TextPlacement = { topLevel: false, avoid };
+    const plain = textEntity('text/plain', body.text, body.html === null ? { topLevel, avoid } : nested);
+    return body.html === null ? plain : multipart('multipart/alternative', [serialize(plain), serialize(textEntity('text/html', body.html, nested))]);
 }
+/** WildDuck completes a top-level message whose last line lacks its break. Authored
+ * 7bit and quoted-printable top-level bodies already end in CRLF (or are empty, so
+ * the header separator ends the message); only base64 still needs one here. */
+function messageEnding(body: Buffer): Buffer { return body.length && !endsWithCrlf(body) ? CRLF : Buffer.alloc(0); }
 /** RFC 2046 message/rfc822 permits only identity encodings. Preserve supplied
  * file bytes; reject bare LF because Wildduck would normalize it on ingestion. */
 function messageEncoding(bytes: Buffer): '7bit' | '8bit' | 'binary' {
@@ -467,36 +579,49 @@ function messageEncoding(bytes: Buffer): '7bit' | '8bit' | 'binary' {
     if (previous === 13) { binary = true; }
     return binary ? 'binary' : eightBit ? '8bit' : '7bit';
 }
+/** The content headers of one attachment, written by the library. Read-back safety net, not
+ * an encoder: libmime, which mailsplit uses, must read the caller's file name back from both
+ * the Content-Disposition filename and the Content-Type name, plus the type, disposition and
+ * Content-ID. */
+function attachmentHeaders(filename: string, contentType: string, disposition: 'attachment' | 'inline', transferEncoding: string, cid: string | undefined): Header[] {
+    const node = new Builder(contentType, { filename, disableFileAccess: true, disableUrlAccess: true });
+    node.setHeader('Content-Disposition', disposition);
+    node.setHeader('Content-Transfer-Encoding', transferEncoding);
+    if (cid) {node.setHeader('Content-ID', `<${cid}>`);}
+    const rawHeaders = Buffer.from(node.buildHeaders() + '\r\n\r\n');
+    const headers = headersAt(rawHeaders, 0, rawHeaders.length).headers.filter(header => header.key.startsWith('content-'));
+    const value = (key: string) => headers.find(header => header.key === key)?.value ?? '';
+    const type = libmime.parseHeaderValue(value('content-type')), placement = libmime.parseHeaderValue(value('content-disposition'));
+    requireMime(headers.length === (cid ? 4 : 3) && type.value === contentType && placement.value === disposition && (cid === undefined || value('content-id') === `<${cid}>`)
+        && libmime.decodeWords(placement.params.filename ?? '') === filename && libmime.decodeWords(type.params.name ?? '') === filename, 'invalid_mime_patch');
+    return headers;
+}
 function attachmentEntities(attachments: readonly MimeAttachment[]): { inline: Buffer[]; regular: Buffer[]; cids: string[]; bytes: number } {
     requireMime(attachments.length <= MIME_LIMITS.nodes, 'invalid_mime_patch');
     const result: { inline: Buffer[]; regular: Buffer[]; cids: string[]; bytes: number } = { inline: [], regular: [], cids: [], bytes: 0 };
     for (const attachment of attachments) {
-        safeText(attachment.filename, 512); requireMime(attachment.filename.length > 0, 'invalid_mime_patch');
-        safeText(attachment.contentType, 128);
+        safeText(attachment.filename, AUTHORED_LIMITS.filenameBytes); requireMime(attachment.filename.length > 0, 'invalid_mime_patch');
+        safeText(attachment.contentType, AUTHORED_LIMITS.contentTypeBytes);
         const contentType = attachment.contentType.toLowerCase();
-        requireMime(MEDIA.test(contentType) && !contentType.startsWith('multipart/'), 'invalid_mime_patch');
-        // Other message subtypes have subtype-specific syntax/encoding rules. Only
-        // rfc822 has an explicit new-part implementation; existing parts stay opaque.
-        requireMime(!contentType.startsWith('message/') || contentType === 'message/rfc822', 'invalid_mime_patch');
+        // Multipart needs a boundary, and other message subtypes have subtype-specific
+        // syntax/encoding rules. Only rfc822 has an explicit new-part implementation;
+        // existing parts stay opaque.
+        requireMime(ATTACHMENT_MEDIA.test(contentType), 'invalid_mime_patch');
         requireMime(attachment.disposition === 'inline' || attachment.disposition === 'attachment', 'invalid_mime_patch');
+        requireMime(!(attachment.disposition === 'inline' && AMBIGUOUS_INLINE.test(contentType)), 'invalid_mime_patch');
         requireMime(typeof attachment.contentBase64 === 'string' && attachment.contentBase64.length <= Math.ceil(MIME_LIMITS.attachmentBytes / 3) * 4, 'mime_limit');
         const bytes = canonicalBase64(attachment.contentBase64, true); result.bytes += bytes.length;
         requireMime(result.bytes <= MIME_LIMITS.attachmentBytes, 'mime_limit');
         requireMime(attachment.disposition !== 'inline' || attachment.cid, 'invalid_mime_patch');
         if (attachment.cid !== undefined) {
-            safeText(attachment.cid, 200);
-            requireMime(/^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~@-]+$/u.test(attachment.cid), 'invalid_mime_patch');
+            safeText(attachment.cid, AUTHORED_LIMITS.cidBytes);
+            requireMime(CONTENT_ID.test(attachment.cid), 'invalid_mime_patch');
             requireMime(!result.cids.includes(attachment.cid), 'invalid_mime_patch'); result.cids.push(attachment.cid);
         }
         const isMessage = contentType === 'message/rfc822';
         const transferEncoding = isMessage ? messageEncoding(bytes) : 'base64';
-        const node = new Builder(contentType, { filename: attachment.filename, disableFileAccess: true, disableUrlAccess: true });
-        node.setHeader('Content-Disposition', attachment.disposition);
-        node.setHeader('Content-Transfer-Encoding', transferEncoding);
-        if (attachment.cid) {node.setHeader('Content-ID', `<${attachment.cid}>`);}
-        const rawHeaders = Buffer.from(node.buildHeaders() + '\r\n\r\n');
-        const headers = headersAt(rawHeaders, 0, rawHeaders.length).headers.filter(header => header.key.startsWith('content-'));
-        const part = Buffer.concat([...headers.map(header => header.raw), Buffer.from('\r\n'), isMessage ? bytes : encoded(bytes)]);
+        const headers = attachmentHeaders(attachment.filename, contentType, attachment.disposition, transferEncoding, attachment.cid);
+        const part = Buffer.concat([...headers.map(header => header.raw), CRLF, isMessage ? bytes : encoded(bytes)]);
         result[attachment.disposition === 'inline' ? 'inline' : 'regular'].push(part);
     }
     return result;
@@ -571,10 +696,15 @@ export async function preparePatch(inspected: InspectedMime, patch: MimePatch): 
             }
         }
     }
-    let replacement: Entity | undefined;
-    if (patch.body !== undefined) { bodyChangeSafe(source.core); replacement = bodyEntity(patch.body); }
     let related: Part | undefined;
     for (let current = source.core.parent; current; current = current.parent) {if (current.type === 'multipart/related') { related = current; break; }}
+    // A replacement body ends the message only when it replaces the root and no
+    // added attachment wraps it. Visible text bodies must not contain a delimiter
+    // line of any retained multipart.
+    const wrapsCore = additions.inline.length > 0 && !related;
+    const topLevel = source.core === source.root && !additions.inline.length && !additions.regular.length;
+    let replacement: Entity | undefined;
+    if (patch.body !== undefined) { bodyChangeSafe(source.core); replacement = bodyEntity(patch.body, topLevel, boundaries.map(boundary => Buffer.from('--' + boundary))); }
     const headerChanges: Record<string, string | MimeAddress | readonly MimeAddress[]> = {};
     if (patch.from !== undefined) {headerChanges.From = patch.from;}
     if (patch.replyTo !== undefined) {headerChanges['Reply-To'] = patch.replyTo;}
@@ -591,10 +721,10 @@ export async function preparePatch(inspected: InspectedMime, patch: MimePatch): 
         if (entity) {
             // WildDuck completes the last line of top-level messages on ingestion.
             // Author that CRLF now so exact read-back verification agrees. Nested
-            // entities use their enclosing delimiter's CRLF; retained bytes and
-            // omitted bodies must remain untouched.
-            const ending = part === source.root && !entity.body.subarray(-2).equals(Buffer.from('\r\n')) ? Buffer.from('\r\n') : Buffer.alloc(0);
-            bytes = Buffer.concat([mergeEntityHeaders(part, entity), entity.body, ending]);
+            // entities (including a root wrapped by new attachments) use their
+            // enclosing delimiter's CRLF; retained bytes and omitted bodies must
+            // remain untouched.
+            bytes = Buffer.concat([mergeEntityHeaders(part, entity), entity.body, topLevel ? messageEnding(entity.body) : Buffer.alloc(0)]);
         }
         else if (part.children.length) {
             const chunks: Buffer[] = [];
@@ -604,8 +734,10 @@ export async function preparePatch(inspected: InspectedMime, patch: MimePatch): 
                 const rendered = render(child);
                 chunks.push(source.raw.subarray(offset, child.start), rendered);
                 // For an empty original body the header separator itself can supply
-                // the CRLF before the delimiter. A replacement body needs its own.
-                if (child.end === child.segmentEnd && !rendered.subarray(-2).equals(Buffer.from('\r\n'))) { chunks.push(Buffer.from('\r\n')); }
+                // the CRLF before the delimiter. A replacement body needs its own,
+                // even when its visible text already ends with a line break.
+                const textBody = child === source.core && !wrapsCore && replacement?.type.startsWith('text/') === true && replacement.body.length > 0;
+                if (child.end === child.segmentEnd && (textBody || !endsWithCrlf(rendered))) { chunks.push(CRLF); }
                 offset = child.end;
             }
             const append = part === related ? additions.inline : part === source.root && part.type === 'multipart/mixed' ? additions.regular : [];
@@ -645,7 +777,7 @@ export async function preparePatch(inspected: InspectedMime, patch: MimePatch): 
 /** New mail uses only caller bytes/strings; no URL, filesystem or remote asset access. */
 export async function createMime(input: MimeCreate): Promise<PreparedMime> {
     requireMime(!(input.deleteAttachmentIds?.length), 'invalid_mime_patch');
-    let entity = bodyEntity(input.body);
+    let entity = bodyEntity(input.body, !(input.attachments?.length));
     const additions = attachmentEntities(input.attachments ?? []);
     if (additions.inline.length) {entity = multipart('multipart/related', [serialize(entity), ...additions.inline]);}
     if (additions.regular.length) {entity = multipart('multipart/mixed', [serialize(entity), ...additions.regular]);}
@@ -659,7 +791,7 @@ export async function createMime(input: MimeCreate): Promise<PreparedMime> {
     const root = builder(); root.setHeader('Date', new Date()); root.setHeader('Message-ID', messageId); root.setHeader('MIME-Version', '1.0');
     const required = Buffer.from(root.buildHeaders() + '\r\n\r\n');
     const metadata = headersAt(required, 0, required.length).headers.filter(header => ['date', 'message-id', 'mime-version'].includes(header.key));
-    const raw = Buffer.concat([...metadata.map(header => header.raw), ...[...generated.values()].filter((value): value is Buffer => value !== null), entity.headers, entity.body, ...(entity.body.subarray(-2).equals(Buffer.from('\r\n')) ? [] : [Buffer.from('\r\n')])]);
+    const raw = Buffer.concat([...metadata.map(header => header.raw), ...[...generated.values()].filter((value): value is Buffer => value !== null), entity.headers, entity.body, messageEnding(entity.body)]);
     return prepared(raw, []);
 }
 

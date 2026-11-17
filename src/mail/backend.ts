@@ -5,11 +5,11 @@ import { WILDDUCK_ORIGIN } from '../wildduck';
 import { remainingRequestTimeMs, withRequestBudget } from '../request-budget';
 import { currentRequestId } from '../request-id';
 import { MailError, MAIL_OPERATION_METADATA_KEY, type BackendMailSession, type MailBackendReader, type MailBackendWriter, type Mailbox, type MailInput, type MailInputRaw, type MailOutput, type MessageKey, type DraftContent, type DraftPatch, type MessageSnapshot, type PreparedDraft, type MailOperationMarker, type MessageRef, type MessageSummary, type MailAddress, type AttachmentMetadata, type AttachmentDownload, type AttachmentDownloadLink, type VerifiedMessageMutation, type AuthoredSourceDescriptor } from './contracts';
-import { draftContentSchema, mailboxIdSchema, messageKeySchema, mailInputSchemas, mailOutputSchemas, canonicalReadMessageOutputSchema, attachmentDownloadLinkSchema, mailOperationMarkerSchema, addFlagSchema, labelSchema, MAX_READ_TEXT_BYTES, MAX_HTML_BYTES, MAX_ATTACHMENT_BYTES, MAX_SNIPPET_BYTES, MAX_SEARCH_TEXT_CHARACTERS } from './schemas';
+import { draftContentSchema, namedAddress, mailboxIdSchema, messageKeySchema, mailInputSchemas, mailOutputSchemas, canonicalReadMessageOutputSchema, attachmentDownloadLinkSchema, mailOperationMarkerSchema, addFlagSchema, labelSchema, MAX_READ_TEXT_BYTES, MAX_HTML_BYTES, MAX_ATTACHMENT_BYTES, MAX_SNIPPET_BYTES, MAX_SEARCH_TEXT_CHARACTERS } from './schemas';
 import { MAX_DOWNLOAD_BYTES, DOWNLOAD_TIMEOUT_MS, type AttachmentDownloadStager } from './downloads';
-import { deriveReply } from './reply';
+import { deriveReply, sanitizeHeaderText } from './reply';
 import { ownedIdentityMatcher } from './identities';
-import { createMime, inspectSource, preparePatch, verifyCandidate, MimeError, MIME_LIMITS, type MimeEnvelope } from './mime';
+import { createMime, inspectSource, preparePatch, verifyCandidate, AUTHORED_LIMITS, MimeError, MIME_LIMITS, type MimeEnvelope } from './mime';
 import { renderBody } from './render';
 
 const META_BYTES = 512 * 1024;
@@ -526,12 +526,14 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
         if (!Array.isArray(aliases['results']) || aliases['results'].length > 1000 || aliases['results'].some(item => !object(item) || typeof item['address'] !== 'string')) { return fail(); }
         const ownedAddresses = [user['address'], ...(aliases['results'] as Json[]).map(item => string(item['address'])).filter(address => !address.includes('*'))];
         const match = ownedIdentityMatcher(ownedAddresses, this.dotAsPlus, user['address']);
-        return { primary: user['address'], ownedAddresses, match, ...(typeof user['name'] === 'string' && user['name'] ? { name: user['name'] } : {}) };
+        // The account's display name is backend data, so it is held to the schema's rules like a reply-derived name.
+        const name = typeof user['name'] === 'string' ? sanitizeHeaderText(user['name'], AUTHORED_LIMITS.nameBytes) : '';
+        return { primary: user['address'], ownedAddresses, match, ...(name ? { name } : {}) };
     }
     private selectFrom(identities: Awaited<ReturnType<MailBackend['ownedIdentities']>>, desired?: { address: string; name?: string | undefined }) {
         if (desired && !isEmailValid(desired.address, API_EMAIL_OPTIONS)) { throw new MailError('invalid_input'); }
         if (desired && !identities.match(desired.address)) { throw new MailError('forbidden'); }
-        return desired ?? { address: identities.primary, ...(identities.name ? { name: identities.name } : {}) };
+        return desired ?? namedAddress(identities.primary, identities.name);
     }
     private async ownedFrom(session: BackendMailSession, desired?: { address: string; name?: string | undefined }) {
         return this.selectFrom(await this.ownedIdentities(session), desired);
@@ -557,7 +559,7 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
                 const owned = identities.match(address);
                 return owned === undefined ? undefined : this.stripReplySuffix ? owned : address;
             }).find(address => address !== undefined && identities.match(address) !== undefined);
-            const from = this.selectFrom(identities, data.from ?? (selected ? { address: selected, ...(identities.name ? { name: identities.name } : {}) } : undefined));
+            const from = this.selectFrom(identities, data.from ?? (selected ? namedAddress(selected, identities.name) : undefined));
             const reply = deriveReply({ original: original.message, ownedAddresses: identities.ownedAddresses, isOwnedAddress: address => identities.match(address) !== undefined, mode: data.mode, body, quoteOriginal: data.quoteOriginal, ...(data.to === undefined && data.cc === undefined ? {} : { recipients: { to: data.to ?? [], cc: data.cc ?? [] } }) });
             const mime = await createMime({ ...reply, from, attachments: data.attachments });
             const envelope = outbound(mime.envelope); if (envelope.from !== from.address) { throw new MailError('unsupported_content'); }
@@ -598,7 +600,9 @@ class MailBackend implements MailBackendReader, MailBackendWriter {
             if (!supportedDraftState(state.raw)) { throw new MailError('unsupported_content'); }
             if (patch.deleteAttachmentIds?.length && Array.isArray(state.raw['files']) && state.raw['files'].length > 0) { throw new MailError('unsupported_content'); }
             const source = await inspectSource(bytes, (state.raw['attachments'] as Json[]).map(item => ({ attachmentId: string(item['id']), hash: string(item['hash']) })));
-            const mime = await preparePatch(source, { ...patch, body });
+            // The parsed patch: its names and subject carry the schema's normalisation.
+            const { uid: _uid, expected_version: _version, operation_id: _operation, ...fields } = parsed.data;
+            const mime = await preparePatch(source, { ...fields, body });
             const envelope = outbound(mime.envelope); await this.ownedFrom(session, { address: envelope.from });
             const flags = strings(state.raw['flags']); const labels = strings(state.raw['labels']);
             if (flags.some(flag => !/^\\(?:draft|deleted)$/iu.test(flag) && !addFlagSchema.safeParse(flag).success) || labels.some(label => !labelSchema.safeParse(label).success)) { throw new MailError('unsupported_content'); }

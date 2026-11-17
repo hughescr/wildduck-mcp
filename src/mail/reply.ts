@@ -1,5 +1,6 @@
-import { MimeError, validateMessageId, validateThreading, validateMimeAddresses, validateMimeBody, type MimeAddress, type MimeBody, type MimeThreading } from './mime';
+import { AUTHORED_LIMITS, MimeError, validateMessageId, validateThreading, validateMimeAddresses, validateMimeBody, type MimeAddress, type MimeBody, type MimeThreading } from './mime';
 import { BLOCKQUOTE_STYLE } from './render';
+import { MAX_SUBJECT_WORD, namedAddress, normalizeHeaderText } from './schemas';
 
 /** Request-local projection of a freshly inspected message. Backend identity,
  * ownership, version and operation replay checks belong to the existing pipeline. */
@@ -34,6 +35,34 @@ export interface DerivedReply extends ReplyRecipients {
 function invalid(): never { throw new MimeError('invalid_mime_patch'); }
 const escapeHtml = (value: string) => value.replace(/[&<>"']/gu, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character] ?? character);
 const addressKey = (address: MimeAddress) => address.address.toLowerCase();
+/** Header text from an untrusted source (the original message, the account's display name),
+ * made acceptable to the schema's rules instead of failing the draft: each run of C0/DEL controls
+ * becomes one space, an unpaired surrogate U+FFFD, and a literal "=?" becomes "= ?" so that no
+ * reader decodes it as an encoded-word; then the schema's normalisation applies and the value is
+ * cut between characters to `maxBytes`. */
+export function sanitizeHeaderText(value: string, maxBytes: number): string {
+    let visible = '';
+    for (const character of value.toWellFormed()) { const code = character.charCodeAt(0); visible += code < 32 || code === 127 ? ' ' : character; }
+    const text = normalizeHeaderText(visible.replaceAll('=?', '= ?'));
+    if (Buffer.byteLength(text) <= maxBytes) { return text; }
+    let result = '', bytes = 0;
+    for (const character of text) {
+        bytes += Buffer.byteLength(character);
+        if (bytes > maxBytes) { break; }
+        result += character;
+    }
+    return result.trimEnd();
+}
+/** Recipients derived from the original keep their display names, sanitised; a name that
+ * sanitises to nothing or equals the address is dropped. Explicit caller recipients are never
+ * touched: the schema already holds them to the same rules. Addresses are not rewritten: one the
+ * MIME layer cannot write fails the reply. */
+function derived(list: readonly MimeAddress[]): MimeAddress[] {
+    return list.map(entry => {
+        if (typeof entry.name !== 'string') { return entry; }
+        return namedAddress(entry.address, sanitizeHeaderText(entry.name, AUTHORED_LIMITS.nameBytes));
+    });
+}
 
 /** Derive only allowlisted reply metadata. Incoming HTML, attachments, Bcc and
  * hidden envelopes are never copied. This helper performs no I/O or writes. */
@@ -46,21 +75,18 @@ export function deriveReply(input: ReplyInput): DerivedReply {
     for (const id of original.references) { validateMessageId(id); }
     const threading = { inReplyTo: original.messageId, references: [...new Set(original.references.filter(id => id !== original.messageId)), original.messageId] };
     validateThreading(threading);
-    if (typeof original.subject !== 'string' || !original.subject.isWellFormed()) { invalid(); }
-    for (const character of original.subject) {
-        const code = character.charCodeAt(0);
-        if (code < 32 || code === 127) { invalid(); }
-    }
-    const subject = /^re:/iu.test(original.subject) ? original.subject : 'Re: ' + original.subject;
-    if (Buffer.byteLength(subject) > 2048) { invalid(); }
+    if (typeof original.subject !== 'string') { invalid(); }
+    // The original subject is untrusted data; a word too long for one header line is split.
+    const originalSubject = sanitizeHeaderText(original.subject, AUTHORED_LIMITS.subjectBytes).replace(new RegExp(`[!-~]{${MAX_SUBJECT_WORD}}(?=[!-~])`, 'gu'), '$& ');
+    const subject = sanitizeHeaderText(/^re:/iu.test(originalSubject) ? originalSubject : 'Re: ' + originalSubject, AUTHORED_LIMITS.subjectBytes);
 
     let to: readonly MimeAddress[], cc: readonly MimeAddress[];
     if (input.recipients !== undefined) {
         ({ to, cc } = input.recipients);
     } else {
-        const target = original.replyTo.length ? original.replyTo : original.from;
-        to = input.mode === 'reply_all' ? [...target, ...original.to] : target;
-        cc = input.mode === 'reply_all' ? original.cc : [];
+        const target = derived(original.replyTo.length ? original.replyTo : original.from);
+        to = input.mode === 'reply_all' ? [...target, ...derived(original.to)] : target;
+        cc = input.mode === 'reply_all' ? derived(original.cc) : [];
     }
     validateMimeAddresses(to); validateMimeAddresses(cc);
     // Lowercase keys prevent duplicate delivery. Additional ownership equivalence
@@ -85,8 +111,8 @@ export function deriveReply(input: ReplyInput): DerivedReply {
     // Continuing our own sent message should address its visible external To
     // recipients. An external Reply-To always wins over this sent-mail fallback.
     if (input.recipients === undefined && input.mode === 'reply' && to.length > 0 && recipients.to.length === 0) {
-        validateMimeAddresses(original.to);
-        recipients.to = select(original.to);
+        validateMimeAddresses(derived(original.to));
+        recipients.to = select(derived(original.to));
     }
     if (recipients.to.length + recipients.cc.length === 0 || recipients.to.length + recipients.cc.length > 100) { invalid(); }
 

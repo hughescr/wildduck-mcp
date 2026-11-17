@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { isEmailValid } from '@hapi/address';
 import type { StandardSchemaWithJSON } from '@modelcontextprotocol/server';
+import { ATTACHMENT_MEDIA, AMBIGUOUS_INLINE, AUTHORED_LIMITS, CONTENT_ID, EMAIL, hasAttachmentReference, hasBareLineFeed } from './mime';
 export const MAX_PAGE_SIZE = 50;
 export const MAX_BATCH_MESSAGES = 10;
 export const MAX_BATCH_BYTES = 1024 * 1024;
@@ -10,13 +11,38 @@ export const MAX_DRAFT_TEXT_BYTES = 128 * 1024;
 export const MAX_READ_TEXT_BYTES = 128 * 1024;
 export const MAX_HTML_BYTES = 256 * 1024;
 export const MAX_ATTACHMENT_BYTES = 2 * 1024 * 1024;
-export const MAX_SUBJECT_BYTES = 2048;
+export const MAX_SUBJECT_BYTES = AUTHORED_LIMITS.subjectBytes;
 export const MAX_SEARCH_TEXT_CHARACTERS = 255;
 const utf8 = (maximum: number) => (value: string) => Buffer.byteLength(value, 'utf8') <= maximum;
 const noHeaderControls = (value: string) => !/[\r\n\0]/u.test(value);
 const nonblank = (value: string) => value.trim().length > 0;
 const boundedText = (maximum: number) => z.string().max(maximum).refine(utf8(maximum), `At most ${maximum} UTF-8 bytes.`);
+// Query filters (search_messages) are not authored headers and keep this weaker rule.
 const headerText = (maximum: number) => boundedText(maximum).refine(noHeaderControls, 'CR, LF and NUL are forbidden.');
+// Subjects, display names and filenames are written by the mail library (nodemailer), which
+// encodes any other text as needed. Up front the schema refuses what the library cannot carry
+// (C0 controls, DEL, unpaired surrogates) and a literal "=?", which readers would decode as an
+// RFC 2047 encoded-word into different text.
+const noC0Controls = (value: string) => { for (const char of value) { const code = char.charCodeAt(0); if (code < 32 || code === 127) { return false; } } return true; };
+const wellFormed = (value: string) => value.isWellFormed();
+const UNPAIRED_SURROGATE = 'Unpaired UTF-16 surrogates are forbidden.';
+const authoredText = (maximum: number) => boundedText(maximum).refine(noC0Controls, { message: 'Control characters are forbidden.', abort: true }).refine(wellFormed, UNPAIRED_SURROGATE).refine(value => !value.includes('=?'), 'The sequence "=?" is not supported in this field.');
+/** Leading and trailing whitespace trimmed and every internal run collapsed to one space: WildDuck
+ * and mail clients trim these fields and unfold a folded header with one space per fold, so this
+ * is the value every reader shows. Applied by the schema, so it is what is authored and digested. */
+export const normalizeHeaderText = (value: string) => value.trim().replace(/\s+/gu, ' ');
+/** The library writes a plain ASCII Subject unencoded and never breaks a word, so a word must fit
+ * one header line (998 characters, measured: "Subject:" CRLF " " word). */
+export const MAX_SUBJECT_WORD = 900;
+const LONG_SUBJECT_WORD = new RegExp(`[!-~]{${MAX_SUBJECT_WORD + 1}}`, 'u');
+const subjectText = (maximum: number) => authoredText(maximum).refine(value => !LONG_SUBJECT_WORD.test(value), `Subject words longer than ${MAX_SUBJECT_WORD} characters are not supported.`).transform(normalizeHeaderText);
+const displayName = authoredText(AUTHORED_LIMITS.nameBytes).transform(normalizeHeaderText);
+// WildDuck trims file names when it lists attachments, so edge whitespace would not read back,
+// and the library may fold a long name inside a whitespace run, which readers unfold to one space.
+const filenameText = authoredText(AUTHORED_LIMITS.filenameBytes).min(1).refine(value => !/^\s|\s$/u.test(value), 'File names must not start or end with whitespace.')
+    .refine(value => !/\s\s/u.test(value), 'File names must not contain repeated whitespace.');
+// Body text has no control-character rule (line breaks and tabs are content), only encodability.
+const bodyText = (maximum: number) => boundedText(maximum).refine(wellFormed, UNPAIRED_SURROGATE);
 const unique = (values: readonly string[]) => new Set(values).size === values.length;
 const overlaps = (left: readonly string[], right: readonly string[]) => { const rightSet = new Set(right); return left.some(value => rightSet.has(value)); };
 export const mailboxIdSchema = z.string().regex(/^[a-f0-9]{24}$/u);
@@ -35,7 +61,17 @@ export const draftRefSchema = messageRefSchema;
 // Pinned 5.1.1 accepts tlds:false at runtime (the existing API uses it),
 // but its bundled declaration omits that boolean option. Keep the cast localized.
 const apiEmailOptions = { tlds: false } as unknown as Parameters<typeof isEmailValid>[1];
-export const inputAddressSchema = z.strictObject({ address: z.string().max(320).refine(noHeaderControls).refine(value => isEmailValid(value, apiEmailOptions), 'Address must satisfy the existing mail API recipient validator.'), name: headerText(320).optional() });
+// The pinned API validator, intersected with the ASCII grammar the MIME layer writes and reads.
+const addressText = z.string().max(320).refine(noHeaderControls).refine(value => isEmailValid(value, apiEmailOptions), 'Address must satisfy the existing mail API recipient validator.')
+    .refine(value => EMAIL.test(value) && !value.includes('..'), 'Only ASCII email addresses are supported; write an internationalised domain in its xn-- form.');
+/** A mailbox with its normalised name, or none: a name that normalises to nothing, or that equals
+ * its address ignoring case, is dropped, since nodemailer's address parser (as WildDuck uses it)
+ * reads a name equal to the address as no name. */
+export function namedAddress(address: string, name: string | undefined): { address: string; name?: string } {
+    return name && name.toLowerCase() !== address.toLowerCase() ? { address, name } : { address };
+}
+export const inputAddressSchema = z.strictObject({ address: addressText, name: displayName.optional().describe('Display name without control characters or "=?". Edge whitespace is trimmed, internal runs become one space, and a name equal to the address is dropped.') })
+    .transform(({ address, name }) => namedAddress(address, name));
 // Malformed incoming MIME addresses remain untrusted data, not outbound validators.
 export const outputAddressSchema = z.strictObject({ address: z.string(), name: z.string().optional() });
 const recipientsSchema = z.array(inputAddressSchema).max(50);
@@ -43,16 +79,23 @@ export const MAX_MARKDOWN_BYTES = MAX_DRAFT_TEXT_BYTES;
 // Each branch is strict with one required key, so the advertised JSON Schema
 // (anyOf) itself says "exactly one". The server renders it before MIME composition.
 export const draftBodySchema = z.union([
-    z.strictObject({ markdown: boundedText(MAX_MARKDOWN_BYTES).describe('Preferred. Markdown rendered to HTML plus generated plain text (multipart/alternative).') }),
-    z.strictObject({ html: boundedText(MAX_HTML_BYTES).describe('HTML sent with generated plain text (multipart/alternative).') }),
-    z.strictObject({ text: boundedText(MAX_DRAFT_TEXT_BYTES).describe('Plain text only (single text/plain part). Some clients drop its line breaks when editing the draft; prefer markdown.') }),
+    z.strictObject({ markdown: bodyText(MAX_MARKDOWN_BYTES).describe('Preferred. Markdown rendered to HTML plus generated plain text (multipart/alternative).') }),
+    z.strictObject({ html: bodyText(MAX_HTML_BYTES).refine(value => !hasAttachmentReference(value), 'HTML must not use attachment:ATTn URLs in tag attributes; reference attached images as cid: URLs.').describe('HTML sent with generated plain text (multipart/alternative).') }),
+    z.strictObject({ text: bodyText(MAX_DRAFT_TEXT_BYTES).describe('Plain text only (single text/plain part). Some clients drop its line breaks when editing the draft; prefer markdown.') }),
 ], { error: 'Provide exactly one of body.markdown, body.html or body.text.' }).describe('Exactly one of markdown (preferred), html or text.');
 const base64Schema = z.string().max(Math.ceil(MAX_ATTACHMENT_BYTES / 3) * 4).refine(value => value.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/u.test(value) && Buffer.from(value, 'base64').toString('base64') === value && Buffer.byteLength(value, 'base64') <= MAX_ATTACHMENT_BYTES, 'Canonical base64 of at most 2 MiB decoded bytes is required.');
-const contentTypeSchema = z.string().max(255).regex(/^[A-Za-z0-9!#$%&'*+.^_`|~-]+\/[A-Za-z0-9!#$%&'*+.^_`|~-]+$/u);
-const cidSchema = headerText(255).min(1).regex(/^[^\s<>]+$/u);
-export const newAttachmentSchema = z.strictObject({ filename: headerText(255).min(1), contentType: contentTypeSchema, contentBase64: base64Schema, disposition: z.enum(['attachment', 'inline']).default('attachment'), cid: cidSchema.optional() }).refine(value => value.disposition !== 'inline' || value.cid !== undefined, 'Inline attachments require a CID.');
+// type/subtype only (case-insensitive; written lower case). multipart/* needs a boundary and other message/*
+// subtypes have their own syntax, so only message/rfc822 is accepted of those.
+const contentTypeSchema = z.string().max(AUTHORED_LIMITS.contentTypeBytes).regex(ATTACHMENT_MEDIA, 'Content type must be type/subtype without parameters; multipart/* and message/* other than message/rfc822 are not supported.');
+// A Content-ID is a msg-id: letters, digits and the RFC 5322 atext punctuation, with "." and "@".
+const cidSchema = z.string().min(1).max(AUTHORED_LIMITS.cidBytes).regex(CONTENT_ID, 'CID may contain only letters, digits and ! # $ % & \' * + - . / = ? ^ _ ` { | } ~ @.');
+const attachmentFilenameSchema = filenameText.describe('Any text without control characters, "=?", edge whitespace or repeated whitespace, including single spaces, quotes, semicolons, slashes and non-ASCII; mail clients sanitise path separators when saving.');
+export const newAttachmentSchema = z.strictObject({ filename: attachmentFilenameSchema, contentType: contentTypeSchema, contentBase64: base64Schema, disposition: z.enum(['attachment', 'inline']).default('attachment'), cid: cidSchema.optional() })
+    .refine(value => value.disposition !== 'inline' || value.cid !== undefined, 'Inline attachments require a CID.')
+    .refine(value => !(value.disposition === 'inline' && AMBIGUOUS_INLINE.test(value.contentType)), 'Inline text/plain and text/html attachments cannot be told from the body; use disposition attachment.')
+    .refine(value => !(value.contentType.toLowerCase() === 'message/rfc822' && hasBareLineFeed(Buffer.from(value.contentBase64, 'base64'))), 'message/rfc822 content must use CRLF line endings.');
 const newAttachmentsSchema = z.array(newAttachmentSchema).max(100).refine(values => values.reduce((sum, item) => sum + Buffer.byteLength(item.contentBase64, 'base64'), 0) <= MAX_ATTACHMENT_BYTES, 'Combined decoded attachments must not exceed 2 MiB.').refine(values => unique(values.flatMap(item => item.cid === undefined ? [] : [item.cid])), 'Attachment CIDs must be unique.');
-const draftFields = { from: inputAddressSchema.optional(), replyTo: recipientsSchema.optional(), to: recipientsSchema.default([]), cc: recipientsSchema.default([]), bcc: recipientsSchema.default([]), subject: headerText(MAX_SUBJECT_BYTES), body: draftBodySchema, attachments: newAttachmentsSchema.default([]) };
+const draftFields = { from: inputAddressSchema.optional(), replyTo: recipientsSchema.optional(), to: recipientsSchema.default([]), cc: recipientsSchema.default([]), bcc: recipientsSchema.default([]), subject: subjectText(MAX_SUBJECT_BYTES), body: draftBodySchema, attachments: newAttachmentsSchema.default([]) };
 export const draftContentSchema = z.strictObject(draftFields).refine(value => value.to.length + value.cc.length + value.bcc.length <= 100, 'At most 100 recipients in total.');
 const writeTargetShape = { uid: uidSchema, expected_version: versionSchema, operation_id: operationIdSchema };
 export const listMailboxesInputSchema = z.strictObject({});
@@ -79,7 +122,7 @@ export const readAttachmentInputSchema = messageKeySchema.extend({ attachmentId:
 export const getAttachmentDownloadInputSchema = readAttachmentInputSchema;
 export const createReplyDraftInputSchema = z.strictObject({ original: messageKeySchema, mode: z.enum(['reply', 'reply_all']).default('reply'), body: draftBodySchema, quoteOriginal: z.boolean().default(false), from: inputAddressSchema.optional(), to: recipientsSchema.optional(), cc: recipientsSchema.optional(), attachments: newAttachmentsSchema.default([]), operation_id: operationIdSchema }).refine(value => (value.to?.length ?? 0) + (value.cc?.length ?? 0) <= 100, 'At most 100 explicit recipients.');
 export const createDraftInputSchema = draftContentSchema.safeExtend({ operation_id: operationIdSchema });
-const patchFields = { from: inputAddressSchema.optional(), replyTo: recipientsSchema.optional(), to: recipientsSchema.optional(), cc: recipientsSchema.optional(), bcc: recipientsSchema.optional(), subject: headerText(MAX_SUBJECT_BYTES).optional(), body: draftBodySchema.optional(), deleteAttachmentIds: z.array(attachmentIdSchema).max(100).refine(unique).optional(), attachments: newAttachmentsSchema.optional() };
+const patchFields = { from: inputAddressSchema.optional(), replyTo: recipientsSchema.optional(), to: recipientsSchema.optional(), cc: recipientsSchema.optional(), bcc: recipientsSchema.optional(), subject: subjectText(MAX_SUBJECT_BYTES).optional(), body: draftBodySchema.optional(), deleteAttachmentIds: z.array(attachmentIdSchema).max(100).refine(unique).optional(), attachments: newAttachmentsSchema.optional() };
 export const updateDraftInputSchema = z.strictObject({ ...writeTargetShape, ...patchFields }).refine(value => Object.keys(patchFields).some(key => { const field = value[key as keyof typeof patchFields]; return Array.isArray(field) && (key === 'deleteAttachmentIds' || key === 'attachments') ? field.length > 0 : field !== undefined; }), 'At least one explicit patch change is required. Omitted body, headers and files are preserved.').refine(value => (value.to?.length ?? 0) + (value.cc?.length ?? 0) + (value.bcc?.length ?? 0) <= 100, 'At most 100 explicitly supplied recipients; the backend also checks the preserved total.');
 export const deleteDraftInputSchema = z.strictObject(writeTargetShape);
 export const sendDraftInputSchema = z.strictObject(writeTargetShape);
